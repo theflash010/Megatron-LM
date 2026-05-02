@@ -167,4 +167,11 @@ def main():
 
 
 if __name__ == '__main__':
+    import debugpy
+    try:#使用异常处理适配多进程代码，这样只有一个进程会监听5678端口
+        debugpy.listen(("localhost", 5678))
+        print("Waiting for debugger attach")
+        debugpy.wait_for_client()#强制等待vscode调试点击
+    except Exception as e:
+        pass
     main()
