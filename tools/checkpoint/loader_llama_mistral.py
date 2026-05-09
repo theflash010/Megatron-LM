@@ -302,7 +302,7 @@ def load_args_from_checkpoint(args, model_size):
     args.swiglu = True
     args.normalization = "RMSNorm"
     args.add_bias_linear = False
-    args.untie_embeddings_and_output_weights = not model_args.get("tie_word_embeddings", False)
+    args.untie_embeddings_and_output_weights = not model_args.get("tie_word_embeddings", False) #这个参数控制输入 embedding 层和输出层是否共享权重，如果为true代表不共享，为false代表共享
     args.vocab_size = model_args["vocab_size"]
     args.padded_vocab_size = model_args["vocab_size"]
     args.ffn_hidden_size = model_args["intermediate_size"]
@@ -470,11 +470,11 @@ def _load_checkpoint(queue, args):
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes.
-    margs.world_size = margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size
+    margs.world_size = margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size   #这里作为loader，tp和pp size都为1
 
     margs = validate_args(margs)
 
-    margs.use_legacy_models = True
+    margs.use_legacy_models = True   #使用旧版模型，位于megatron/legacy/model/
     margs.transformer_impl = args.loader_transformer_impl
 
     margs.position_embedding_type = "rope"
@@ -563,7 +563,7 @@ def _load_checkpoint(queue, args):
     # Get first pipe stage.
     mpu.set_tensor_model_parallel_rank(0)
     mpu.set_pipeline_model_parallel_rank(0)
-    model = load_checkpoint_to_model(margs)
+    model = load_checkpoint_to_model(margs)    #加载模型参数
 
     queue.put(md)
 
