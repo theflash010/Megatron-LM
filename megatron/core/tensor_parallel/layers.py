@@ -247,7 +247,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 torch.empty(
                     self.num_embeddings_per_partition, self.embedding_dim, dtype=config.params_dtype
                 )
-            )
+            ) #这里数据已经实例化了，开始占用空间了，还没初始化
             if config.perform_initialization:
                 _initialize_affine_weight_cpu(
                     self.weight,
