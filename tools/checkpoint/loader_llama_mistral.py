@@ -388,16 +388,16 @@ def load_checkpoint_to_model(args):
     from gpt_builders import gpt_builder
     from transformers import AutoModelForCausalLM
 
-    # Load Huggingface model.
+    # Load Huggingface model. 加载hf模型
     hf_model = AutoModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu")
 
-    # Init Megatron model.
+    # Init Megatron model. Megatron模型已经占用了空间，但是还没赋值
     model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
 
     # Set model state.
-    set_preprocess_state(args, model, hf_model)
-    set_postprocess_state(args, model, hf_model)
-    for layer_idx in tqdm(range(args.num_layers), "set layer states"):
+    set_preprocess_state(args, model, hf_model) #将hf模型的embedding参数加载到megatron模型，纯copy
+    set_postprocess_state(args, model, hf_model) #将hf模型的last norm和lm_head参数加载到megatron模型，纯copy
+    for layer_idx in tqdm(range(args.num_layers), "set layer states"): #将hf模型的中间层参数加载到megatron模型，纯copy
         set_layer_state(args, model, hf_model, layer_idx)
 
     return model
@@ -557,13 +557,13 @@ def _load_checkpoint(queue, args):
     margs.model_size = args.model_size
 
     # Get true (non-padded) vocab size
-    tokenizer = transformers.AutoTokenizer.from_pretrained(margs.tokenizer_model)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(margs.tokenizer_model) #获取tokenizer
     md.true_vocab_size = tokenizer._tokenizer.get_vocab_size(with_added_tokens=True)
 
     # Get first pipe stage.
     mpu.set_tensor_model_parallel_rank(0)
     mpu.set_pipeline_model_parallel_rank(0)
-    model = load_checkpoint_to_model(margs)    #加载模型参数
+    model = load_checkpoint_to_model(margs)    #1.加载hf模型 2.构建Megatron模型 3.将hf模型参数copy到Megatron模型中
 
     queue.put(md)
 
@@ -613,7 +613,7 @@ def _load_checkpoint(queue, args):
             mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
 
         # Handle gated linear units.
-        if md.swiglu:
+        if md.swiglu: #对SwiGLU的特殊处理
             # Concat all the first halves ('W's) and all the second halves ('V's).
             for tp_rank in range(tp_size):
                 mlp_l0_weight[tp_rank] = torch.chunk(mlp_l0_weight[tp_rank], 2, dim=0)

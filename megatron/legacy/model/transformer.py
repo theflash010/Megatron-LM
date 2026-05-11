@@ -109,7 +109,7 @@ class ParallelMLP(MegatronModule):
 
         self.add_bias = config.add_bias_linear
 
-        ffn_hidden_size = config.ffn_hidden_size ##这里有bug，对于SwiGLU应该进行stride，把up和gate交错分发给tp rank，但是这里没有这逻辑
+        ffn_hidden_size = config.ffn_hidden_size #这里有bug，对于SwiGLU应该进行stride，把up和gate交错分发给tp rank，但是这里没有这逻辑
         if config.gated_linear_unit:
             ffn_hidden_size *= 2
 
@@ -123,7 +123,7 @@ class ParallelMLP(MegatronModule):
             gather_output=False,
             skip_bias_add=True,
             is_expert=is_expert,
-        )
+        )#这里有bug，对于SwiGLU应该进行stride，把up和gate交错分发给tp rank，但是这里没有这逻辑
 
         self.bias_gelu_fusion = False
         self.activation_func = None
