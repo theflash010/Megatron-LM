@@ -183,7 +183,7 @@ def _initialize_affine_weight_cpu(
     if rank is None:
         rank = get_tensor_model_parallel_rank()
         world_size = get_tensor_model_parallel_world_size()
-    my_weight_list = weight_list[rank::world_size]
+    my_weight_list = weight_list[rank::world_size] #::是切片操作，rank是起始位置，world_size是步长（每隔多少个tensor取一个）
 
     with torch.no_grad():
         # all tensors must live on the same device

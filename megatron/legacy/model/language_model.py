@@ -318,7 +318,7 @@ class Embedding(MegatronModule):
 
 class TransformerLanguageModel(MegatronModule):
     """Transformer language model.
-
+    Transformer完整模型，包括embedding，rope，Encoder和Decoder（由ParallelTransformer构建），lm_head
     Args:
         transformer_hparams: transformer hyperparameters
         vocab_size: vocabulary size
@@ -371,7 +371,7 @@ class TransformerLanguageModel(MegatronModule):
                 args.hidden_dropout,
                 config,
                 self.num_tokentypes,
-            )
+            ) #添加Embedding
             self._embedding_key = 'embedding'
 
         # Rotary positional embeddings
@@ -391,7 +391,7 @@ class TransformerLanguageModel(MegatronModule):
                 kv_channels=rotary_dim,
                 rotary_percent=args.rotary_percent,
                 seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
-            )
+            )#添加rope嵌入
 
         # Encoder (usually set to True, False if part of an encoder-decoder
         # architecture and in encoder-only stage).
@@ -424,7 +424,7 @@ class TransformerLanguageModel(MegatronModule):
 
         if self.post_process:
             # Pooler.
-            if self.add_pooler:
+            if self.add_pooler: #Pooler是池化层，Pooler 通常用于将序列的 hidden states 转换为固定大小的 pooled representation，比如在 BERT 中用于获取 [CLS] token 的表示，或者做均值/最大池化。这常见于序列分类、句子嵌入等任务。
                 self.pooler = Pooler(self.hidden_size, self.init_method)
                 self._pooler_key = 'pooler'
 

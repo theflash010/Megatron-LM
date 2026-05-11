@@ -109,7 +109,7 @@ class ParallelMLP(MegatronModule):
 
         self.add_bias = config.add_bias_linear
 
-        ffn_hidden_size = config.ffn_hidden_size
+        ffn_hidden_size = config.ffn_hidden_size ##这里有bug，对于SwiGLU应该进行stride，把up和gate交错分发给tp rank，但是这里没有这逻辑
         if config.gated_linear_unit:
             ffn_hidden_size *= 2
 
@@ -315,7 +315,9 @@ class SwitchMLP(MegatronModule):
 
 
 class CoreAttention(MegatronModule):
-
+    """
+    包括QK^T + Softmax + Dropout + @V
+    """
     def __init__(self, layer_number, config,
                  attn_mask_type=AttnMaskType.padding):
         super(CoreAttention, self).__init__()
@@ -1126,7 +1128,7 @@ def _get_num_layers(args, model_type, is_decoder=False):
 
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
-
+    #Transformer本体，包括Encoder的所有layer和Decoder的所有layer，不包括embedding，rope，lm_head
     def __init__(self, config,
                  model_type, layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
