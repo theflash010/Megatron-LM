@@ -121,6 +121,17 @@ class FusedScaleMaskSoftmax(nn.Module):
     """
     fused operation: scaling + mask + softmax
 
+    #注意：这个算子融合不是FlashAttention，而是只优化Softmax部分
+    # 传统方式（3个kernel）
+    scaled = attention_scores * scale          # kernel 1
+    masked = apply_mask(scaled, mask)          # kernel 2
+    probs = softmax(masked)                    # kernel 3
+
+    # Fused Softmax（1个kernel）
+    probs = FusedScaleMaskSoftmax(
+        attention_scores, mask, scale
+    )  # 融合：scale + mask + softmax
+
     Args:
         input_in_fp16: flag to indicate if input in fp16 data format.
         input_in_bf16: flag to indicate if input in bf16 data format.
