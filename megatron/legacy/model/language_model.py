@@ -395,7 +395,7 @@ class TransformerLanguageModel(MegatronModule):
 
         # Encoder (usually set to True, False if part of an encoder-decoder
         # architecture and in encoder-only stage).
-        if self.add_encoder:
+        if self.add_encoder: #这里的add encoder代表第一个组件，add decoder代表第二个组件，不是说add encoder = True就是加encoder，也可能是decoder，具体要看是mask类型，因为decoder和encoder可以复用一套代码，只是decoder mask是casual，encoder mask是bidirectional（padding）
             self.encoder = ParallelTransformer(
                 config,
                 model_type=args.model_type,

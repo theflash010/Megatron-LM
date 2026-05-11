@@ -1021,7 +1021,7 @@ class ParallelTransformerLayer(MegatronModule):
         # Cross attention.
         if self.layer_type == LayerType.encoder:
             pass
-        elif self.layer_type == LayerType.decoder:
+        elif self.layer_type == LayerType.decoder:  #Megatron规定LayerType.decoder就是encoder-decoder架构中的decoder，一定会做cross- attention。decoder-only架构中的decoder复用encoder代码，layer_type还是LayerType.encoder
             norm_input, norm_output = \
                 self.default_decoder_cross_attention(
                     encoder_output,
@@ -1206,7 +1206,7 @@ class ParallelTransformer(MegatronModule):
 
         # Number of layers.
         self.num_layers = _get_num_layers(args, model_type,
-                                          layer_type==LayerType.decoder)
+                                          layer_type==LayerType.decoder) #这个num_layers是单个rank需要处理的layer数量，不是模型所有layer数量
 
         self.drop_path_rates = [
             rate.item() for rate in
