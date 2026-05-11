@@ -165,6 +165,8 @@ def _initialize_affine_weight_cpu(
 ):
     """Initialize affine weight for model parallel.
 
+    #一个例子：在处理SwiGLU这种gate FFN的时候，stride用于管理SwiGLU在TP下交错赋值，让每个TP rank都得到部分对应的gate和up矩阵参数
+
     Build the master weight on all processes and scatter
     the relevant chunk."""
 
@@ -881,7 +883,7 @@ class ColumnParallelLinear(torch.nn.Module):
                         return_master_weight=keep_master_weight_for_test,
                         rank=rank,
                         world_size=world_size,
-                    )
+                    )#这里的stride用于管理SwiGLU在TP下交错赋值，让每个TP rank都得到部分对应的gate和up矩阵
                 else:
                     set_tensor_model_parallel_attributes(
                         tensor=self.weight, is_parallel=True, dim=0, stride=stride
