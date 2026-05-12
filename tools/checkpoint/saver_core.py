@@ -51,7 +51,7 @@ class MegatronCheckpointSaverLLM(MegatronCheckpointSaverBase):
             raise Exception(f'unrecognized model type: {self.args.model_type}')
 
     def receive_model(self):
-        # Model schema.
+        # Model schema. 获取参数名称映射，这里对GPT用了decoder名称
         schema = get_model_schema(
             self.md.model_type,
             self.margs.transformer_impl,

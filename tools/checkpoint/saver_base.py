@@ -328,11 +328,11 @@ class MegatronCheckpointSaverBase:
 
         self.receive_checkpoint_metadata() #获取loader加载的模型的元数据，确定saver的并行配置
 
-        self.parse_megatron_args()
+        self.parse_megatron_args() 
 
-        self.initialize_megatron_env()
+        self.initialize_megatron_env() #确定model_builder，创建fake通信环境（不知道会不会开多进程）
 
-        self.models = self.initialize_models()
+        self.models = self.initialize_models() #创建一个 3D 数组，值为 None.  models[PP][EP][TP] = None
 
         self.receive_model()
 
@@ -378,10 +378,17 @@ class MegatronCheckpointSaverBase:
         # Embeddings
         #-----------
         embeddings_msg = self.queue_get("embeddings")
+        import debugpy
+        try:#使用异常处理适配多进程代码，这样只有一个进程会监听5678端口
+            debugpy.listen(("localhost", 5678))
+            print("Waiting for debugger attach")
+            debugpy.wait_for_client()#强制等待vscode调试点击
+        except Exception as e:
+            pass
         pos_embed = None
         if self.md.position_embedding_type == 'learned_absolute':
             pos_embed = embeddings_msg.pop("position embeddings")
-        orig_word_embed = embeddings_msg.pop("word embeddings")
+        orig_word_embed = embeddings_msg.pop("word embeddings") #loader获取的embedding的权重值
         self.check_message(embeddings_msg)
 
         # Deal with padding
@@ -415,20 +422,20 @@ class MegatronCheckpointSaverBase:
 
         full_word_embed = pad_weight(orig_word_embed, self.md.true_vocab_size)
 
-        # Split into new tensor model parallel sizes
+        # Split into new tensor model parallel sizes     按照TP对embedding进行切片
         out_word_embed = torch.chunk(full_word_embed, self.args.target_tensor_parallel_size, dim=0)
 
         # Set embeddings.
         # --------------
         for ep_rank in range(self.args.target_expert_parallel_size):
             for tp_rank in range(self.args.target_tensor_parallel_size):
-                model = self.get_local_model(0, ep_rank, tp_rank)
+                model = self.get_local_model(0, ep_rank, tp_rank) #好像build了模型
                 if pos_embed is None:
                     assert not schema.has_position_embeddings(model)
                 schema.set("embeddings", model, {
                     "pos" : pos_embed,
                     "word" : out_word_embed[tp_rank],
-                })
+                })#按照TP分片病赋值给
 
         # Transformer layers.
         # ------------------

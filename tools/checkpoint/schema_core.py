@@ -18,7 +18,7 @@ class CoreSchema(ModelSchema):
 
     def __init__(self, model_type, layer_schema, prefix):
         block_key = get_core_transformer_block_key(model_type)
-        super().__init__({
+        super().__init__({ #参数名称映射字典
             "embeddings" : {
                 "pos" : f"{prefix}embedding.position_embeddings.weight",
                 "word" : f"{prefix}embedding.word_embeddings.weight",
@@ -76,8 +76,7 @@ class CoreLocalSchema(CoreSchema):
 class CoreTESchema(CoreSchema):
 
     def __init__(self, model_type, prefix, extra_layer_schema):
-        super().__init__(model_type, layer_schema={
-
+        super().__init__(model_type, layer_schema={ #TE模型参数名称和Megatron模型参数名称的映射字典，key是TE模型参数名称，value是Megatron模型参数名称
             # Self attention.
             "self_attn_norm_weight" : "self_attention.linear_qkv.layer_norm_weight",
             "self_attn_norm_bias" : "self_attention.linear_qkv.layer_norm_bias",
