@@ -136,15 +136,15 @@ class GPTModel(LanguageModule):
         self.max_position_embeddings = max_sequence_length
         self.rotary_percent = rotary_percent
 
-        if hasattr(self.config, 'rotary_base'):
+        if hasattr(self.config, 'rotary_base'): #旋转基频，控制位置编码的频率范围
             self.rotary_base = self.config.rotary_base
         else:
             self.rotary_base = rotary_base
-        self.rotary_scaling = rope_scaling
-        self.mtp_block_spec = mtp_block_spec
+        self.rotary_scaling = rope_scaling #旋转缩放  扩展模型的有效上下文长度，无需重新训练
+        self.mtp_block_spec = mtp_block_spec #mtp是指Multi-Token Prediction，多 Token 预测 。这个参数是MTP 模块规格
         self.mtp_process = mtp_block_spec is not None and mtp_on_this_rank(
             self.config, ignore_virtual=False, vp_stage=vp_stage
-        )
+        )#这个参数是标记，当前 rank 是否需要处理 MTP
 
         if self.pre_process or self.mtp_process:
             self.embedding = LanguageModelEmbedding(
@@ -154,7 +154,7 @@ class GPTModel(LanguageModule):
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
                 tp_group=self.pg_collection.tp,
-            )
+            )#创建了embedding层，开始占用了显存，但是还没赋值
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = RotaryEmbedding(
@@ -203,7 +203,7 @@ class GPTModel(LanguageModule):
             ), "mrope require mrope_section setting, but we got None from TransformerConfig"
 
         # Cache for RoPE tensors which do not change between iterations.
-        self.rotary_pos_emb_cache = {}
+        self.rotary_pos_emb_cache = {} #RoPE 的 cos/sin 值只取决于：序列长度 seq_len、rotary_base、维度 dim。对于相同的 max_sequence_length，cos/sin 值是固定的，不会因为输入内容不同而变，因此可以进行cache
 
         # Transformer.
         self.decoder = TransformerBlock(

@@ -65,7 +65,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 assert not (config.transformer_impl == "inference_optimized")
                 transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
             else:
-                # Define the decoder layer spec 获取模型配置蓝图
+                # Define the decoder layer spec 获取模型层配置蓝图
                 transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
         mtp_block_spec = None
         if args.mtp_num_layers is not None:

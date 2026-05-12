@@ -44,7 +44,7 @@ class LanguageModule(MegatronModule):
 
     def __init__(
         self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
-    ) -> None:
+    ) -> None: #设置通信组
         super().__init__(config=config)
         self._set_attention_backend()
         if pg_collection is None:

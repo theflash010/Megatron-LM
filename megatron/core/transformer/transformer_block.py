@@ -226,7 +226,7 @@ def _get_block_submodules(
 ) -> TransformerBlockSubmodules:
     """
     Retrieve or construct TransformerBlockSubmodules based on the provided specification.
-
+    #TransformerBlockSubmodules定义了一个TransformerBlock包含的子组件的配置蓝图，
     Args:
         config (TransformerConfig): Configuration object for the transformer model.
         spec (Union[TransformerBlockSubmodules, ModuleSpec]): Specification for the
@@ -246,7 +246,7 @@ def _get_block_submodules(
     # is implemented in `transformer_layer.py` or if it subclasses
     # `BaseTransformerLayer` from the `transformer_layer.py` file.
     elif isinstance(spec, ModuleSpec):
-        if issubclass(spec.module, TransformerBlock):
+        if issubclass(spec.module, TransformerBlock): #用于检查一个类是否是另一个类的子类   issubclass(子类, 父类) → bool。
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
@@ -282,7 +282,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         pp_rank = get_pg_rank(pp_group)
 
-        self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank)
+        self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank) #获取TransformerBlockSubmodules对象
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
@@ -364,7 +364,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.layers = torch.nn.ModuleList(
             [
                 build_layer(layer_spec, i + 1)
-                for i, layer_spec in enumerate(self.submodules.layer_specs)
+                for i, layer_spec in enumerate(self.submodules.layer_specs) #TransformerBlcok的submodules.layer_specs是一个列表，列表的每个元素代表一个layer的spec
             ]
         )
 
