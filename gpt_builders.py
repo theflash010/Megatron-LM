@@ -65,7 +65,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 assert not (config.transformer_impl == "inference_optimized")
                 transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
             else:
-                # Define the decoder layer spec
+                # Define the decoder layer spec 获取模型配置蓝图
                 transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
@@ -136,7 +136,7 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
-        )
+        )#获取TE库的模型配置
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
             config.qk_layernorm,

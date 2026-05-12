@@ -76,7 +76,7 @@ class CoreLocalSchema(CoreSchema):
 class CoreTESchema(CoreSchema):
 
     def __init__(self, model_type, prefix, extra_layer_schema):
-        super().__init__(model_type, layer_schema={ #TE模型参数名称和Megatron模型参数名称的映射字典，key是TE模型参数名称，value是Megatron模型参数名称
+        super().__init__(model_type, layer_schema={ #Megatron模型参数名称和TE模型参数名称的映射字典，key是Megatron模型参数名称，value是TE模型参数名称
             # Self attention.
             "self_attn_norm_weight" : "self_attention.linear_qkv.layer_norm_weight",
             "self_attn_norm_bias" : "self_attention.linear_qkv.layer_norm_bias",

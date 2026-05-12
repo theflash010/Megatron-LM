@@ -175,11 +175,11 @@ class ProcessGroupCollection:
                 If None, pull all default process groups. Each string should correspond to
                 one of the dataclass process group attributes.
         """
-        # Get all available process groups
+        # Get all available process groups 获取所有可用的进程组字段名
         all_pgs = {field.name for field in fields(cls)}
 
         # If no specific process groups requested, use all
-        if required_pgs is None:
+        if required_pgs is None: #确定需要初始化的进程组
             required_pgs = list(all_pgs)
 
         # Validate requested process groups
@@ -255,9 +255,9 @@ class ProcessGroupCollection:
         ProcessGroupCollection fields"
 
         # Build initialization dict by calling appropriate parallel_state get_foo_group
-        init_dict = {pg: pg_to_func[pg]() for pg in required_pgs}
+        init_dict = {pg: pg_to_func[pg]() for pg in required_pgs} #根据映射表调用对应的获取函数
 
-        return cls(**init_dict)
+        return cls(**init_dict) #创建并返回 ProcessGroupCollection 实例
 
     @staticmethod
     def setup_process_groups_for_optimizer(

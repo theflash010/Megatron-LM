@@ -231,7 +231,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
         moe_grouped_gemm=moe_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
         use_te_activation_func=use_te_activation_func,
-    )
+    )#mlp的module spec
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
@@ -323,7 +323,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                         L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
                     ),
                 ),
-            ),
+            ),#self attention的module spec
             self_attn_bda=get_bias_dropout_add,
             pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
             mlp=mlp,
@@ -516,7 +516,7 @@ def get_mlp_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_te_activation_func: bool = False,
-) -> ModuleSpec:
+) -> ModuleSpec: #获得MLP模块的ModuleSpec
     """Helper function to get module spec for MLP/MoE"""
 
     linear_fc2 = backend.row_parallel_linear()

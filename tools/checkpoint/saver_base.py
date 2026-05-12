@@ -435,7 +435,7 @@ class MegatronCheckpointSaverBase:
                 schema.set("embeddings", model, {
                     "pos" : pos_embed,
                     "word" : out_word_embed[tp_rank],
-                })#按照TP分片病赋值给
+                })#按照TP分片赋值给TE模型
 
         # Transformer layers.
         # ------------------

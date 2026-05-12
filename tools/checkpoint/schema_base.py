@@ -74,7 +74,7 @@ class ModelSchema:
     # Setters.
     @classmethod
     def _set(cls, schema, model, params):
-        for k, m in schema.items():
+        for k, m in schema.items(): #k是schema的key，m是value，也就是如果k在params里面，就把params[k]赋值给model.m
             if k in params:
                 cls._set_deep_tensor(model, m, params[k])
 
