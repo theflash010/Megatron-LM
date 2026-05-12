@@ -32,7 +32,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
             config = core_transformer_config_from_args(args)
-    if args.use_legacy_models:
+    if args.use_legacy_models:#老版本模型
         model = megatron.legacy.model.GPTModel(
             config,
             num_tokentypes=0,

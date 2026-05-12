@@ -340,6 +340,8 @@ class NumMicroBatchesCalculator(ABC):
 class ConstantNumMicroBatchesCalculator(NumMicroBatchesCalculator):
     """Calculator of number of microbatches with constant global batch size.
 
+    #这个类用来计算训练中的gbs，mbs，mbc（num_micro_batches），并将这些参数保存为自身成员
+
     Args:
         global_batch_size (int):
             Global batch size.

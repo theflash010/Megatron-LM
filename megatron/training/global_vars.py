@@ -136,7 +136,7 @@ def set_global_variables(args, build_tokenizer=True):
     if build_tokenizer:
         _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
-    _set_wandb_writer(args)
+    _set_wandb_writer(args) #wandb（Weights & Biases）是一个机器学习实验跟踪工具。可以记录 loss、accuracy、learning rate 等指标
     _set_one_logger(args)
     _set_adlr_autoresume(args)
     _set_timers(args)

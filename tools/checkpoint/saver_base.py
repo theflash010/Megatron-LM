@@ -54,7 +54,7 @@ class MegatronCheckpointSaverBase:
 
     def _load_checkpoint_args(self, margs):
         """
-        Load arguments from checkpoint to margs.
+        Load arguments from checkpoint to margs. #saver目前有些参数缺失，直接从ckpt中获取（除了一些saver配置所需的参数外）
         """
         if hasattr(self.md, 'checkpoint_args'):
             # These are arguments that we are either changing, or cause problems for validation if they are set
@@ -73,10 +73,10 @@ class MegatronCheckpointSaverBase:
                             'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
                             'start_weight_decay', 'end_weight_decay',
                             'ckpt_format',
-            ]
+            ]#这些是会被保留的参数，代表saver自身逻辑所需的一些参数，不会被检查点的参数覆盖
 
             for arg, value in vars(self.md.checkpoint_args).items():
-                if arg in args_to_keep:
+                if arg in args_to_keep: #对于args_to_keep的参数，直接跳过
                     continue
                 if not hasattr(margs, arg):
                     print(f"Checkpoint had argument {arg} but new arguments does not have this.")
@@ -162,6 +162,7 @@ class MegatronCheckpointSaverBase:
         # Initialize torch.distributed with a minimal single-process backend so that
         # process-group size queries (get_pg_size / get_tensor_model_parallel_group_if_none)
         # return the fake groups below rather than falling back to world_size=1.
+        #创建一个最小化的假进程组world_size=1，只有自己的进程组，代码中有很多地方调用 get_tensor_model_parallel_group() 或 get_pipeline_model_parallel_group()，这些函数依赖 torch.distributed 已初始化，创建这个单进程组后，这些函数就能正常返回 fake group 信息，而不是报错或返回 1。
         if not torch.distributed.is_initialized():
             os.environ.setdefault('MASTER_ADDR', 'localhost')
             os.environ.setdefault('MASTER_PORT', '12356')
@@ -325,7 +326,7 @@ class MegatronCheckpointSaverBase:
         """
         self.insert_megatron_path_and_check_te()
 
-        self.receive_checkpoint_metadata()
+        self.receive_checkpoint_metadata() #获取loader加载的模型的元数据，确定saver的并行配置
 
         self.parse_megatron_args()
 
