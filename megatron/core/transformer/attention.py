@@ -243,7 +243,7 @@ class CrossAttentionSubmodules:
 
 class Attention(MegatronModule, ABC):
     """Attention layer abstract class.
-
+    #纯Attention，不包括linear_qkv，只包括core_attention和linear_proj
     This layer only contains common modules required for the "self attn" and
     "cross attn" specializations.
     """
@@ -275,7 +275,7 @@ class Attention(MegatronModule, ABC):
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
         self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
-        self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
+        self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups  #num_query_groups用于适配GQA
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
@@ -331,7 +331,7 @@ class Attention(MegatronModule, ABC):
             cp_comm_type=cp_comm_type,
             softmax_scale=self.config.softmax_scale,
             pg_collection=self.pg_collection,
-        )
+        )#core_attention包括Q*KT的计算，sacle，mask，softmax，P*V的计算，可以选择FlashAttention/FusedAttention/UnfusedDotProductAttention作为core_attention
 
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'

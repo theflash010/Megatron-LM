@@ -235,7 +235,7 @@ class VocabParallelEmbedding(torch.nn.Module): #支持TP的embedding层
                 self.num_embeddings, get_pg_rank(self.tp_group), get_pg_size(self.tp_group)
             )
         )
-        self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index #每个TP负责的vocab数量。对于saver来说这里只是创建，所以不需要vocab_end_index和vocab_start_index对应上tp rank，只需要每个rank的形状是正确的，即num_embeddings_per_partition = vocab_size / TP数，后面加载参数的时候需要看一下是不是按照这个逻辑做的
+        self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index #每个TP负责的vocab数量。对于saver来说这里只是创建，所以不需要vocab_end_index和vocab_start_index对应上tp rank，只需要每个rank的形状是正确的，即num_embeddings_per_partition = vocab_size / TP数，后面加载参数的时候需要看一下是不是按照这个逻辑做的TODO
         self.deterministic_mode = config.deterministic_mode
         self.config = config
 

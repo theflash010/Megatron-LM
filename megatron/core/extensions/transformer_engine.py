@@ -1381,7 +1381,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         self.config = config
         self.te_forward_mask_type = False
-        self.qkv_format: str = "sbhd"
+        self.qkv_format: str = "sbhd"  ## sbhd 格式 (Megatron 默认)  qkv: [seq_len, batch_size, num_heads, head_dim]
         # Default to 1 split when batch-invariant mode is enabled, unless explicitly overridden
         self.num_splits: Optional[int] = (
             1 if (num_splits is None and self.config.batch_invariant_mode) else num_splits
