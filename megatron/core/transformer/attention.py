@@ -366,7 +366,7 @@ class Attention(MegatronModule, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
-        )
+        )#这个对应Attention中的linear_proj，即 O*W
 
         if (
             HAVE_TE
@@ -1357,7 +1357,7 @@ class SelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
-        )
+        )#父类Attention不是完整的SelfAttention，缺少linear_qkv等
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
@@ -1373,7 +1373,7 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
-        )
+        )#这是layernorm+linear融合算子，layernorm是layer开头的layernorm，linear是qkv的linear
 
         # Resolve which norm class to use for Q and K.
         # Config selects the default norm class; spec overrides if set.

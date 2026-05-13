@@ -666,7 +666,7 @@ class TENorm:
 
 class TELinear(te.pytorch.Linear):
     """Wrapper for the Transformer-Engine's `Linear` layer.
-
+    #支持TP的Linear，支持三种parallel mode：column、row、duplicated，父类te.pytorch.Linear本身就支持这三种
     Note that if Megatron's parallel_state has not been initialized
     yet, the tp_group passed to TE will be None and must be set later
     via set_tensor_parallel_group().
@@ -1041,7 +1041,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             return_layernorm_output=False,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
             **extra_kwargs,
-        )
+        )#父类就完成了LayerNorm和Linear的空间分配，并登记为参数
         self.te_quant_params: Optional[TEQuantizationParams] = None
 
         # Set proper partition_stride
@@ -1306,7 +1306,7 @@ class TERowParallelLinear(TELinear):
                 1,
                 init_method=condition_init_method(config, init_method),
                 stride=1,
-                return_master_weight=False,
+                return_master_weight=False,  #return_master_weight=False，master weight不会被保留，初始化weight参数后被丢弃
                 params_dtype=config.params_dtype,
                 rank=rank,
                 world_size=world_size,

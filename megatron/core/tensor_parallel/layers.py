@@ -164,8 +164,8 @@ def _initialize_affine_weight_cpu(
     skip_set_tensor_parallel_attributes=False,
 ):
     """Initialize affine weight for model parallel.
-
-    #一个例子：在处理SwiGLU这种gate FFN的时候，stride用于管理SwiGLU在TP下交错赋值，让每个TP rank都得到部分对应的gate和up矩阵参数
+    #这个函数的作用：CPU 上初始化完整权重master_weight → 分片 → 复制给 GPU 参数 → 自身按需保留或丢弃。
+    #stride的作用：交错赋值。一个例子：在处理SwiGLU这种gate FFN的时候，stride用于管理SwiGLU在TP下交错赋值，让每个TP rank都得到部分对应的gate和up矩阵参数
 
     Build the master weight on all processes and scatter
     the relevant chunk."""
