@@ -263,7 +263,7 @@ class GPTModel(LanguageModule):
             )#lm head使用的是列切分 column TP
 
         if self.pre_process or self.post_process or self.mtp_process:
-            self.setup_embeddings_and_output_layer()
+            self.setup_embeddings_and_output_layer() #对embedding和lm head的参数打了标记 weight.is_embedding_parameter = True
 
         if has_config_logger_enabled(self.config):
             log_config_to_disk(

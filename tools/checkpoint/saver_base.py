@@ -317,7 +317,7 @@ class MegatronCheckpointSaverBase:
         if self.models[pp_rank][ep_rank][tp_rank] is None:
             pre_process = True if pp_rank == 0 else False
             post_process = True if pp_rank == self.args.target_pipeline_parallel_size - 1 else False
-            self.models[pp_rank][ep_rank][tp_rank] = self.model_provider(pre_process, post_process).to(self.md.params_dtype)
+            self.models[pp_rank][ep_rank][tp_rank] = self.model_provider(pre_process, post_process).to(self.md.params_dtype) #列表的每一个元素self.models[pp_rank][ep_rank][tp_rank]都是一个Core版本的GPTModel，而且有TP分片逻辑，每个元素只有自己TP rank对应的数据，已经占据空间，还没初始化，是空参数
         return self.models[pp_rank][ep_rank][tp_rank]
 
     def save(self):
@@ -330,7 +330,7 @@ class MegatronCheckpointSaverBase:
 
         self.parse_megatron_args() 
 
-        self.initialize_megatron_env() #确定model_builder，创建fake通信环境（不知道会不会开多进程）
+        self.initialize_megatron_env() #确定model_builder，创建fake通信环境，始终单进程
 
         self.models = self.initialize_models() #创建一个 3D 数组，值为 None.  models[PP][EP][TP] = None
 
@@ -377,10 +377,10 @@ class MegatronCheckpointSaverBase:
 
         # Embeddings
         #-----------
-        embeddings_msg = self.queue_get("embeddings")
+        embeddings_msg = self.queue_get("embeddings") #获取loader发出的name == "embedding" 的消息，这个消息是一个字典，key是loader规定的参数名称，vaule是tensor
         import debugpy
         try:#使用异常处理适配多进程代码，这样只有一个进程会监听5678端口
-            debugpy.listen(("localhost", 5678))
+            debugpy.listen(("localhost", 5679))
             print("Waiting for debugger attach")
             debugpy.wait_for_client()#强制等待vscode调试点击
         except Exception as e:
@@ -388,7 +388,7 @@ class MegatronCheckpointSaverBase:
         pos_embed = None
         if self.md.position_embedding_type == 'learned_absolute':
             pos_embed = embeddings_msg.pop("position embeddings")
-        orig_word_embed = embeddings_msg.pop("word embeddings") #loader获取的embedding的权重值
+        orig_word_embed = embeddings_msg.pop("word embeddings") #获取的'embedding'消息中的key为'word embeddings'对应的tensor
         self.check_message(embeddings_msg)
 
         # Deal with padding
@@ -429,7 +429,7 @@ class MegatronCheckpointSaverBase:
         # --------------
         for ep_rank in range(self.args.target_expert_parallel_size):
             for tp_rank in range(self.args.target_tensor_parallel_size):
-                model = self.get_local_model(0, ep_rank, tp_rank) #好像build了模型
+                model = self.get_local_model(0, ep_rank, tp_rank) #构建了TP rank所需的模型GPTModel，占用空间
                 if pos_embed is None:
                     assert not schema.has_position_embeddings(model)
                 schema.set("embeddings", model, {
