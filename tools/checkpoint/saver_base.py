@@ -435,7 +435,7 @@ class MegatronCheckpointSaverBase:
                 schema.set("embeddings", model, {
                     "pos" : pos_embed,
                     "word" : out_word_embed[tp_rank],
-                })#通过自定义的标识符来对实际的模型参数名进行映射，按照TP分片赋值给TE模型
+                })#通过自定义的标识符"pos"/"word"来对实际的模型参数名“embedding.position_embeddings.weight”进行映射，按照TP分片赋值给TE模型
 
         # Transformer layers.
         # ------------------

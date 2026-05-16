@@ -18,7 +18,7 @@ class CoreSchema(ModelSchema):
 
     def __init__(self, model_type, layer_schema, prefix):
         block_key = get_core_transformer_block_key(model_type)
-        super().__init__({ #构建参数名称映射字典作为父类初始化的参数mapping，key是saver自己定的标识符，如'embedding'/'pos'，value是GPTModel的实际参数名，saver通过获取loader发送的message，然后通过自定义的标识符来对实际的模型参数名进行映射，如'embedding.word_embeddings.weight'
+        super().__init__({ #构建参数名称映射字典作为父类初始化的参数mapping，key是saver自己定的标识符，如'embedding'/'pos'，value是GPTModel的实际参数名，如'embedding.word_embeddings.weight'，saver通过获取loader发送的message，然后通过自定义的标识符来对实际的模型参数名进行映射。这里还需要layer_schema，这个是由子类确定的
             "embeddings" : {
                 "pos" : f"{prefix}embedding.position_embeddings.weight",
                 "word" : f"{prefix}embedding.word_embeddings.weight",
@@ -76,7 +76,7 @@ class CoreLocalSchema(CoreSchema):
 class CoreTESchema(CoreSchema):
 
     def __init__(self, model_type, prefix, extra_layer_schema):
-        super().__init__(model_type, layer_schema={ #Megatron模型参数名称和TE模型参数名称的映射字典，key是Megatron模型参数名称，value是TE模型参数名称
+        super().__init__(model_type, layer_schema={ #saver自定义的参数名称的映射字典，key是saver自己定的标识符，value是GPTModel的实际参数名，这里是具体的layer部分，根据后端不同选用不同类
             # Self attention.
             "self_attn_norm_weight" : "self_attention.linear_qkv.layer_norm_weight",
             "self_attn_norm_bias" : "self_attention.linear_qkv.layer_norm_bias",
