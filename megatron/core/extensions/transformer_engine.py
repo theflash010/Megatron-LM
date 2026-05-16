@@ -1017,7 +1017,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
-        self.stride = stride
+        self.stride = stride #应对SWiGLU这种gate FFN
 
         super().__init__(
             in_features=input_size,

@@ -870,7 +870,7 @@ class ColumnParallelLinear(torch.nn.Module):
                     torch.empty(
                         self.output_size_per_partition, self.input_size, dtype=config.params_dtype
                     )
-                )
+                )#这里是按照矩阵转置后的形状构造的，原因可以看上面的注释
                 if config.perform_initialization:
                     self.master_weight = _initialize_affine_weight_cpu(
                         self.weight,
@@ -883,7 +883,7 @@ class ColumnParallelLinear(torch.nn.Module):
                         return_master_weight=keep_master_weight_for_test,
                         rank=rank,
                         world_size=world_size,
-                    )#这里的stride用于管理SwiGLU在TP下交错赋值，让每个TP rank都得到部分对应的gate和up矩阵
+                    )#这里的stride用于管理SwiGLU在TP下交错赋值，让每个TP rank都得到部分对应的gate和up矩阵     torch.nn.functional.linear performs XA^T + b and as a result
                 else:
                     set_tensor_model_parallel_attributes(
                         tensor=self.weight, is_parallel=True, dim=0, stride=stride
@@ -1219,7 +1219,7 @@ class RowParallelLinear(torch.nn.Module):
                 torch.empty(
                     self.output_size, self.input_size_per_partition, dtype=config.params_dtype
                 )
-            )
+            )#这里是按照矩阵转置后的形状构造的，原因可以看上面的注释   torch.nn.functional.linear performs XA^T + b and as a result
             if config.perform_initialization:
                 self.master_weight = _initialize_affine_weight_cpu(
                     self.weight,

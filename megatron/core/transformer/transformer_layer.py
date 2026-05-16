@@ -353,7 +353,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # [Module 6: BiasDropoutFusion]
         self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config)
 
-        # [Module 7: Pre MLP] Optional Layernorm before MLP
+        # [Module 7: Pre MLP] Optional Layernorm before MLP   这里没有，因为可以将LayerNorm和后续MLP中的Linear1算子合并，使用TELayerNormColumnParallelLinear这个类
         self.pre_mlp_layernorm = submodules.pre_mlp_layernorm(
             config=self.config,
             hidden_size=self.config.hidden_size,

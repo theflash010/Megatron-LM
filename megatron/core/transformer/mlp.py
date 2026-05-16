@@ -221,7 +221,7 @@ class MLP(MegatronModule):
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
             stride=fc1_stride,
-        )#这个是LayerNorm+Linear，Linear包含gate Linear和up Linear
+        )#这个是LayerNorm+Linear，Linear包含gate Linear和up Linear，这两个Linear矩阵是合并形式
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
             self.activation_func = apply_module(submodules.activation_func(config=self.config))
@@ -241,7 +241,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc2",
             tp_group=tp_group,
-        )
+        )#TERowParallelLinear单纯downLinear
 
     def forward(
         self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs

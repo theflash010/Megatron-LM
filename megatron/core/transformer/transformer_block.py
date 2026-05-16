@@ -282,7 +282,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         pp_rank = get_pg_rank(pp_group)
 
-        self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank) #获取TransformerBlockSubmodules对象
+        self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank) #获取TransformerBlockSubmodules
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
@@ -319,7 +319,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
             self.config._cpu_offloading_context = None
 
-        self._build_layers()
+        self._build_layers() #构建Block内部的各个子layer
         self.num_layers_per_pipeline_rank = len(self.layers)
 
     def _build_layers(self):
@@ -363,15 +363,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # offset is implicit in TransformerLayer
         self.layers = torch.nn.ModuleList(
             [
-                build_layer(layer_spec, i + 1)
+                build_layer(layer_spec, i + 1) #构建每个TransformerLayer，占用空间
                 for i, layer_spec in enumerate(self.submodules.layer_specs) #TransformerBlcok的submodules.layer_specs是一个列表，列表的每个元素代表一个layer的spec
             ]
-        )
+        )#构建中间Layers
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
-        if self.has_final_layernorm_in_this_stage():
+        if self.has_final_layernorm_in_this_stage(): #最后一层后面的LayerNorm
             self.final_layernorm = not_none(self.submodules.layer_norm)(
                 config=self.config,
                 hidden_size=self.config.hidden_size,

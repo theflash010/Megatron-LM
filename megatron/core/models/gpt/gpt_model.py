@@ -213,7 +213,7 @@ class GPTModel(LanguageModule):
             post_process=self.post_process,
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
-        )
+        )#构建主体TransformerBlock
 
         if self.mtp_process:
             self.mtp = MultiTokenPredictionBlock(
@@ -260,7 +260,7 @@ class GPTModel(LanguageModule):
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.pg_collection.tp,
-            )
+            )#lm head使用的是列切分 column TP
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
