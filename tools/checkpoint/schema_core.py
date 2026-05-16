@@ -18,7 +18,7 @@ class CoreSchema(ModelSchema):
 
     def __init__(self, model_type, layer_schema, prefix):
         block_key = get_core_transformer_block_key(model_type)
-        super().__init__({ #构建参数名称映射字典作为父类初始化的参数mapping，key为loader发送的消息名称，如'embedding'，value是Megatron-LM中对应的参数名称，如'embedding.word_embeddings.weight'
+        super().__init__({ #构建参数名称映射字典作为父类初始化的参数mapping，key是saver自己定的标识符，如'embedding'/'pos'，value是GPTModel的实际参数名，saver通过获取loader发送的message，然后通过自定义的标识符来对实际的模型参数名进行映射，如'embedding.word_embeddings.weight'
             "embeddings" : {
                 "pos" : f"{prefix}embedding.position_embeddings.weight",
                 "word" : f"{prefix}embedding.word_embeddings.weight",

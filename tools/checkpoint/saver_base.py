@@ -317,7 +317,7 @@ class MegatronCheckpointSaverBase:
         if self.models[pp_rank][ep_rank][tp_rank] is None:
             pre_process = True if pp_rank == 0 else False
             post_process = True if pp_rank == self.args.target_pipeline_parallel_size - 1 else False
-            self.models[pp_rank][ep_rank][tp_rank] = self.model_provider(pre_process, post_process).to(self.md.params_dtype) #列表的每一个元素self.models[pp_rank][ep_rank][tp_rank]都是一个Core版本的GPTModel，而且有TP分片逻辑，每个元素只有自己TP rank对应的数据，已经占据空间，还没初始化，是空参数
+            self.models[pp_rank][ep_rank][tp_rank] = self.model_provider(pre_process, post_process).to(self.md.params_dtype) #列表的每一个元素self.models[pp_rank][ep_rank][tp_rank]都是一个Core版本的GPTModel，而且有TP分片逻辑，每个元素只有自己TP rank对应的权重数据，已经占据空间，还没初始化，是空参数
         return self.models[pp_rank][ep_rank][tp_rank]
 
     def save(self):
@@ -435,7 +435,7 @@ class MegatronCheckpointSaverBase:
                 schema.set("embeddings", model, {
                     "pos" : pos_embed,
                     "word" : out_word_embed[tp_rank],
-                })#按照TP分片赋值给TE模型
+                })#通过自定义的标识符来对实际的模型参数名进行映射，按照TP分片赋值给TE模型
 
         # Transformer layers.
         # ------------------
