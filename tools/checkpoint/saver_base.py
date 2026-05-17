@@ -447,24 +447,24 @@ class MegatronCheckpointSaverBase:
                     debugpy.wait_for_client()#强制等待vscode调试点击
                 except Exception as e:
                     pass
-                input_norm_weight = msg.pop("input norm weight")
-                post_norm_weight = msg.pop("post norm weight")
+                input_norm_weight = msg.pop("input norm weight") #layer.input_norm.weight
+                post_norm_weight = msg.pop("post norm weight") #layer.post_attention_norm.weight
                 if self.md.norm_has_bias:
                     input_norm_bias = msg.pop("input norm bias")
                     post_norm_bias = msg.pop("post norm bias")
 
                 # Split up the parallel tensors
-                qkv_weight = chunk_weight(msg.pop("qkv weight"), "column", self.args.target_tensor_parallel_size)
-                dense_weight = chunk_weight(msg.pop("dense weight"), "row", self.args.target_tensor_parallel_size)
-                mlp_l1_weight = chunk_weight(msg.pop("mlp l1 weight"), "row", self.args.target_tensor_parallel_size, self.args.target_expert_parallel_size)
+                qkv_weight = chunk_weight(msg.pop("qkv weight"), "column", self.args.target_tensor_parallel_size) #layer.self_attention.query_key_value.weight
+                dense_weight = chunk_weight(msg.pop("dense weight"), "row", self.args.target_tensor_parallel_size) #layer.self_attention.dense.weight
+                mlp_l1_weight = chunk_weight(msg.pop("mlp l1 weight"), "row", self.args.target_tensor_parallel_size, self.args.target_expert_parallel_size) #layer.mlp.dense_4h_to_h.weight
 
                 if self.margs.num_experts:
                     router = msg.pop("router weight")
 
                 # Special handling for swiglu
                 if self.md.swiglu:
-                    mlp_l0_weight_W = chunk_weight(msg.pop("mlp l0 weight W"), "column", self.args.target_tensor_parallel_size, self.args.target_expert_parallel_size)
-                    mlp_l0_weight_V = chunk_weight(msg.pop("mlp l0 weight V"), "column", self.args.target_tensor_parallel_size, self.args.target_expert_parallel_size)
+                    mlp_l0_weight_W = chunk_weight(msg.pop("mlp l0 weight W"), "column", self.args.target_tensor_parallel_size, self.args.target_expert_parallel_size) #部分 layer.mlp.dense_h_to_4h.weight
+                    mlp_l0_weight_V = chunk_weight(msg.pop("mlp l0 weight V"), "column", self.args.target_tensor_parallel_size, self.args.target_expert_parallel_size) #部分 layer.mlp.dense_h_to_4h.weight
                     mlp_l0_weight = torch.cat((mlp_l0_weight_W, mlp_l0_weight_V), dim=-2)
                 else:
                     mlp_l0_weight = chunk_weight(msg.pop("mlp l0 weight"), "column", self.args.target_tensor_parallel_size, self.args.target_expert_parallel_size)
