@@ -378,13 +378,6 @@ class MegatronCheckpointSaverBase:
         # Embeddings
         #-----------
         embeddings_msg = self.queue_get("embeddings") #获取loader发出的name == "embedding" 的消息，这个消息是一个字典，key是loader规定的参数名称，vaule是tensor
-        import debugpy
-        try:#使用异常处理适配多进程代码，这样只有一个进程会监听5678端口
-            debugpy.listen(("localhost", 5679))
-            print("Waiting for debugger attach")
-            debugpy.wait_for_client()#强制等待vscode调试点击
-        except Exception as e:
-            pass
         pos_embed = None
         if self.md.position_embedding_type == 'learned_absolute':
             pos_embed = embeddings_msg.pop("position embeddings")
@@ -435,7 +428,7 @@ class MegatronCheckpointSaverBase:
                 schema.set("embeddings", model, {
                     "pos" : pos_embed,
                     "word" : out_word_embed[tp_rank],
-                })#通过自定义的标识符"pos"/"word"来对实际的模型参数名“embedding.position_embeddings.weight”进行映射，按照TP分片赋值给TE模型
+                })#通过自定义的标识符"pos"/"word"来对实际的模型参数名“embedding.position_embeddings.weight”进行映射，同时保证TP分片正确
 
         # Transformer layers.
         # ------------------
@@ -445,9 +438,15 @@ class MegatronCheckpointSaverBase:
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
             self.get_local_model(pp_rank,0,0)
             for layer_id in range(schema.get_num_layers(self.models[pp_rank][0][0])):
-                msg = self.queue_get(f"transformer layer {total_layer_num}")
-
+                msg = self.queue_get(f"transformer layer {total_layer_num}") #接收loader发送的name == "transformer layer {layer_id}"的消息
                 # duplicated tensors
+                import debugpy
+                try:#使用异常处理适配多进程代码，这样只有一个进程会监听5678端口
+                    debugpy.listen(("localhost", 5670))
+                    print("Waiting for debugger attach")
+                    debugpy.wait_for_client()#强制等待vscode调试点击
+                except Exception as e:
+                    pass
                 input_norm_weight = msg.pop("input norm weight")
                 post_norm_weight = msg.pop("post norm weight")
                 if self.md.norm_has_bias:

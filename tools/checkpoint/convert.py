@@ -152,32 +152,31 @@ def main():
     # Initialize queue
     queue = mp.Queue(maxsize=args.max_queue_size)
 
-    # # Start saver process.
-    # print("Starting saver...")
-    # saver_proc = mp.Process(target=saver.save_checkpoint, args=(queue, args))
-    # saver_proc.start()
-
-    # # Run loader.
-    # print("Starting loader...")
-    # loader.load_checkpoint(queue, args)
-
-    # # Finish saver process.
-    # print("Waiting for saver to complete...")
-    # saver_proc.join()
-
-    # Start loader process.
-    print("Starting loader...")
-    loader_proc = mp.Process(target=loader.load_checkpoint, args=(queue, args))
-    loader_proc.start()
-
-    # Run saver.
+    # Start saver process.
     print("Starting saver...")
-    saver.save_checkpoint(queue, args)
-    
+    saver_proc = mp.Process(target=saver.save_checkpoint, args=(queue, args))
+    saver_proc.start()
+
+    # Run loader.
+    print("Starting loader...")
+    loader.load_checkpoint(queue, args)
 
     # Finish saver process.
     print("Waiting for saver to complete...")
-    loader_proc.join()
+    saver_proc.join()
+
+    # # Start loader process.
+    # print("Starting loader...")
+    # loader_proc = mp.Process(target=loader.load_checkpoint, args=(queue, args))
+    # loader_proc.start()
+
+    # # Run saver.
+    # print("Starting saver...")
+    # saver.save_checkpoint(queue, args)
+
+    # # Finish loader process.
+    # print("Waiting for loader to complete...")
+    # loader_proc.join()
 
 
 

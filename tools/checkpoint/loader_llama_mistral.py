@@ -593,7 +593,13 @@ def _load_checkpoint(queue, args):
         if md.linear_bias:
             message["dense bias"] = layer.self_attention.dense.bias.data
             message["mlp l1 bias"] = layer.mlp.dense_4h_to_h.bias.data
-
+        import debugpy
+        try:#使用异常处理适配多进程代码，这样只有一个进程会监听5678端口
+            debugpy.listen(("localhost", 5670))
+            print("Waiting for debugger attach")
+            debugpy.wait_for_client()#强制等待vscode调试点击
+        except Exception as e:
+            pass
         # Grab all parallel tensors for this layer.
         qkv_weight = []
         qkv_bias = []
@@ -615,10 +621,10 @@ def _load_checkpoint(queue, args):
         # Handle gated linear units.
         if md.swiglu: #对SwiGLU的特殊处理
             # Concat all the first halves ('W's) and all the second halves ('V's).
-            for tp_rank in range(tp_size):
+            for tp_rank in range(tp_size): #loader是TP=1
                 mlp_l0_weight[tp_rank] = torch.chunk(mlp_l0_weight[tp_rank], 2, dim=0)
-            message["mlp l0 weight W"] = torch.cat([w[0] for w in mlp_l0_weight], dim=0)
-            message["mlp l0 weight V"] = torch.cat([w[1] for w in mlp_l0_weight], dim=0)
+            message["mlp l0 weight W"] = torch.cat([w[0] for w in mlp_l0_weight], dim=0) #W矩阵是指gate矩阵
+            message["mlp l0 weight V"] = torch.cat([w[1] for w in mlp_l0_weight], dim=0) #V矩阵是指up矩阵
         else:
             message["mlp l0 weight"] = torch.cat(mlp_l0_weight, dim=0)
 
@@ -652,6 +658,11 @@ def _load_checkpoint(queue, args):
         queue_put("output layer", message)
 
     queue.put("done")
+
+    print("Loader waiting for debugger... Press Ctrl+C to continue")
+    import time
+    while True:
+        time.sleep(1)
 
     if args.checkpoint_type == "meta":
         shutil.rmtree(os.path.join(args.load_dir))
