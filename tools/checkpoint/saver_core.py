@@ -58,7 +58,7 @@ class MegatronCheckpointSaverLLM(MegatronCheckpointSaverBase):
             self.margs.num_experts,
             self.margs.expert_model_parallel_size,
         )
-        self.receive_lm(schema)
+        self.receive_lm(schema) #获取loader发送的参数权重，并以此初始化Core版本的GPTModel中的参数
 
 def save_checkpoint(queue, args):
     """

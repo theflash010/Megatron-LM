@@ -213,7 +213,7 @@ class MegatronCheckpointSaverBase:
         return val
 
     def check_message(self, msg):
-        """
+        """  确保msg所有字段都被使用了，除了"name"字段
         Check that a field exists on queue message if necessary.
         """
         if not self.args.checking:
@@ -334,7 +334,7 @@ class MegatronCheckpointSaverBase:
 
         self.models = self.initialize_models() #创建一个 3D 数组，值为 None.  models[PP][EP][TP] = None
 
-        self.receive_model()
+        self.receive_model() #获取loader发送的参数权重，并以此初始化Core版本的GPTModel中的参数
 
         self.save_local_models_to_checkpoint()
 
@@ -437,7 +437,7 @@ class MegatronCheckpointSaverBase:
             mpu.set_pipeline_model_parallel_rank(pp_rank)
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
             self.get_local_model(pp_rank,0,0)
-            for layer_id in range(schema.get_num_layers(self.models[pp_rank][0][0])):
+            for layer_id in range(schema.get_num_layers(self.models[pp_rank][0][0])): #针对当前pp rank对应的layer
                 msg = self.queue_get(f"transformer layer {total_layer_num}") #接收loader发送的name == "transformer layer {layer_id}"的消息
                 # duplicated tensors
                 import debugpy
@@ -453,7 +453,7 @@ class MegatronCheckpointSaverBase:
                     input_norm_bias = msg.pop("input norm bias")
                     post_norm_bias = msg.pop("post norm bias")
 
-                # Split up the parallel tensors
+                # Split up the parallel tensors 按照TP切分tensor
                 qkv_weight = chunk_weight(msg.pop("qkv weight"), "column", self.args.target_tensor_parallel_size) #layer.self_attention.query_key_value.weight
                 dense_weight = chunk_weight(msg.pop("dense weight"), "row", self.args.target_tensor_parallel_size) #layer.self_attention.dense.weight
                 mlp_l1_weight = chunk_weight(msg.pop("mlp l1 weight"), "row", self.args.target_tensor_parallel_size, self.args.target_expert_parallel_size) #layer.mlp.dense_4h_to_h.weight
@@ -481,7 +481,7 @@ class MegatronCheckpointSaverBase:
                     else:
                         mlp_l0_bias = chunk_bias(msg.pop("mlp l0 bias"), 'column', self.args.target_tensor_parallel_size, self.args.target_expert_parallel_size)
 
-                # Save them to the model
+                # Save them to the model 在单个layer内部按照TP逻辑对每个TP rank初始化其参数权重
                 for ep_rank in range(self.args.target_expert_parallel_size):
                     for tp_rank in range(self.args.target_tensor_parallel_size):
                         params_dict = {
@@ -527,14 +527,14 @@ class MegatronCheckpointSaverBase:
                                 "router_weight":  router
                             })
                         model = self.get_local_model(pp_rank, ep_rank, tp_rank)
-                        schema.set_layer(model, layer_id, params_dict)
+                        schema.set_layer(model, layer_id, params_dict) #根据上面获取的[tp_rank]权重分片，初始化单个layer的参数权重
 
                 total_layer_num = total_layer_num + 1
                 self.check_message(msg)
 
 
-            if pp_rank == self.args.target_pipeline_parallel_size - 1:
-                msg = self.queue_get("final norm")
+            if pp_rank == self.args.target_pipeline_parallel_size - 1: #最后一个stage的pp rank需要额外做的事情
+                msg = self.queue_get("final norm") #model.language_model.encoder.final_norm.weight
                 final_norm_weight = msg.pop("weight")
                 if self.md.norm_has_bias:
                     final_norm_bias = msg.pop("bias")
@@ -545,7 +545,7 @@ class MegatronCheckpointSaverBase:
                     schema.set("final_norm", model, {
                         "weight" : final_norm_weight,
                         "bias" : final_norm_bias if self.md.norm_has_bias else None,
-                    })
+                    }) #初始化final norm
                     if pp_rank != 0 and not self.md.output_layer:
                         # Copy word embeddings to final pipeline rank
                         schema.set("output_layer", model, {
@@ -561,13 +561,13 @@ class MegatronCheckpointSaverBase:
                     if not hasattr(pp_local_models[0] if prefix is None else getattr(pp_local_models[0], prefix), 'output_layer'):
                         print("ERROR: got an output layer, but model does not have one")
                         exit(1)
-                    output_layer_weight = pad_weight(msg.pop("weight"), self.md.true_vocab_size)
+                    output_layer_weight = pad_weight(msg.pop("weight"), self.md.true_vocab_size) #model.language_model.output_layer.weight
                     output_layer_weight = torch.chunk(output_layer_weight, self.args.target_tensor_parallel_size, dim=0)
                     for eptp_rank, model in enumerate(pp_local_models):
                         tp_rank = eptp_rank % self.args.target_tensor_parallel_size
                         schema.set("output_layer", model, {
                             "weight" : output_layer_weight[tp_rank],
-                        })
+                        }) #初始化output_layer
                     self.check_message(msg)
 
                 msg = self.queue_get()
