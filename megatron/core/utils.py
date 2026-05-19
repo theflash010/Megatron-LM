@@ -2267,7 +2267,9 @@ def nvtx_decorator(message: Optional[str] = None) -> Callable[[_Wrapped], _Wrapp
 
 
 def unwrap_model(model, module_instances=None):
-    """Unwrap_model to return the final model instance"""
+    """Unwrap_model to return the final model instance
+    模型解包函数，用于去除 DDP/FSDP 等分布式训练 wrapper，获取底层真实模型。
+    """
     if module_instances is None:
         from megatron.core.distributed import DistributedDataParallel as DDP
         from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -2279,7 +2281,7 @@ def unwrap_model(model, module_instances=None):
         module_instances = (DDP, torch_FSDP, megatron_FSDP, Float16Module)
 
     return_list = True
-    if not isinstance(model, list):
+    if not isinstance(model, list): #判断model本身是不是列表，如果本身是列表，那解包之后也应该返回一个列表，反之依然
         model = [model]
         return_list = False
     unwrapped_model = []

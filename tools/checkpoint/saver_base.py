@@ -360,7 +360,7 @@ class MegatronCheckpointSaverBase:
                     save_checkpoint(self.md.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
                         pipeline_rank=pp_rank, pipeline_parallel=self.args.target_pipeline_parallel_size > 1,
                         expert_rank=ep_rank, expert_parallel=self.args.target_expert_parallel_size > 1,
-                        tensor_rank=tp_rank)
+                        tensor_rank=tp_rank) #只是保存一个rank的模型权重
                     # release the uselese model parts
                     self.models[pp_rank][ep_rank][tp_rank] = None
 

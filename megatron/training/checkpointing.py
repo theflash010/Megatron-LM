@@ -521,7 +521,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
-    ckpt_type = CheckpointType.GLOBAL if args.use_dist_ckpt else CheckpointType.LEGACY
+    ckpt_type = CheckpointType.GLOBAL if args.use_dist_ckpt else CheckpointType.LEGACY #模型转换用的是LEGACY
     save_dir = args.save
     if non_persistent_ckpt:
         if args.non_persistent_ckpt_type == 'global':
@@ -560,7 +560,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Checkpoint name.
     return_base_dir = (ckpt_type != CheckpointType.LEGACY)
     checkpoint_name = get_checkpoint_name(save_dir, iteration, release=release, pipeline_parallel=pipeline_parallel,
-        tensor_rank=tensor_rank, pipeline_rank=pipeline_rank, expert_parallel=expert_parallel, expert_rank=expert_rank, return_base_dir=return_base_dir)
+        tensor_rank=tensor_rank, pipeline_rank=pipeline_rank, expert_parallel=expert_parallel, expert_rank=expert_rank, return_base_dir=return_base_dir) #确定每个检查点文件的名字，或者说保存路径
 
     # Save dataloader state if the dataloader supports it (currently only Megatron Energon).
     maybe_save_dataloader_state(train_data_iterator, iteration, getattr(args, "dataloader_save", None))
@@ -616,7 +616,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
             model_sd_kwargs=dict(metadata=sharded_sd_metadata),
             rerun_state=rerun_state,
-        )
+        )#获取state_dict，包括model、optimizer、rng_state、rerun_state等
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == "torch_dist":
@@ -1011,7 +1011,7 @@ def generate_state_dict(
                 })
             )
         else:   # torch, torch_dcp, fsdp_dtensor
-            model_sd = model[i].state_dict_for_save_checkpoint()
+            model_sd = model[i].state_dict_for_save_checkpoint() #获取所有带参数的module对应的参数名和参数tensor，就是字典module.state_dict()，如decoder.layers.0.self_attention.linear_proj.weight : tensor[...]。对于decoder这种本身_parameters为{}的module，就没有记录
 
         state_dict[key] = model_sd
 
