@@ -336,7 +336,7 @@ class MegatronCheckpointSaverBase:
 
         self.receive_model() #获取loader发送的参数权重，并以此初始化Core版本的GPTModel中的参数
 
-        self.save_local_models_to_checkpoint()
+        self.save_local_models_to_checkpoint() #获取GPTModel的state_dict，参数转换只有model.state_dict，不包括优化器/rng这些其他的，然后通过torch.save()将state_dict保存为.pt文件
 
         print("Done!")
 
@@ -362,7 +362,7 @@ class MegatronCheckpointSaverBase:
                         expert_rank=ep_rank, expert_parallel=self.args.target_expert_parallel_size > 1,
                         tensor_rank=tp_rank) #只是保存一个rank的模型权重
                     # release the uselese model parts
-                    self.models[pp_rank][ep_rank][tp_rank] = None
+                    self.models[pp_rank][ep_rank][tp_rank] = None #删除原模型参数，节省空间
 
     def receive_lm(self, schema, prefix=None):
         """

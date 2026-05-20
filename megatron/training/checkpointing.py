@@ -517,7 +517,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     ft_integration.on_checkpointing_start()
 
     # Only rank zero of the data parallel writes to the disk.
-    model = unwrap_model(model)
+    model = unwrap_model(model) #剥掉所有 wrapper（DDP/FSDP），恢复原始模型
 
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
@@ -616,7 +616,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
             model_sd_kwargs=dict(metadata=sharded_sd_metadata),
             rerun_state=rerun_state,
-        )#获取state_dict，包括model、optimizer、rng_state、rerun_state等
+        )#获取state_dict，包括model、optimizer、rng_state、rerun_state等。模型转换场景只获取model.state_dict()
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == "torch_dist":
@@ -759,7 +759,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 # Save.
                 ensure_directory_exists(checkpoint_name)
                 torch.save(state_dict, checkpoint_name)
-    start_misc = time()
+    start_misc = time() #misc 是 miscellaneous 的缩写，意为"杂项/其他"，表示保存之后的收尾工作（一些记录日志等）
     if ckpt_type != CheckpointType.LOCAL:
         if not args.async_save:
             assert async_save_request is None
@@ -864,7 +864,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    end_misc = time()
+    end_misc = time() #收尾工作的结束时间
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
