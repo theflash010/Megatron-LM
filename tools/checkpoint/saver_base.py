@@ -440,13 +440,13 @@ class MegatronCheckpointSaverBase:
             for layer_id in range(schema.get_num_layers(self.models[pp_rank][0][0])): #针对当前pp rank对应的layer
                 msg = self.queue_get(f"transformer layer {total_layer_num}") #接收loader发送的name == "transformer layer {layer_id}"的消息
                 # duplicated tensors
-                import debugpy
-                try:#使用异常处理适配多进程代码，这样只有一个进程会监听5678端口
-                    debugpy.listen(("localhost", 5670))
-                    print("Waiting for debugger attach")
-                    debugpy.wait_for_client()#强制等待vscode调试点击
-                except Exception as e:
-                    pass
+                # import debugpy
+                # try:#使用异常处理适配多进程代码，这样只有一个进程会监听5678端口
+                #     debugpy.listen(("localhost", 5670))
+                #     print("Waiting for debugger attach")
+                #     debugpy.wait_for_client()#强制等待vscode调试点击
+                # except Exception as e:
+                #     pass
                 input_norm_weight = msg.pop("input norm weight") #layer.input_norm.weight
                 post_norm_weight = msg.pop("post norm weight") #layer.post_attention_norm.weight
                 if self.md.norm_has_bias:

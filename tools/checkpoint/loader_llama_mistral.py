@@ -653,10 +653,10 @@ def _load_checkpoint(queue, args):
 
     queue.put("done")
 
-    print("Loader waiting for debugger... Press Ctrl+C to continue")
-    import time
-    while True:
-        time.sleep(1)
+    # print("Loader waiting for debugger... Press Ctrl+C to continue")
+    # import time
+    # while True:
+    #     time.sleep(1)
 
     if args.checkpoint_type == "meta":
         shutil.rmtree(os.path.join(args.load_dir))
