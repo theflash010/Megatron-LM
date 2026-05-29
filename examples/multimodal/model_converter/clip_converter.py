@@ -12,7 +12,7 @@ def convert(download_root, output_path, tensor_parallel_size, use_te):
 
     model, _ = clip.load("ViT-L/14@336px", device=device, download_root=download_root) #获取CLIP模型，并且已经加载了TorchScript中的数据
 
-    state_dict = model.state_dict()
+    state_dict = model.state_dict() #获取CLIP模型的状态字典，当前是PyTorch格式，接下来需要转换为Megatron-LM格式
     new_state_dicts = [{"model": dict()} for _ in range(tensor_parallel_size)]
 
     # Indices from mapping pytorch multihead attention to megatron.
