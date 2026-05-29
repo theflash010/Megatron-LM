@@ -10,7 +10,7 @@ import clip
 def convert(download_root, output_path, tensor_parallel_size, use_te):
     device = "cuda"
 
-    model, _ = clip.load("ViT-L/14@336px", device=device, download_root=download_root)
+    model, _ = clip.load("ViT-L/14@336px", device=device, download_root=download_root) #获取CLIP模型，并且已经加载了TorchScript中的数据
 
     state_dict = model.state_dict()
     new_state_dicts = [{"model": dict()} for _ in range(tensor_parallel_size)]
