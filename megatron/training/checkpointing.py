@@ -758,7 +758,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 assert ckpt_type == CheckpointType.LEGACY
                 # Save.
                 ensure_directory_exists(checkpoint_name)
-                torch.save(state_dict, checkpoint_name)
+                torch.save(state_dict, checkpoint_name) #模型转换的保存
     start_misc = time() #misc 是 miscellaneous 的缩写，意为"杂项/其他"，表示保存之后的收尾工作（一些记录日志等）
     if ckpt_type != CheckpointType.LOCAL:
         if not args.async_save:

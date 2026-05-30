@@ -16,16 +16,16 @@ def convert(download_root, output_path, tensor_parallel_size, use_te):
     new_state_dicts = [{"model": dict()} for _ in range(tensor_parallel_size)]
 
     # Indices from mapping pytorch multihead attention to megatron.
-    kv_channels = 64
+    kv_channels = 64 #单个attention head的hidden size
     hidden_dim = 1024
     num_heads = 16
     indices = []
     for i in range(num_heads):
-        lb = i * kv_channels
-        ub = (i + 1) * kv_channels
-        indices.append(torch.arange(lb, ub, dtype=torch.int))
-        indices.append(torch.arange(hidden_dim + lb, hidden_dim + ub, dtype=torch.int))
-        indices.append(torch.arange(2 * hidden_dim + lb, 2 * hidden_dim + ub, dtype=torch.int))
+        lb = i * kv_channels #lower bound 当前 head 的起始索引
+        ub = (i + 1) * kv_channels #upper bound 当前 head 的结束索引
+        indices.append(torch.arange(lb, ub, dtype=torch.int)) #获取Q的张量索引  #torch.arange(start, end) 是 PyTorch 的序列生成函数，生成从 start 到 end-1 的整数序列
+        indices.append(torch.arange(hidden_dim + lb, hidden_dim + ub, dtype=torch.int)) #获取K的张量索引
+        indices.append(torch.arange(2 * hidden_dim + lb, 2 * hidden_dim + ub, dtype=torch.int)) #获取V的张量索引
 
     indices = torch.cat(indices)
 
@@ -45,9 +45,9 @@ def convert(download_root, output_path, tensor_parallel_size, use_te):
             new_tensor = new_tensor.to(torch.float32)
 
         # This is used for chunking some tensors to target tensor parallel size.
-        chunk_dim = None
+        chunk_dim = None #确定TP切分的维度
 
-        if "class_embedding" in name:
+        if "class_embedding" in name: #开始名称转换和分片
             new_name = "class_token"
             # Our model uses class token that is expanded to input dimensions already.
             new_tensor = new_tensor.expand(1, 1, -1)
@@ -65,8 +65,8 @@ def convert(download_root, output_path, tensor_parallel_size, use_te):
 
             if "attn.in_proj_weight" in name:
                 new_name = f"{base}.self_attention.linear_qkv.weight"
-                new_tensor = new_tensor[indices]
-                chunk_dim = 0
+                new_tensor = new_tensor[indices] # 用前面构建的索引重排 QKV
+                chunk_dim = 0 #这里的dim0是output_dim
             elif "attn.in_proj_bias" in name:
                 new_name = f"{base}.self_attention.linear_qkv.bias"
                 new_tensor = new_tensor[indices]
@@ -113,10 +113,10 @@ def convert(download_root, output_path, tensor_parallel_size, use_te):
 
         for i in range(tensor_parallel_size):
             # chunk() creates a view of a bigger tensor. clone() is used here to avoid excessive storage.
-            new_state_dicts[i]["model"][new_name] = new_tensors[i].clone()
+            new_state_dicts[i]["model"][new_name] = new_tensors[i].clone() #将参数权重加入每个TP分片的new_state_dicts中
 
             # TE sets _extra_state (for FP8 purposes), so set an empty one here for compatibility.
-            extra_state_layers = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
+            extra_state_layers = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2") #TE (Transformer Engine) 会为 Linear 层设置 _extra_state，用于存储 FP8 计算时的缩放因子等中间状态。 转换的权重在 Megatron 中可能用 TE 运行，也可能不用。不设置 _extra_state 会导致 TE 报错或行为异常
             is_extra_state_layer = any([l in new_name for l in extra_state_layers])
             if use_te and is_extra_state_layer:
                 layer = new_name.split(".")[-2]
@@ -124,9 +124,9 @@ def convert(download_root, output_path, tensor_parallel_size, use_te):
                     extra_state_name = (
                         new_name[: new_name.rfind(".") + 1] + "_extra_state"
                     )  # Replace the weight name.
-                    new_state_dicts[i]["model"][extra_state_name] = None
+                    new_state_dicts[i]["model"][extra_state_name] = None #兼容TE，随便赋值None
 
-    for i in range(tensor_parallel_size):
+    for i in range(tensor_parallel_size): #把转换为Megatron格式并按TP分片的的参数权重保存到本地
         output_dir_tp = os.path.join(output_path, "iter_0000001", f"mp_rank_0{i}")
         os.makedirs(output_dir_tp)
         output_path_tp = os.path.join(output_dir_tp, "model_optim_rng.pt")
