@@ -29,7 +29,7 @@ def combine(input_files, module_prefixes, output_files):
             # initialize the combined state dict using the first provided input file
             # NOTE: To load legacy checkpoints, set TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
             # (only use with trusted files — allows arbitrary code execution).
-            current_state_dict = torch.load(input_file)
+            current_state_dict = torch.load(input_file, weights_only=False) #默认的load使用的weights_only=True，只允许加载一些符合白名单的类型（OrderedDict，Parameter这些），这里clip有NameSpace类型，所以需要设置weights_only=False（只要能保证数据安全，就可以设置False）
             if i == 0: #对于第一个分片的第一个组件language_model，创建combined_state_dict
                 combined_state_dict = current_state_dict.copy()
                 combined_state_dict["model"] = dict()
