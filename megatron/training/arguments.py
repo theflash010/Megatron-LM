@@ -89,7 +89,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
 def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
     args = parse_args(extra_args_provider, ignore_unknown_args)
 
-    if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
+    if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False): #从checkpoint中加载参数
         from megatron.training.checkpointing import load_args_from_checkpoint
 
         assert args.load is not None or args.pretrained_checkpoint is not None, "--use-checkpoint-args requires --load or --pretrained-checkpoint argument"
@@ -98,19 +98,19 @@ def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False,
             "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
             "before initializing LocalCheckpointManager."
         )
-        load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
-        load_args_from_checkpoint(args)
+        load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')  #先把预训练模型自带的元信息塞进 args
+        load_args_from_checkpoint(args) #再用本地 ckpt 信息覆盖/补充
 
-    if args.yaml_cfg is not None:
+    if args.yaml_cfg is not None: #如果有 yaml 配置文件
         from megatron.training.yaml_arguments import validate_yaml
 
         args = validate_yaml(args, args_defaults)
     else:
-        validate_args(args, args_defaults)
+        validate_args(args, args_defaults) #验证参数合理性
 
     # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
-    set_global_variables(args)
+    set_global_variables(args) #一次性把训练中其他代码模块需要的所有"全局共享对象"都创建好并挂到模块级变量上
 
     return args
 
@@ -118,15 +118,15 @@ def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False,
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
-                                     allow_abbrev=False)
+                                     allow_abbrev=False) #初始化一个参数解析器
 
-    parser = add_megatron_arguments(parser)
+    parser = add_megatron_arguments(parser) #对解析器中加入megatron的参数类型
 
     # Custom arguments.
-    if extra_args_provider is not None:
-        parser = extra_args_provider(parser)
+    if extra_args_provider is not None: #添加用户自定义参数  
+        parser = extra_args_provider(parser) #将parser传入，用户提供的extra_args_provider会在parser中添加额外的参数组
 
-    # Parse.
+    # Parse. 开始解析参数
     if ignore_unknown_args:
         args, _ = parser.parse_known_args()
     else:
@@ -134,12 +134,12 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
     args._is_global_batch_size_explicitly_specified = args.global_batch_size is not None
 
-    # Experimental yaml
-    if args.yaml_cfg is not None:
+    # Experimental yaml YAML 实验性支持
+    if args.yaml_cfg is not None: #如果有yaml配置文件
         from .yaml_arguments import load_yaml
         assert args.yaml_cfg and not args.use_legacy_models, \
             "Yaml config is not supported with legacy models."
-        args = load_yaml(args.yaml_cfg)
+        args = load_yaml(args.yaml_cfg) #加载后整个 args 对象被替换为 yaml 解析结果
 
 
     # Args from environment
@@ -2099,10 +2099,10 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
     ]
-    transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
-    transformer_group = transformer_factory.build_group(parser, "transformer configuration")
+    transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude) #利用TransformerConfig这个模型相关的dataclass，实例化一个ArgumentGroupFactory参数组工厂
+    transformer_group = transformer_factory.build_group(parser, "transformer configuration")#在parser中添加一个名为"transformer configuration"的参数组，其内容由TransformerConfig类的字段生成
 
-    group = parser.add_argument_group(title='network size')
+    group = parser.add_argument_group(title='network size')#在parser中添加一个名为"network size"的参数组，也是一些和模型有关的参数
 
     group.add_argument('--encoder-num-layers', type=int, default=None,
                        help='Number of encoder transformer layers.')

@@ -36,12 +36,12 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
 
         import megatron.core.tokenizers.vision.libraries as tokenizers
 
-        library_class = getattr(tokenizers, TOKENIZER_MAPPING_LIBRARIES[self.library])
+        library_class = getattr(tokenizers, TOKENIZER_MAPPING_LIBRARIES[self.library]) #确定底层library类型，这个类型是<class 'megatron.core.tokenizers.vision.libraries.multimodal_tokenizer.MegatronMultimodalTokenizer'>
 
         if self.library in ['null-multimodal']:
             return library_class(**kwargs)
         else:
-            return library_class(self.path, **kwargs)
+            return library_class(self.path, **kwargs) #调用底层library来初始化tokenizer
 
     def tokenize(self, text: Union[str, List[Dict]]) -> List[int]:
         """
@@ -84,6 +84,20 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
             return_target (bool): Return target tokens with system and assistant masked.
             add_generation_prompt (bool): Add assistant prefix to the end.
         """
+
+        # import os
+        # import torch
+        # rank = int(os.environ.get("RANK", "0"))
+        # worker_info = torch.utils.data.get_worker_info()   # 获取当前 worker 的信息
+        # worker_id = worker_info.id if worker_info else 0   # worker id,非 worker 则为 0
+        # # 只在 rank=0、worker=0 这一个进程暂停
+        # if rank == 0 and worker_id == 0:
+        #     import debugpy
+        #     debugpy.listen(("localhost", 5678))
+        #     print(f"[RANK={rank} WORKER={worker_id}] Waiting for debugger attach")
+        #     debugpy.wait_for_client()
+        # else:
+        #     while True: pass   # 其他所有进程永久卡死
 
         return self._tokenizer.tokenize_conversation(
             conversation=conversation,

@@ -66,7 +66,7 @@ class MegatronMultimodalTokenizer:
     ):
         """Tokenizer with a support for non-text inputs.
 
-        Note: Currently, only HuggingFaceTokenizer is supported as the underlying text tokenizer.
+        Note: Currently, only HuggingFaceTokenizer is supported as the underlying text tokenizer. #这个多模态 tokenizer 底层只支持 HuggingFace 的 AutoTokenizer,不能直接用 sentencepiece、tiktoken 等其他引擎。
 
         Args:
             path (str): Path to the underlying tokenizer.
@@ -83,11 +83,11 @@ class MegatronMultimodalTokenizer:
             kwargs.update({"from_slow": True, "legacy": False, "add_bos_token": True})
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path=path, **kwargs
-        )
+        )#利用 transformers 库加载 mistral 的 tokenizer
 
         self._vocab_size = len(tokenizer)
 
-        num_added_tokens = tokenizer.add_tokens(special_tokens, special_tokens=True)
+        num_added_tokens = tokenizer.add_tokens(special_tokens, special_tokens=True) #添加特殊token '<image>'，返回新增量
         assert num_added_tokens == len(
             special_tokens
         ), f"failed to add {len(special_tokens)} special tokens; only added {num_added_tokens}"
@@ -96,7 +96,7 @@ class MegatronMultimodalTokenizer:
 
         if prompt_format == "mistral":
             # Mistral format doesn't have prefix for the assistant message.
-            self._prompt_config = PromptConfig(
+            self._prompt_config = PromptConfig( #PromptConfig 是一个对话模板配置类，按照prompt_format的类型确定所使用的对话模版
                 assistant_prefix_len=0,
                 pad_token_id=tokenizer.unk_token_id,
                 custom_chat_template=mistral_custom_template,
@@ -251,29 +251,30 @@ class MegatronMultimodalTokenizer:
         # Apply possible image tag.
         conversation = self._apply_image_tag(conversation)
 
-        tokens = self.tokenizer.apply_chat_template(
-            conversation,
+        tokens = self.tokenizer.apply_chat_template( #对输入应用聊天模板，并转成 token ID 序列
+            conversation, #输入单个对话（可能一轮 / 多轮问答）
             tokenize=True,
             add_generation_prompt=add_generation_prompt,
             return_assistant_token_mask=False,
             return_tensors="np",
+            return_dict=False,         #MYNEW ← 加这行,否则默认为True，返回的是BatchEncoding类型的对象，不是numpy
             chat_template=self._prompt_config.custom_chat_template,
-        )[0]
+        )[0] #由于只有单个对话，所以只取第一个
 
         if not return_target:
             return tokens
 
         target = tokens.copy()
 
-        # Mask system and user tokens in the target.
+        # Mask system and user tokens in the target. mask掉system和user的输入token，不参数loss计算，mask是在target上
         idx = 0
         for turn_idx, turn in enumerate(conversation):
             if len(turn["content"]) == 0:
                 raise ValueError(f"empty turn in conversation: {conversation}. Skipping.")
 
             turn_tokens = self.tokenizer.apply_chat_template(
-                [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
-            )
+                [turn], tokenize=True, return_dict=False, chat_template=self._prompt_config.custom_chat_template
+            ) #MYNEW ← 加了return_dict=False，否则默认为True，返回的是BatchEncoding类型的对象，不是numpy
 
             # There should be only one BOS at the very beginning.
             # After the first turn, skip BOS token.
@@ -283,7 +284,7 @@ class MegatronMultimodalTokenizer:
             turn_len = len(turn_tokens)
 
             role = turn["role"].lower()
-            if role in ("system", "user"):
+            if role in ("system", "user"): #用户的输入打上 [IGNORE_INDEX]，表明训练模型不需要关注这些 token
                 target[idx : idx + turn_len] = IGNORE_INDEX
             elif role == "assistant":
                 if IMAGE_TOKEN in turn["content"]:

@@ -29,7 +29,9 @@ from megatron.core.parallel_state import (
 )
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
 from megatron.training.utils import is_last_rank, get_batch_on_this_cp_rank
-
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+import torch.distributed as dist
 
 def get_batch(data_iterator, image_token_index, img_seq_len):
     """Generate a batch
@@ -383,20 +385,31 @@ if __name__ == "__main__":
     train_valid_test_dataloaders_provider.is_distributed = True
 
     # import debugpy
-    # try:#使用异常处理适配多进程代码，这样只有一个进程会监听5678端口
+    # local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    # try:#使用异常处理适配多进程代码，这样只有一个进程会监听5670端口
+    #     # 仅主进程开启调试监听
+    #     if local_rank == 0:
     #         debugpy.listen(("localhost", 5670))
     #         print("Waiting for debugger attach")
     #         debugpy.wait_for_client()#强制等待vscode调试点击
+    #     else:
+    #         # 非0号进程：永久阻塞，卡死在这里，不执行任何后续代码
+    #         while True: pass
     # except Exception as e:
-    #         pass
+    #     pass
+
+    args = parse_and_validate_args(
+        extra_args_provider=add_multimodal_extra_args, #添加用户自定义参数的函数
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}, #针对那些没有default的参数进行兜底
+    )
+    full_config = pretrain_cfg_container_from_args(args) #获取完整配置
 
     pretrain(
+        full_config,
         train_valid_test_dataloaders_provider,
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_args_provider=add_multimodal_extra_args,
         process_non_loss_data_func=write_online_eval_to_tensorboard,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,

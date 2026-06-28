@@ -80,7 +80,7 @@ class ArgumentGroupFactory:
         self.exclude = set(exclude) if exclude is not None else set()
 
     def _format_arg_name(self, config_attr_name: str, prefix: Optional[str] = None) -> str:
-        """Convert dataclass name into appropriate argparse flag name.
+        """Convert dataclass name into appropriate argparse flag name. ##参数名字通过_format_arg_name函数来格式化，例如Filed的name属性是export_model_type，那么最终名字就是--export-model-type
 
         Args:
             config_attr_name: dataclass attribute name
@@ -145,15 +145,15 @@ class ArgumentGroupFactory:
 
 
     def _build_argparse_kwargs_from_field(self, attribute: Field) -> dict[str, Any]:
-        """Assemble kwargs for add_argument().
+        """Assemble kwargs for add_argument(). 将单个Filed对象转换为一个参数
 
         Args:
             attribute: dataclass attribute
         """
         argparse_kwargs = {}
-        argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name)]
-        argparse_kwargs["dest"] = attribute.name
-        argparse_kwargs["help"] = self.field_docstrings[attribute.name] if attribute.name in self.field_docstrings else ""
+        argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name)] #参数名字通过_format_arg_name函数来格式化，例如Filed的name属性是export_model_type，那么最终名字就是--export-model-type
+        argparse_kwargs["dest"] = attribute.name #参数访问属性，就是Filed的name属性
+        argparse_kwargs["help"] = self.field_docstrings[attribute.name] if attribute.name in self.field_docstrings else "" #help文档利用之前获取的field_docstrings来确定
 
         # dataclasses specifies that both should not be set
         if isinstance(attribute.default, type(dataclasses.MISSING)):
@@ -207,18 +207,18 @@ class ArgumentGroupFactory:
         """
         arg_group = parser.add_argument_group(title=title, description=self.src_cfg_class.__doc__)
         for attr in fields(self.src_cfg_class):
-            if attr.name in self.exclude or attr.init is False:
+            if attr.name in self.exclude or attr.init is False: #如果属性名在exclude列表中，或者属性没有初始化，那么就跳过
                 continue
 
-            add_arg_kwargs = self._build_argparse_kwargs_from_field(attr)
+            add_arg_kwargs = self._build_argparse_kwargs_from_field(attr) #将一个Filed对象转换为一个参数
 
             arg_names = add_arg_kwargs.pop("arg_names")
-            arg_group.add_argument(*arg_names, **add_arg_kwargs)
+            arg_group.add_argument(*arg_names, **add_arg_kwargs) #将参数加入创造的参数组里
 
         return arg_group
 
     def _get_field_docstrings(self, src_cfg_class: type) -> dict[str, str]:
-        """Extract field-level docstrings from a dataclass by inspecting its AST.
+        """Extract field-level docstrings from a dataclass by inspecting its AST. #通过 inspect.getsource() 读取源代码文件，然后通过 AST 解析源码，把每个字段的 docstring（文档字符串） 提取出来，然后在 build_group 中，这些 docstring 会作为 help 参数传给 argparse。
 
         Recurses on parent classes of `src_cfg_class`.
 
@@ -268,37 +268,38 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
     names in `args`. Some classes might require additional logic.
     """
     kwargs = {}
-    for f in fields(cls):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
+    for f in fields(cls): # 遍历目标dataclass的所有字段定义
+        if hasattr(args, f.name): # 如果args里恰好有同名字段
+            kwargs[f.name] = getattr(args, f.name) # 就把值拷到kwargs字典
 
-    if return_instance:
-        return cls(**kwargs)
+    if return_instance: #如果需要直接返回实例
+        return cls(**kwargs) # 直接构造dataclass实例返回
     else:
-        return kwargs
+        return kwargs # 返回dict让调用方继续调整后再构造dataclass实例
 
 def pretrain_cfg_container_from_args(args: Namespace) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
 
-    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
-    ckpt_kwargs["save_optim"] = not args.no_save_optim
+    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False) ## ↑ 从args里按同名字段抓取所有 CheckpointConfig 字段值(返回dict而非实例，因为后续还需要调整)
+    ckpt_kwargs["save_optim"] = not args.no_save_optim # ↓ 调整一些字段
     ckpt_kwargs["save_rng"] = not args.no_save_rng
     ckpt_kwargs["load_optim"] = not args.no_load_optim
     ckpt_kwargs["load_rng"] = not args.no_load_rng
     ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
     ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
 
-    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
+    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False) #同上面一样
     prof_kwargs["use_nsys_profiler"] = args.profile
 
-    rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
+    rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False) #同上面一样
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
 
+    #这两个没法用简单的同名拷贝完成，所以单独写函数来实现
     optim_cfg, _ = get_megatron_optimizer_config(args)
     ddp_config = get_megatron_ddp_config(args)
 
-    cfg = PretrainConfigContainer(
+    cfg = PretrainConfigContainer(#实例化代表不同用途的参数config，最终用一个PretrainConfigContainer把每个配置类组合起来
         train=_default_config_from_args(TrainingConfig, args),
         validation=_default_config_from_args(ValidationConfig, args),
         optimizer=optim_cfg,

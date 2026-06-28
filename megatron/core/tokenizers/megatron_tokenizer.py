@@ -60,10 +60,10 @@ class MegatronTokenizer:
         """
 
         # Get metadata path
-        if not metadata_path:
+        if not metadata_path: #如果没指定metadata_path，则从tokenizer_path的同级目录中查找
             metadata_path = _get_metadata_path(tokenizer_path)
 
-        if isinstance(metadata_path, str):
+        if isinstance(metadata_path, str): #如果metadata_path是字符串，则从该路径加载metadata
             # Check if metadata file exists
             assert os.path.exists(metadata_path), (
                 "Tokenizer metadata file doesn't exist. Please, use "
@@ -72,7 +72,7 @@ class MegatronTokenizer:
             # Load tokenizer metadata
             with open(metadata_path, "r") as f:
                 metadata = json.load(f)
-        elif isinstance(metadata_path, dict):
+        elif isinstance(metadata_path, dict): #如果metadata_path是字典，则直接从字典中获取metadata
             metadata = metadata_path
             metadata_path = None
         else:
@@ -80,7 +80,7 @@ class MegatronTokenizer:
                 f"Expected metadata_path to be str or dict, but got {type(metadata_path)}."
             )
 
-        tokenizer_library = metadata.get('library', None)
+        tokenizer_library = metadata.get('library', None) #从metadata中获取tokenizer_library
         if tokenizer_library not in ['byte-level', 'null-text', 'null-multimodal']:
             assert tokenizer_path, "Tokenizer path must be specified."
 
@@ -93,8 +93,8 @@ class MegatronTokenizer:
                 'image_tag_type' in kwargs
             ), "Image tag type (`image_tag_type`) must be specified."
 
-        # Initialize tokenizer object
-        tokenizer_cls = _get_tokenizer_model_class(tokenizer_library, metadata)
+        # Initialize tokenizer object 确定tokenizer model type
+        tokenizer_cls = _get_tokenizer_model_class(tokenizer_library, metadata) #multimodal对应的是DefaultTokenizerVision <class 'megatron.core.tokenizers.vision.models.default_tokenizer.DefaultTokenizerVision'>
 
         metadata['metadata_path'] = metadata_path
         tokenizer = tokenizer_cls(path=tokenizer_path, config=metadata, **kwargs)
@@ -187,7 +187,7 @@ def _get_metadata_path(tokenizer_path: str) -> str:
 
 def _get_tokenizer_model_class(library: str, metadata: dict) -> MegatronTokenizerBase:
     """
-    Returns a class which corresponds to choosen tokenizer model type.
+    Returns a class which corresponds to choosen tokenizer model type. tokenizer model type是由tokenizer类型和模型共同决定的，text类型的tokenizer包括gpt/bert/mamba/t5等tokenizer类，vision类型的tokenizer包括multimodal这种tokenizer类
 
     Args:
         library (str): tokenizer library.
@@ -200,14 +200,14 @@ def _get_tokenizer_model_class(library: str, metadata: dict) -> MegatronTokenize
     if metadata.get('tokenizer_class', None):
         return getattr(metadata['tokenizer_class_path'], metadata['tokenizer_class_name'])
 
-    # Define tokenizer type
+    # Define tokenizer type 确定tokenizer的基本类型，text还是vision，vision是指包含图像处理逻辑的（不是纯图像，可以有文本）
     tokenizer_type = 'text' if library in TEXT_LIBRARIES else 'vision'
 
-    module_name = f"megatron.core.tokenizers.{tokenizer_type}.models"
+    module_name = f"megatron.core.tokenizers.{tokenizer_type}.models" #定义要导入的模块名称
     models = importlib.import_module(module_name)
 
-    model_type = metadata.get("model_type", None)
-    if model_type is None:
+    model_type = metadata.get("model_type", None) #从metadata中获取model_type 确定模型名称
+    if model_type is None: #如果没有指定模型名称，默认 "default-{text/vision}" 做兜底保证能跑通。
         model_type = f"default-{tokenizer_type}"
 
     tokenizer_cls = getattr(models, TOKENIZER_MAPPING_NAMES[model_type])

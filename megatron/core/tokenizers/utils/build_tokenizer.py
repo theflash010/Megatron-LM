@@ -59,6 +59,7 @@ def build_tokenizer(args, **kwargs):
         kwargs['include_special_tokens'] = not args.tokenizer_hf_no_include_special_tokens
     elif args.tokenizer_type == 'MultimodalTokenizer':
         tokenizer_library = 'multimodal'
+        tokenizer_path = args.tokenizer_model #MYNEW 我自己加的，Megatron这里不加tokenizer_model的话后面会报错
         kwargs['prompt_format'] = args.tokenizer_prompt_format
         kwargs['special_tokens'] = args.special_tokens
         kwargs['image_tag_type'] = args.image_tag_type
@@ -88,9 +89,9 @@ def build_tokenizer(args, **kwargs):
 
         return tokenizer
 
-    if args.tokenizer_metadata:
+    if args.tokenizer_metadata: #如果用户参数指定了tokenizer_metadata，则使用用户参数
         metadata = args.tokenizer_metadata
-    else:
+    else:#否则使用推断出的tokenizer_library来赋值metadata
         metadata = {'library': tokenizer_library}
     tokenizer = MegatronTokenizer.from_pretrained(
         tokenizer_path=tokenizer_path, metadata_path=metadata, **kwargs

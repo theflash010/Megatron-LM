@@ -115,6 +115,7 @@ def _graceful_shutdown(signum, frame):
 
 def set_global_variables(args, build_tokenizer=True):
     """Set args, tokenizer, tensorboard-writer, adlr-autoresume, and timers."""
+    #直接设置好这些参数/变量，后续使用的时候直接导入模块，然后获取数据就行。一次性把训练中其他代码模块需要的所有"全局共享对象"都创建好并挂到模块级变量上,后续任意模块通过简单的 getter 即可获取,无需再传参或重新构造。
 
     assert args is not None
 
@@ -189,7 +190,7 @@ def unset_global_variables():
 
 def set_args(args):
     global _GLOBAL_ARGS
-    _GLOBAL_ARGS = args
+    _GLOBAL_ARGS = args #全局参数设置
 
 
 def _build_tokenizer(args):
