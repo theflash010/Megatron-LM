@@ -52,7 +52,7 @@ except ImportError:
 
 
 def get_layer_spec(is_vit, normalization) -> ModuleSpec:
-    attn_mask_type = AttnMaskType.no_mask if is_vit else AttnMaskType.causal
+    attn_mask_type = AttnMaskType.no_mask if is_vit else AttnMaskType.causal #对ViT使用no_mask，全连接。对decoder使用causal，因果注意力
     if normalization == "LayerNorm":
         norm = LNImpl
     elif normalization == "RMSNorm":
@@ -70,7 +70,7 @@ def get_layer_spec(is_vit, normalization) -> ModuleSpec:
     else:
         raise RuntimeError("unknown normalization", normalization)
 
-    mlp = get_mlp_module_spec(use_te=False)  # doesn't include norm.
+    mlp = get_mlp_module_spec(use_te=False)  # doesn't include norm. #确定MLP模块的spec
 
     return ModuleSpec(
         module=TransformerLayer,
@@ -187,7 +187,7 @@ def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
 def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     # Dense MLP w/ or w/o TE modules.
     return ModuleSpec(
-        module=MLP,
+        module=MLP, #确定模块
         submodules=MLPSubmodules(
             linear_fc1=not_none(TEColumnParallelLinear) if use_te else ColumnParallelLinear,
             linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
@@ -197,8 +197,8 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
 
 def get_norm_mlp_module_spec_te() -> ModuleSpec:
     return ModuleSpec(
-        module=MLP,
-        submodules=MLPSubmodules(
+        module=MLP, #确定模块为MLP
+        submodules=MLPSubmodules( #设定子模块
             linear_fc1=not_none(TELayerNormColumnParallelLinear),
             linear_fc2=not_none(TERowParallelLinear),
         ),

@@ -65,7 +65,7 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
     shard_size = buffer.numel() // data_parallel_world_size
     sharded_buffer = [
         buffer[(r * shard_size) : ((r + 1) * shard_size)] for r in range(data_parallel_world_size)
-    ]
+    ]#按照DP并行度对buffer进行分片
     return sharded_buffer
 
 
@@ -115,7 +115,7 @@ class _ParamAndGradBucket:
         self.bucket_id = bucket_id
         # Derive bucket-local param offsets from the global param_index_map.
         self.param_to_index = {}
-        for param in params:
+        for param in params: #将全局索引（相对于整个 grad_data）转为本地索引（相对于这个 bucket 的 grad_data 切片）
             global_start, global_end, _ = param_index_map[param]
             self.param_to_index[param] = (global_start - offset, global_end - offset)
         self.params_with_extra_main_grads = params_with_extra_main_grads
@@ -183,23 +183,23 @@ class _ParamAndGradBucketGroup:
 
         # overlap_param_gather covers the layer-wise optimizer case, which sets
         # overlap_param_gather=True without use_distributed_optimizer.
-        if self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather:
+        if self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather: #DistOpt 路径：用 collective_group 作为 intra_distributed_optimizer_instance_group
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
             self.intra_distributed_optimizer_instance_rank = collective_group.rank()
-        if not self.ddp_config.use_distributed_optimizer:
+        if not self.ddp_config.use_distributed_optimizer: #非 DistOpt 路径：用 collective_group 作为 data_parallel_group
             self.data_parallel_group = collective_group
 
         # State for bookkeeping: params is the set of parameters this bucket group is
         # responsible for, param_to_bucket maps params to the corresponding bucket.
         self.param_to_bucket = {}
         self.params = set()
-        for bucket in self.buckets:
+        for bucket in self.buckets: #遍历所有 bucket 中的所有参数，建立从参数到所在 bucket 的映射字典。
             for param in bucket.params_list:
                 self.param_to_bucket[param] = bucket
                 self.params.add(param)
 
-        self.next_param_gather_bucket_group = None
+        self.next_param_gather_bucket_group = None #后续由外部设置，表示下一个需要进行param gather的bucket group，有点像链表
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
@@ -321,7 +321,7 @@ class _ParamAndGradBucketGroup:
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
 
-        if not self.ddp_config.use_distributed_optimizer:
+        if not self.ddp_config.use_distributed_optimizer: #不使用分布式优化器，对应Layer-wise optimizer
             # Layer-wise optimizer path: use all_gather for variable-size
             # param gather.
             #
@@ -333,7 +333,7 @@ class _ParamAndGradBucketGroup:
             dp_size = self.intra_distributed_optimizer_instance_size
             if dp_size == 1:
                 # Single-rank group (e.g., expt_dp_size == 1): no all-gather needed.
-                self.param_gather_dispatched = True
+                self.param_gather_dispatched = True #标记allgather已经发起
                 return
             local_rank = self.intra_distributed_optimizer_instance_rank
             group = self.intra_distributed_optimizer_instance_group
@@ -358,11 +358,11 @@ class _ParamAndGradBucketGroup:
                 # Partition reuse_buf into contiguous per-rank receive slices.
                 gather_list = []
                 offset = 0
-                for i in range(dp_size):
-                    size = bucket.layerwise_param_flat_sizes[i]
-                    gather_list.append(reuse_buf[offset : offset + size])
+                for i in range(dp_size):#layerwise每个rank处理的参数不一定相同
+                    size = bucket.layerwise_param_flat_sizes[i] #切分接收 buffer 的粒度，每个 rank 的槽位多大
+                    gather_list.append(reuse_buf[offset : offset + size])  #复用 grad_data 作为 all_gather 的接收 buffer，并进行切分
                     offset += size
-                local_slot_view = gather_list[local_rank]
+                local_slot_view = gather_list[local_rank] #选出自己的槽位
 
                 # Flatten local params and copy into the local rank's slot.
                 # Detach from autograd since start_param_sync may be called
@@ -370,17 +370,17 @@ class _ParamAndGradBucketGroup:
                 if local_size > 0:
                     flat_local_params = _flatten_dense_tensors(
                         bucket.layerwise_params_list[local_rank]
-                    ).detach()
+                    ).detach() #当前 rank 持有的参数拍平并拷贝到 buffer 中自己对应的位置
                     local_slot_view.copy_(flat_local_params)
                 bucket.layerwise_gather_list = gather_list
 
                 work = torch.distributed.all_gather(
                     gather_list, local_slot_view, group=group, async_op=async_op
-                )
+                )#所有rank发起allgather
                 if async_op and work is not None:
-                    layerwise_work_handles.append(work)
+                    layerwise_work_handles.append(work) #加入work
 
-            if async_op:
+            if async_op: #异步，存 handle → 后面 finish_param_sync 中 handle.wait() → 再解包拷贝
                 self.param_gather_handle = _LayerwiseAllGatherHandle(layerwise_work_handles)
             else:
                 # Synchronous: unflatten and copy gathered params immediately.
@@ -390,11 +390,11 @@ class _ParamAndGradBucketGroup:
                     for idx, params in enumerate(bucket.layerwise_params_list):
                         if len(params) == 0 or idx == local_rank:
                             continue
-                        updated_params = _unflatten_dense_tensors(
+                        updated_params = _unflatten_dense_tensors( ## 把接收 buffer 中 rank idx 的扁平数据解包成原始参数形状
                             bucket.layerwise_gather_list[idx], params
                         )
                         for updated_p, model_p in zip(updated_params, params):
-                            model_p.data.copy_(updated_p)
+                            model_p.data.copy_(updated_p) # 逐个参数拷贝到模型中
                     bucket.layerwise_gather_list = None
                 self.param_gather_handle = None
         else:
@@ -403,29 +403,29 @@ class _ParamAndGradBucketGroup:
             # does not need a copy-back step, so coalescing works correctly.
             with _coalescing_manager(
                 self.intra_distributed_optimizer_instance_group, async_ops=async_op
-            ) as cm:
+            ) as cm: #通信合并，合并这个bucket group中的所有bucket gather通信
                 for idx, bucket in enumerate(self.buckets):
                     if self.cached_param_buffer_shard_list[idx] is None:
                         self.cached_param_buffer_shard_list[idx] = shard_buffer(
                             bucket.param_data, self.intra_distributed_optimizer_instance_size
-                        )
+                        )#参数分片
                     local_data_view = self.cached_param_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
-                    ]
+                    ]# 当前 rank 负责的参数分片
                     dist_all_gather_func(
-                        bucket.param_data,
-                        local_data_view,
+                        bucket.param_data, # 输出：完整参数（收集后写入这里）
+                        local_data_view, # 输入：当前 rank 的分片
                         group=self.intra_distributed_optimizer_instance_group,
                         async_op=async_op,
-                    )
-            if async_op:
+                    )# all_gather: 从各 rank 收集参数分片 → 完整的 param_data
+            if async_op: #异步就保存handle
                 self.param_gather_handle = cm
             else:
                 # When using `_coalescing_manager`, even if a synchronous op
                 # (async_op=False) is used, `cm` is not None. Manually set to None for
                 # consistency with prior code.
                 self.param_gather_handle = None
-        self.param_gather_dispatched = True
+        self.param_gather_dispatched = True  #标记allgather已经发起
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
         """
@@ -446,14 +446,14 @@ class _ParamAndGradBucketGroup:
 
         # If current bucket's param AG has not been dispatched, dispatch it now (e.g., first
         # AG bucket in first model chunk if ddp_config.align_param_gather is False).
-        if not self.param_gather_dispatched:
-            self.start_param_sync()
+        if not self.param_gather_dispatched: #第一步：确保已发起allgather
+            self.start_param_sync() # 还没发就补发
 
-        if self.param_gather_handle is not None:
-            self.param_gather_handle.wait()
+        if self.param_gather_handle is not None: #第二步：确保已收集allgather
+            self.param_gather_handle.wait() # 等当前 bucket组的 all-gather 完成
             self.param_gather_handle = None
             # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
-            if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
+            if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch: #触发下一个 bucket group 的 all-gather（与当前前向计算重叠）
                 if self.next_param_gather_bucket_group.param_gather_dispatched:
                     warnings.warn(
                         "The next bucket's parameter all-gather operation has already been "
@@ -487,7 +487,7 @@ class _ParamAndGradBucketGroup:
                     # correspond to multiple param buffers. If we zero out the entire grad buffer,
                     # it would clear the data of those param buffers that have not yet completed AG.
                     bucket.param_data.zero_()
-            elif not self.ddp_config.use_distributed_optimizer:
+            elif not self.ddp_config.use_distributed_optimizer: #逐层优化器
                 for bucket in self.buckets:
                     if bucket.layerwise_gather_list is None:
                         continue
@@ -501,11 +501,11 @@ class _ParamAndGradBucketGroup:
                             continue
                         updated_params = _unflatten_dense_tensors(
                             bucket.layerwise_gather_list[idx], params
-                        )
+                        )#解包
                         for updated_p, model_p in zip(updated_params, params):
-                            model_p.data.copy_(updated_p)
+                            model_p.data.copy_(updated_p)#拷贝
                     bucket.layerwise_gather_list = None
-            else:
+            else: #标准 DistOpt use_distributed_optimizer，除了fp8之外的参数在初始化已经完成了重定向，所以只有fp8需要额外操作
                 fp8_params = []
                 for bucket in self.buckets:
                     for param in bucket.params:
@@ -534,13 +534,13 @@ class _ParamAndGradBucketGroup:
 
         # Copy accumulated .main_grad into communication buffer before collective if
         # .main_grad is not in .grad_data already (e.g., because we want to do local
-        # gradient accumulation in a higher precision).
+        # gradient accumulation in a higher precision). #当启用了 promote_main_grads_to_higher_precision（line 1162）时，参数的梯度会在一个独立的 FP32 tensor 中进行本地累加，而不是直接累加到 grad_data buffer 中。遍历所有需要额外精度梯度的参数，将 FP32 main_grad 中累积的梯度值 拷贝回 grad_data buffer（main_grad_copy_in_grad_buffer），这样通信 collective 操作的是正确的梯度数据。
         for bucket in self.buckets:
             for param in bucket.params_with_extra_main_grads:
                 if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
                     param.main_grad_copy_in_grad_buffer.copy_(param.main_grad)
 
-        if self.ddp_config.check_for_nan_in_grad or self.ddp_config.check_for_large_grads:
+        if self.ddp_config.check_for_nan_in_grad or self.ddp_config.check_for_large_grads: #检查梯度是否异常
             self.check_grads(
                 check_for_nan_or_inf=self.ddp_config.check_for_nan_in_grad,
                 check_for_large=self.ddp_config.check_for_large_grads,
@@ -548,11 +548,11 @@ class _ParamAndGradBucketGroup:
 
         # gradient_scaling_factor already takes into account whether we are computing
         # an average or sum in the data-parallel collective.
-        for bucket in self.buckets:
+        for bucket in self.buckets: #将gradient_scaling_factor应用到grad_data上
             if bucket.gradient_scaling_factor != 1.0:
                 bucket.grad_data *= bucket.gradient_scaling_factor
 
-        # Decide reduce_op.
+        # Decide reduce_op. 确定reduce通信方式
         reduce_op = torch.distributed.ReduceOp.SUM
         if self.ddp_config.average_in_collective:
             reduce_op = torch.distributed.ReduceOp.AVG
@@ -568,9 +568,9 @@ class _ParamAndGradBucketGroup:
         async_op = (
             self.ddp_config.overlap_grad_reduce
             and self.ddp_config.num_distributed_optimizer_instances == 1
-        )
+        )#仅在 overlap_grad_reduce = True 且 DistOpt instance 数量为 1 时，才使用异步操作，不切 stream。
         if (
-            self.ddp_config.num_distributed_optimizer_instances > 1
+            self.ddp_config.num_distributed_optimizer_instances > 1 #多 DistOpt 场景走下面的专用 communication stream 机制来实现 overlap
             and self.ddp_config.overlap_grad_reduce
         ):
             # Assign a communication stream if we have multiple DistOpt instances and we
@@ -580,44 +580,44 @@ class _ParamAndGradBucketGroup:
             # The RS/AR communication stream needs to wait for the current stream
             # to complete its gradient computation before launching the next
             # gradient reduction collective.
-            self.communication_stream.wait_stream(torch.cuda.current_stream())
-        else:
+            self.communication_stream.wait_stream(torch.cuda.current_stream()) #让通信流等待当前计算流完成梯度计算后再开始通信，确保 NCCL 操作读到的是正确的梯度值
+        else: #不切换 stream，直接在默认的当前 stream 上操作
             stream_context = nullcontext()
 
-        if self.ddp_config.use_distributed_optimizer:
+        if self.ddp_config.use_distributed_optimizer: #确定通信组
             communication_group = self.intra_distributed_optimizer_instance_group
         else:
             communication_group = self.data_parallel_group
 
         # Coalesce communication kernels across buckets in the bucket group.
         grad_reduce_handle = None
-        with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
-            for idx, bucket in enumerate(self.buckets):
+        with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm: #指定cuda流和通信合并，合并的是这个bucket group的所有bucket的reduce通信
+            for idx, bucket in enumerate(self.buckets): #遍历bucket group中的所有bucket
                 if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
                     if self.cached_grad_buffer_shard_list[idx] is None:
                         self.cached_grad_buffer_shard_list[idx] = shard_buffer(
                             bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                        )
+                        )#将grad进行分片，并记录到cached_grad_buffer_shard_list中，分片是因为进行reduce_scatter通信
                     local_data_view = self.cached_grad_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
-                    ]
+                    ]#从分片列表中选出当前 rank 自己该持有的那一份梯度切片视图
                     grad_reduce_handle = dist_reduce_scatter_func(
-                        local_data_view,
-                        bucket.grad_data,
+                        local_data_view, # 接收缓冲区 ← 就是这个切片视图
+                        bucket.grad_data, ## 输入：完整的梯度数据（全体 rank 的梯度）
                         op=reduce_op,
-                        group=communication_group,
+                        group=communication_group, #通信组
                         async_op=async_op,
-                    )
-                else:
+                    )#进行reduce_scatter通信
+                else: #不使用分布式优化器或强制 all-reduce 时
                     if torch.distributed.get_rank() == 0 and force_all_reduce:
                         logger.info(
                             f"Performing reduction using all_reduce because {force_all_reduce=}"
                         )
-                    torch.distributed.all_reduce(
+                    torch.distributed.all_reduce( #每个bucket直接all_reduce
                         bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                     )
 
-        # With multiple DistOpt instances, we need to all-reduce across instances.
+        # With multiple DistOpt instances, we need to all-reduce across instances. #使用多优化器实例，需要进行inter的allreduce
         if (
             self.ddp_config.use_distributed_optimizer
             and self.ddp_config.num_distributed_optimizer_instances > 1
@@ -629,20 +629,20 @@ class _ParamAndGradBucketGroup:
                 _coalescing_manager(
                     self.inter_distributed_optimizer_instance_group, async_ops=async_op
                 ) as cm,
-            ):
-                for idx, bucket in enumerate(self.buckets):
+            ): #指定通信流和通信合并
+                for idx, bucket in enumerate(self.buckets): #遍历bucket group中的所有bucket
                     if self.cached_grad_buffer_shard_list[idx] is None:
                         self.cached_grad_buffer_shard_list[idx] = shard_buffer(
                             bucket.grad_data, self.intra_distributed_optimizer_instance_size
                         )
                     local_data_view = self.cached_grad_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
-                    ]
+                    ]#从分片列表中选出当前 rank 自己该持有的那一份梯度切片视图
 
                     torch.distributed.all_reduce(
                         local_data_view,
                         op=reduce_op,
-                        group=self.inter_distributed_optimizer_instance_group,
+                        group=self.inter_distributed_optimizer_instance_group, #是inter通信组
                         async_op=async_op,
                     )
 
@@ -656,14 +656,14 @@ class _ParamAndGradBucketGroup:
                 assert grad_reduce_handle is not None
                 self.grad_reduce_handle = grad_reduce_handle
             else:
-                self.grad_reduce_handle = cm
+                self.grad_reduce_handle = cm #存 cm（_CoalescingManager），后面调用 cm.wait() 统一等待。
         else:
             # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
             # `cm` is not None, which is different from when `_coalescing_manager` is not used in
             # which case the torch.distributed._reduce_scatter_base() will return None. In order to
             # maintain consistency with prior code, we need to manually set communication handle to
             # None.
-            self.grad_reduce_handle = None
+            self.grad_reduce_handle = None #设置None，代表不同步
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
@@ -678,18 +678,18 @@ class _ParamAndGradBucketGroup:
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
-            self._copy_back_extra_main_grads()
+            self._copy_back_extra_main_grads() #把通信完成后的梯度从 grad_data buffer 拷贝回 FP32 main_grad
             return
         # If first batch, start asynchronous communication here. register_grad_ready() launches
         # asynchronous communication only once self.golden_per_param_grad_ready_counts is
         # populated at the end of this first batch.
-        if self.is_first_batch:
+        if self.is_first_batch: #首次 batch 中 golden_per_param_grad_ready_counts 还没建立，register_grad_ready 不会触发通信，所以需要在 finish_grad_sync 里补发一次
             self.start_grad_sync(force_all_reduce=force_all_reduce)
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.current_stream().wait_stream(self.communication_stream)
-            self._copy_back_extra_main_grads()
+            self._copy_back_extra_main_grads() #把通信完成后的梯度从 grad_data buffer 拷贝回 FP32 main_grad
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
@@ -757,12 +757,12 @@ class _ParamAndGradBucketGroup:
 def group_params_for_buffers(
     params: List[torch.nn.Parameter], grad_reduce_in_fp32: bool
 ) -> Dict['BufferKey', Tuple[List[torch.nn.Parameter], List[int]]]:
-    """Group parameters by buffer identity for buffer allocation.
+    """Group parameters by buffer identity for buffer allocation. #将参数按照BufferKey的三个维度进行分组
 
-    Each distinct buffer is identified by a BufferKey with three dimensions:
-    - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
-    - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
-    - is_expert_parallel: whether the parameter is expert-parallel (param.allreduce == False),
+    Each distinct buffer is identified by a BufferKey with three dimensions: #BufferKey由三个维度决定，三个维度都相同的param共享一个BufferKey
+    - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype). #存储 dtype。普通参数 = param.dtype，FP8/NVFP4 参数 = torch.uint8
+    - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype). #梯度规约 dtype。grad_reduce_in_fp32 时 = torch.float（32位），否则 = param.dtype
+    - is_expert_parallel: whether the parameter is expert-parallel (param.allreduce == False), #param.allreduce 为 False 的 MoE expert 参数，用独立的 DP group，正常的DP参数使用allreduce
       which requires a separate buffer with a different data-parallel group.
 
     The param_indices track each parameter's position among same-dtype params (using
@@ -782,28 +782,28 @@ def group_params_for_buffers(
     dtype_to_offsets = {}
     key_to_indices = {}
 
-    for param in params:
+    for param in params: #遍历参数
         assert param.requires_grad
 
-        param_dtype = param.dtype
-        if is_float8tensor(param) or is_nvfp4tensor(param):
+        param_dtype = param.dtype #确定param的物理dtype
+        if is_float8tensor(param) or is_nvfp4tensor(param):#如果是fp8，物理的param_dtype为torch.uint8
             param_dtype = torch.uint8
-        grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
-        is_expert_parallel = not getattr(param, 'allreduce', True)
+        grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype #确定grad的dtype
+        is_expert_parallel = not getattr(param, 'allreduce', True) #确定is_expert_parallel
 
-        key = BufferKey(param_dtype, grad_dtype, is_expert_parallel)
-        param_list = key_to_params.get(key, [])
-        param_list.append(param)
-        key_to_params[key] = param_list
+        key = BufferKey(param_dtype, grad_dtype, is_expert_parallel) #创建BufferKey
+        param_list = key_to_params.get(key, []) #从key_to_params中获取相同BufferKey的param列表
+        param_list.append(param) #将当前param添加到param列表
+        key_to_params[key] = param_list #将BufferKey和param列表存入key_to_params，更新key_to_params
 
         # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
         # logical high-precision dtype, needed for checkpoint compatibility.
-        offset_key = BufferKey(param.dtype, grad_dtype, is_expert_parallel)
-        offset = dtype_to_offsets.get(offset_key, 0)
-        dtype_to_offsets[offset_key] = offset + 1
-        indices = key_to_indices.get(key, [])
-        indices.append(offset)
-        key_to_indices[key] = indices
+        offset_key = BufferKey(param.dtype, grad_dtype, is_expert_parallel) #这里是逻辑dtype
+        offset = dtype_to_offsets.get(offset_key, 0) #获取计数器，代表同一个bufferkey下逻辑dtype相同的param数量，也就是这个param是第几位
+        dtype_to_offsets[offset_key] = offset + 1 #当前逻辑dtype的param数量+1
+        indices = key_to_indices.get(key, []) #从key_to_params中获取相同BufferKey的param列表
+        indices.append(offset) #将当前param的逻辑dtype的序号添加到indices
+        key_to_indices[key] = indices #将BufferKey和indices存入key_to_indices，更新key_to_indices
 
     result = {}
     for key, param_list in key_to_params.items():
@@ -900,7 +900,7 @@ class _ParamAndGradBuffer:
         param_layout: Optional['PerBufferParamLayout'] = None,
     ):
 
-        if pg_collection is None:
+        if pg_collection is None: #通信组初始化
             self.dp_cp_group = parallel_state.get_data_and_context_parallel_group(
                 with_context_parallel=True
             )
@@ -934,7 +934,7 @@ class _ParamAndGradBuffer:
         self.param_to_bucket = {}  # Param -> bucket mapping.
 
         # Use the provided layout if given, otherwise compute the default (no-padding) layout.
-        if param_layout is None:
+        if param_layout is None: #如果没有提供布局信息，则计算默认布局，否则复用
             param_layout = _compute_default_per_buffer_param_layout(self.params, bucket_size)
         self.param_index_map = param_layout.param_index_map
         self.bucket_indices = param_layout.bucket_indices
@@ -969,8 +969,8 @@ class _ParamAndGradBuffer:
 
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
-        self.numel = self.bucket_indices[-1][1]
-        self.numel_unpadded = sum(per_bucket_numel_unpadded)
+        self.numel = self.bucket_indices[-1][1] #实际需要的bucket总元素个数
+        self.numel_unpadded = sum(per_bucket_numel_unpadded) #计算未填充的bucket总元素个数
         if self.has_nvfp4_params:
             self.nvfp4_packed_numel = self.nvfp4_packed_bucket_indices[-1][1]
             # nvfp4_packed_numel_unpadded is already set by _compute_nvfp4_packed_layout.
@@ -989,7 +989,7 @@ class _ParamAndGradBuffer:
         self.grad_data = None
         self.extra_main_grads = []
 
-        if self.nccl_ub:
+        if self.nccl_ub: #根据 nccl_ub 开关，选择 NCCL 分配器或常规 CUDA 分配来创建 param/grad buffer
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
             nccl_allocator.init()
             pool = nccl_allocator.create_nccl_mem_pool(
@@ -1011,13 +1011,13 @@ class _ParamAndGradBuffer:
             # If nccl_ub is False, mem_alloc_context is nullcontext.
             mem_alloc_context = nullcontext
 
-        with mem_alloc_context():
+        with mem_alloc_context(): #进行buffer创建
             # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
             # The buffer is mapped to weight gradients whose dtype is either bf16 or FP32.
             # It can be temporarily reused by param AG.
             if self.ddp_config.use_distributed_optimizer and any(
                 is_mxfp8tensor(p) for p in self.params
-            ):
+            ):#有fp8
                 self.shared_buffer = torch.zeros(
                     self.numel,
                     dtype=self.grad_dtype,
@@ -1032,22 +1032,22 @@ class _ParamAndGradBuffer:
                 else:
                     self.param_data = self.shared_buffer
                 self.grad_data = self.shared_buffer
-            else:
+            else: #常规分配
                 # Only re-map param tensors if using distributed optimizer.
                 if self.ddp_config.use_distributed_optimizer:
-                    numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel
+                    numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel #确定元素数量
                     self.param_data = torch.zeros(
                         numel,
                         dtype=self.param_dtype,
                         device=torch.cuda.current_device(),
                         requires_grad=False,
-                    )
+                    )#创建param buffer，分配在GPU上(gather)，只有用DisOpt才需要进行all gather，需要param buffer
                 self.grad_data = torch.zeros(
                     self.numel,
                     dtype=self.grad_dtype,
                     device=torch.cuda.current_device(),
                     requires_grad=False,
-                )
+                )#创建grad buffer，分配在GPU上(reduce)，不用DisOpt也需要grad buffer，因为需要allreduce
 
         self.grad_data_size = 0
         self.param_data_size = 0
@@ -1067,7 +1067,7 @@ class _ParamAndGradBuffer:
             Returns:
                 A new _ParamAndGradBucket instance.
             """
-            bucket_start_index, bucket_end_index = self.bucket_indices[bucket_id]
+            bucket_start_index, bucket_end_index = self.bucket_indices[bucket_id] #确定bucket的起始位置
             if self.has_nvfp4_params:
                 nvfp4_packed_start_index, nvfp4_packed_end_index = self.nvfp4_packed_bucket_indices[
                     bucket_id
@@ -1096,7 +1096,7 @@ class _ParamAndGradBuffer:
                 nvfp4_packed_param_start_index, _, _ = self.nvfp4_packed_param_index_map[param]
             # For MXFP8 param:
             # we only need to map bf16 weights (layernorm, embedding, etc) to the buffer.
-            if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag or not is_mxfp8tensor(param):
+            if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag or not is_mxfp8tensor(param): #设置param buffer
                 if self.param_data is not None:
                     if is_nvfp4tensor(param):
                         # Remap the NVFP4 tensor's internal rowwise uint8 storage so it
@@ -1130,19 +1130,19 @@ class _ParamAndGradBuffer:
                                 if self.has_nvfp4_params
                                 else param_start_index
                             ),
-                            buffer_type=BufferType.PARAM,
-                        )
-                        old_param_data = param.data
-                        param.data = new_param_data
+                            buffer_type=BufferType.PARAM, #param buffer
+                        )#获取从param buffer切分出来的tensor
+                        old_param_data = param.data #旧数据标记，后面del
+                        param.data = new_param_data #设置param.data为新的tensor
                         assert old_param_data._base is None
                         # Copy tensor values (from initialization or checkpoint).
-                        param.data.detach().copy_(old_param_data)
-                        del old_param_data
+                        param.data.detach().copy_(old_param_data) #复制一下旧数据
+                        del old_param_data #完全删除
 
             # Grad buffer always uses full-numel offsets from param_index_map.
             param.main_grad = self._get(
                 param.data.shape, param_start_index, buffer_type=BufferType.GRAD
-            )
+            ) #挂载参数的梯度到_get()返回的buffer里
             # Create FP32 copy of .main_grads if necessary.
             promote_main_grads_to_higher_precision = False
             for param_name_pattern in ddp_config.param_name_patterns_for_fp32_local_accumulation:
@@ -1166,24 +1166,24 @@ class _ParamAndGradBuffer:
                 param.main_grad = torch.empty_like(param.main_grad, dtype=torch.float32)
                 self.extra_main_grads.append(param.main_grad)
 
-            if bucket_id != cur_bucket_id:
+            if bucket_id != cur_bucket_id: #检测到bucket切换，每次迭代拿到当前参数的 bucket_id（来自预计算布局 param_index_map），如果和当前正在构建的 cur_bucket_id 不同，说明进入了下一个 bucket。
                 self.buckets.append(
                     _create_bucket(
                         cur_bucket_id, bucket_params, bucket_params_with_extra_main_grads
                     )
-                )
-                bucket_params = []
+                )#把上一组参数打包成 _ParamAndGradBucket 存入 self.buckets
+                bucket_params = [] #清空临时列表
                 bucket_params_with_extra_main_grads = []
-                assert cur_bucket_id + 1 == len(self.buckets)
+                assert cur_bucket_id + 1 == len(self.buckets) 
                 assert bucket_id == cur_bucket_id + 1
-                cur_bucket_id = bucket_id
+                cur_bucket_id = bucket_id #更新cur_bucket_id
 
-            bucket_params.append(param)
+            bucket_params.append(param) #将param加入到bucket_params
             if promote_main_grads_to_higher_precision:
                 bucket_params_with_extra_main_grads.append(param)
 
         # Add remaining params to a new bucket.
-        if len(bucket_params) > 0:
+        if len(bucket_params) > 0: #处理最终剩余的部分参数
             self.buckets.append(
                 _create_bucket(cur_bucket_id, bucket_params, bucket_params_with_extra_main_grads)
             )
@@ -1307,7 +1307,7 @@ class _ParamAndGradBuffer:
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """
         Return a tensor with the input `shape` as a view into the 1-D data starting at
-        `start_index`.
+        `start_index`. #从 1D 连续 buffer 中切出 [start, end) 的一段，reshape 成目标 shape 返回。
         """
         end_index = start_index + shape.numel()
         if buffer_type == BufferType.PARAM:
@@ -1367,13 +1367,13 @@ class _ParamAndGradBuffer:
                     buffer_type=BufferType.PARAM,
                 )
             else:
-                bucketed_param_data = self._get(
+                bucketed_param_data = self._get( ##从 1D 连续 buffer 中切出 [start, end) 的一段，reshape 成目标 shape 返回
                     torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.PARAM
-                )
+                ) #param的bucket
         # Grad buffer always uses full-numel offsets.
         bucketed_grad_data = self._get(
             torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.GRAD
-        )
+        )#grad的bucket
         bucket = _ParamAndGradBucket(
             params=bucket_params,
             param_data=bucketed_param_data,
@@ -1384,8 +1384,8 @@ class _ParamAndGradBuffer:
             bucket_id=bucket_id,
             param_index_map=self.param_index_map,
             params_with_extra_main_grads=bucket_params_with_extra_main_grads,
-        )
-        for bucket_param in bucket_params:
+        ) #构建_ParamAndGradBucket对象
+        for bucket_param in bucket_params: #建立param到bucket的映射，方便后续通过param找到bucket
             assert bucket_param not in self.param_to_bucket
             self.param_to_bucket[bucket_param] = bucket
 
@@ -1483,7 +1483,7 @@ def partition_buckets(
         dtype_to_buffer_map[dtype] = buffer
 
     # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
-    if force_single_bucket_group:
+    if force_single_bucket_group: #把所有bucket放到一个组里
         buckets = []
         ddp_config = buffers[0].ddp_config
         data_parallel_group = buffers[0].data_parallel_group
@@ -1499,7 +1499,7 @@ def partition_buckets(
         )
         return [bucket_group]
 
-    if torch.uint8 not in dtype_to_buffer_map:
+    if torch.uint8 not in dtype_to_buffer_map: #没有fp8，就一个bucket自成一组
         # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
         #         only one bucket.
         bucket_groups = []
@@ -1507,7 +1507,7 @@ def partition_buckets(
             for bucket in buffer.buckets:
                 bucket_groups.append(
                     _ParamAndGradBucketGroup(
-                        [bucket],
+                        [bucket], #只有一个bucket
                         buffer.ddp_config,
                         buffer.data_parallel_group,
                         buffer.data_parallel_world_size,

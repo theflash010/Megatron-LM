@@ -69,8 +69,8 @@ class LLaVAModel(MegatronModule):
         share_embeddings_and_output_weights (bool): Input embedding and output layer share weights.
         language_position_embedding_type (str): Language model position embedding type.
         language_rotary_percent (float): RoPE percent. Defaults to 1.0.
-        pre_process (bool): Include embedding layer in the decoder (used with pipeline parallel).
-        post_process (bool): Include output layer in the decoder (used with pipeline parallel).
+        pre_process (bool): Include embedding layer in the decoder (used with pipeline parallel). #当前 pipeline stage 是否包含 embedding 层
+        post_process (bool): Include output layer in the decoder (used with pipeline parallel). #当前 pipeline stage 是否包含 output 层
         add_encoder (bool): Construct the encoder (used with pipeline parallel).
             When we use pipelining, the encoder will live on only the first stage
         add_decoder (bool): Construct the decoder (used with pipeline parallel).
@@ -187,7 +187,7 @@ class LLaVAModel(MegatronModule):
         # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
 
-        if self.add_decoder:
+        if self.add_decoder: #如果添加decoder
             if getattr(language_transformer_config, "language_model_type", "").startswith("hf://"):
                 from megatron.core.models.huggingface.module import build_hf_model
 
@@ -213,7 +213,7 @@ class LLaVAModel(MegatronModule):
                     pg_collection=self.pg_collection,
                 )
             else:
-                self.language_model = GPTModel(
+                self.language_model = GPTModel( #使用这个，构建语言模型
                     config=language_transformer_config,
                     transformer_layer_spec=language_transformer_layer_spec,
                     vocab_size=language_vocab_size,
@@ -230,7 +230,7 @@ class LLaVAModel(MegatronModule):
                     share_embeddings_and_output_weights=share_embeddings_and_output_weights,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
-                )
+                )#一个 GPTModel 实例就是完整大模型在某个并行维度组合（tp rank, pp rank, dp rank, cp rank, ep rank, vp stage）下的一个切片
 
             self._language_max_sequence_length = language_max_sequence_length
             self._language_is_pipeline_parallel = (
@@ -245,8 +245,8 @@ class LLaVAModel(MegatronModule):
 
         class_token_len = 1
         if self.add_encoder:
-            self._drop_vision_class_token = drop_vision_class_token
-            add_class_token = True
+            self._drop_vision_class_token = drop_vision_class_token #是否丢掉视觉分类token
+            add_class_token = True #视觉模型架构本身是否需要 class token，即使你最终不需要它（drop_vision_class_token=True，输出时把它丢掉），模型内部依然需要生成它
             if vision_transformer_config.vision_model_type.startswith(
                 ("clip", "siglip", "internvit")
             ):
@@ -258,7 +258,7 @@ class LLaVAModel(MegatronModule):
                         "set disable-vision-class-token to False."
                     )
                     assert not self._drop_vision_class_token, error_msg
-                self.vision_model = CLIPViTModel(
+                self.vision_model = CLIPViTModel(#按照视觉模型config和layer_spec来构架模型
                     vision_transformer_config,
                     vision_transformer_layer_spec,
                     img_h=img_h,
@@ -350,7 +350,7 @@ class LLaVAModel(MegatronModule):
                 vision_projection_type,
                 vision_projection_input_size,
                 tp_group=self.pg_collection.tp,
-            )
+            )#视觉投影层
             # Ignore missing weights for the vision projection during checkpoint loading.
             # This should be disabled by default but can be enabled if your checkpoint contains
             # pretrained vision and language models but not the projection from vision model
@@ -379,7 +379,7 @@ class LLaVAModel(MegatronModule):
             tile_tags is not None,  # Tile tags enabled/disabled.
             max_num_tiles,
             tokenizer_type,
-        )
+        )#视觉token数量
 
         self.image_token_index = image_token_index
         self._pixel_shuffle = pixel_shuffle

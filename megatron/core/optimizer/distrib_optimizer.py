@@ -513,17 +513,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         bucket_id = 0
 
         def _finalize_bucket(param_end_index, bucket_start_index, bucket_id):
-            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index) #记录当前桶的 unpadded 大小
             bucket_end_index = pad_bucket_end(
                 param_end_index,
-                data_parallel_world_size,
-                ddp_config.pad_buckets_for_high_nccl_busbw,
+                data_parallel_world_size, #单步消息大小 = bucket_size / dp_world_size，确保桶的大小能被 dp_world_size 整除
+                ddp_config.pad_buckets_for_high_nccl_busbw, #如果 pad_buckets_for_high_nccl_busbw=True，还要进一步 padding 到 2^16 的倍数，让 NCCL ring 的单步消息大小对齐大幂次。
             )
-            bucket_indices.append((bucket_start_index, bucket_end_index))
+            bucket_indices.append((bucket_start_index, bucket_end_index)) #插入当前桶的 [起始位置, 结束位置]
             return bucket_end_index, bucket_id + 1
 
-        for param in params[::-1]:
-            param_start_index = pad_param_start(param_start_index)
+        for param in params[::-1]: #反向遍历，因为参数的梯度是反向到达的，确保梯度先就绪的参数在同一个 bucket 中
+            param_start_index = pad_param_start(param_start_index) #每个参数在 buffer 中的起始位置按 64 字节对齐
 
             # Split shared embedding params into separate bucket.
             if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
@@ -533,23 +533,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 bucket_params = set()
                 param_start_index = bucket_start_index
 
-            param_numel = param.data.nelement()
-            param_end_index = param_start_index + param_numel
-            param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+            param_numel = param.data.nelement() #参数量，一个参数占用的元素数量
+            param_end_index = param_start_index + param_numel #当前参数在 buffer 中的结束位置
+            param_index_map[param] = (param_start_index, param_end_index, bucket_id) #将参数和其在 buffer 中的起始位置、结束位置、bucket_id存入param_index_map，更新param_index_map
             bucket_params.add(param)
 
-            if (
+            if ( #当当前桶累积的元素数达到 bucket_size，调用 _finalize_bucket 封桶
                 bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
             ) or _does_param_require_new_bucket(param):
                 bucket_start_index, bucket_id = _finalize_bucket(
                     param_end_index, bucket_start_index, bucket_id
-                )
-                bucket_params = set()
-                param_start_index = bucket_start_index
+                )#调用 _finalize_bucket 封桶
+                bucket_params = set() #清空当前桶
+                param_start_index = bucket_start_index #更新param_start_index为新的桶的起始位置
             else:
                 param_start_index = param_end_index
 
-        if len(bucket_params) > 0:
+        if len(bucket_params) > 0: #遍历结束后如果还有未封的桶，封掉
             _finalize_bucket(param_end_index, bucket_start_index, bucket_id)
 
         return PerBufferParamLayout(
@@ -567,7 +567,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ddp_config,
         expert_data_parallel_world_size: Optional[int] = None,
     ) -> 'FullParamLayout':
-        """Compute parameter layouts for all buffer groups.
+        """Compute parameter layouts for all buffer groups. ##将param按照BufferKey进行分组，然后对每组param进行确定layout（多少param组成一个bucket），所有layout组成一个完整的param layout方案
 
         Groups parameters by (param_dtype, grad_dtype, is_expert_parallel), then
         computes a padded PerBufferParamLayout for each group. Expert-parallel groups use
@@ -576,19 +576,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Args:
             params: List of all parameters to lay out.
             bucket_size: Approximate number of elements per bucket, or None for single bucket.
-            data_parallel_world_size: Size of the data-parallel group for dense params.
+            data_parallel_world_size: Size of the data-parallel group for dense params. #dp的world size，用于dense部分
             ddp_config: DistributedDataParallel config object.
-            expert_data_parallel_world_size: Size of the expert data-parallel group.
+            expert_data_parallel_world_size: Size of the expert data-parallel group. #edp的world size，用于expert部分
                 Required if any expert-parallel params are present. Defaults to
                 data_parallel_world_size if not provided.
 
         Returns:
             FullParamLayout with a PerBufferParamLayout per buffer group.
         """
-        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
+        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32) ##将参数按照BufferKey的三个维度进行分组
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
+            if buffer_key.is_expert_parallel:#确定dp_world_size，如果是expert-parallel则使用edp的world size，否则使用dp的world size
                 dp_world_size = (
                     expert_data_parallel_world_size
                     if expert_data_parallel_world_size is not None
@@ -598,8 +598,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 dp_world_size = data_parallel_world_size
             layout = DistributedOptimizer._compute_per_buffer_param_layout(
                 group_params, bucket_size, dp_world_size, ddp_config, param_indices
-            )
-            layouts[buffer_key] = layout
+            )#每个 BufferKey 一个 layout，一个layout可能多个桶
+            layouts[buffer_key] = layout #记录当前 BufferKey 的 layout
         return FullParamLayout(layouts=layouts)
 
     def __init__(

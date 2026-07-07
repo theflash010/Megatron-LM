@@ -75,21 +75,21 @@ class CLIPViTModel(VisionModule):
 
         assert self.img_h % self.patch_dim == 0
         assert self.img_w % self.patch_dim == 0
-        self.num_patches_per_dim_h = self.img_h // self.patch_dim
-        self.num_patches_per_dim_w = self.img_w // self.patch_dim
-        self.num_patches = self.num_patches_per_dim_h * self.num_patches_per_dim_w
+        self.num_patches_per_dim_h = self.img_h // self.patch_dim #h上的patch数量
+        self.num_patches_per_dim_w = self.img_w // self.patch_dim #w上的patch数量
+        self.num_patches = self.num_patches_per_dim_h * self.num_patches_per_dim_w #总的patch数量
 
         self.add_class_token = add_class_token
         self.class_token_len = class_token_len
 
-        self.seq_length = self.num_patches + (self.class_token_len if self.add_class_token else 0)
+        self.seq_length = self.num_patches + (self.class_token_len if self.add_class_token else 0) #序列长度=patch数量+class token长度
 
         self.ln_pre = None
         self.ln_post = None
         self.pg_collection = pg_collection
         self.vp_stage = vp_stage
         if model_subtype == "clip":
-            self.ln_pre = build_module(
+            self.ln_pre = build_module( #添加归一化层
                 ln_pre_impl,
                 config=transformer_config,
                 hidden_size=self.visual_hidden_size,
@@ -119,13 +119,13 @@ class CLIPViTModel(VisionModule):
             stride=self.patch_dim,
             bias=conv_bias,
             padding=padding,
-        )
+        )#添加卷积层，用卷积实现patch分割，将rgb图片转换为[visual_hidden_size,num_patches_per_dim_h,num_patches_per_dim_w]的格式
 
         self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
 
         self.position_embeddings = torch.nn.Embedding(
             self.seq_length, self.visual_hidden_size, dtype=transformer_config.params_dtype
-        )
+        )#添加位置编码，这里是绝对位置编码
 
         self.add_class_token = add_class_token
         if self.add_class_token:
@@ -136,7 +136,7 @@ class CLIPViTModel(VisionModule):
                     self.visual_hidden_size,
                     dtype=transformer_config.params_dtype,
                 )
-            )
+            )#添加class token
 
         self.model_type = ModelType.encoder_or_decoder
 
@@ -214,7 +214,7 @@ def get_num_image_embeddings(
     max_num_tiles=0,
     tokenizer_type=None,
 ):
-    """Get the number of image embeddings per image tile."""
+    """Get the number of image embeddings per image tile.""" #注意这里获取的是单个tile的token数量，如果一个图片没有被tile切分，那就相当于图片的token数量
     if vision_model_type == "siglip":
         keep_class_token = False
     elif vision_model_type in ("clip", "internvit", "internvit300M"):
@@ -236,15 +236,15 @@ def get_num_image_embeddings(
     else:
         raise NotImplementedError(f"unknown vision model type {vision_model_type}")
 
-    num_patches_per_dim_h = img_h // patch_dim
-    num_patches_per_dim_w = img_w // patch_dim
-    num_patches = num_patches_per_dim_h * num_patches_per_dim_w
-    num_image_embeddings_per_tile = num_patches + (class_token_len if keep_class_token else 0)
+    num_patches_per_dim_h = img_h // patch_dim #h维度有几块
+    num_patches_per_dim_w = img_w // patch_dim #w维度有几块
+    num_patches = num_patches_per_dim_h * num_patches_per_dim_w #总共有多少块
+    num_image_embeddings_per_tile = num_patches + (class_token_len if keep_class_token else 0) #计算每个tile的token数量，并判断是否添加class_token
 
     if pixel_shuffle:
         num_image_embeddings_per_tile = int(num_image_embeddings_per_tile * (0.5**2))
 
-    if use_tile_tags:
+    if use_tile_tags: #有些模型会将图片tile为多个子图，然后对每个子图进行patch和vit，这里控制的是将每个tile经过vit输出的token和文本token结合的时候，是否为每个 tile 前面添加位置标记 token（如 <tile_1>、<tile_2>...），告诉语言模型当前 tile 在原图里的排列顺序，和vit内部的位置编码无关
         if tokenizer_type in ("llama3p1", "chatml", "qwen2p0", "qwen2p5"):
             num_image_embeddings_per_tile += 5
         elif tokenizer_type.startswith("nemotron5"):
@@ -258,4 +258,4 @@ def get_num_image_embeddings(
         elif max_num_tiles > 100:
             raise ValueError(f"max number of tiles {max_num_tiles} not supported")
 
-    return num_image_embeddings_per_tile
+    return num_image_embeddings_per_tile #返回最终计算出的单个tile的视觉token数量

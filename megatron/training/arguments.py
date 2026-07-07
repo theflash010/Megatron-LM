@@ -1446,7 +1446,7 @@ def validate_args(args, defaults={}):
         torch.use_deterministic_algorithms(True)
 
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
-    if args.apply_query_key_layer_scaling:
+    if args.apply_query_key_layer_scaling: # apply_query_key_layer_scaling 在1/sqrt(d_k) 这个 scaling factor之上，额外按层号再缩小，一般不用
         args.attention_softmax_in_fp32 = True
 
     if args.result_rejected_tracker_filename is not None:
@@ -1724,7 +1724,7 @@ def _check_arg_is_not_none(args, arg):
 
 
 def core_transformer_config_from_args(args, config_class=None):
-
+    #arg → TransformerConfig 的适配器，将用户从 CLI 传入的参数args 构建为TransformerConfig
     # Config class.
     config_class = config_class or TransformerConfig
 

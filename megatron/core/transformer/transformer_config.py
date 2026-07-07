@@ -1067,10 +1067,10 @@ class TransformerConfig(ModelParallelConfig):
         if self.ffn_hidden_size is None:
             self.ffn_hidden_size = 4 * self.hidden_size
 
-        if self.kv_channels is None:
+        if self.kv_channels is None: #单个attention头的维度
             self.kv_channels = self.hidden_size // self.num_attention_heads
 
-        if self.num_query_groups is None:
+        if self.num_query_groups is None: #Q的组数
             self.num_query_groups = self.num_attention_heads
 
         if (
@@ -1505,7 +1505,7 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         # PP layout
-        if self.pipeline_model_parallel_layout is not None:
+        if self.pipeline_model_parallel_layout is not None: ##如果有pipeline_model_parallel_layout，就构造PipelineParallelLayerLayout对象
             # If pipeline layout is set, we will check the conflicts
             # with other pipeline layout arguments.
             any_conflict = (
@@ -1538,19 +1538,19 @@ class TransformerConfig(ModelParallelConfig):
                     pipeline_model_parallel_size=self.pipeline_model_parallel_size,
                 )
 
-            # Check whether the input VPP size conflicts with the PP layout
+            # Check whether the input VPP size conflicts with the PP layout #VPP size 冲突检测
             detected_vpp_size = (
                 self.pipeline_model_parallel_layout.virtual_pipeline_model_parallel_size
-            )
+            )#从 layout 对象中提取检测到的 VPP size
             if self.virtual_pipeline_model_parallel_size is not None:
                 assert self.virtual_pipeline_model_parallel_size == detected_vpp_size, (
                     f"virtual_pipeline_model_parallel_size conflicts with"
                     f" pipeline_model_parallel_layout,"
                     f" ({self.virtual_pipeline_model_parallel_size=}, "
                     f" {detected_vpp_size=})"
-                )
-            elif detected_vpp_size > 1:
-                self.virtual_pipeline_model_parallel_size = detected_vpp_size
+                )#    # 用户在配置中显式设了 VPP size → 必须与 layout 推导的一致
+            elif detected_vpp_size > 1: #    # 用户没设 VPP，但 layout 里有多个 virtual stage → 自动填充
+                self.virtual_pipeline_model_parallel_size = detected_vpp_size 
 
             # Check whether the layout is valid.
             self.mtp_standalone = self.pipeline_model_parallel_layout.validate_layer_layout(
@@ -1635,7 +1635,7 @@ class TransformerConfig(ModelParallelConfig):
 
         elif (
             self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
-        ):
+        ):#处理 embedding 层和 loss 层是否计入 pipeline 切分
             if self.virtual_pipeline_model_parallel_size is None:
                 num_layers = self.num_layers
 

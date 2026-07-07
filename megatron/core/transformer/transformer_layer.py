@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 def get_transformer_layer_offset(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ):
-    """Get the index offset of current pipeline stage, given the level of pipelining."""
+    """Get the index offset of current pipeline stage, given the level of pipelining.""" #计算当前block的层起始偏移
     if pp_rank is None:
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
@@ -270,7 +270,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self,
         config: TransformerConfig,
         submodules: TransformerLayerSubmodules,
-        layer_number: int = 1,
+        layer_number: int = 1, #当前block内部的layer编号
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
@@ -298,7 +298,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             self.layer_number = layer_number + get_transformer_layer_offset(
                 self.config, vp_stage, get_pg_rank(pg_collection.pp)
-            )
+            )#确定当前layer在全局的layer编号
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
 
@@ -311,7 +311,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         attention_optional_kwargs = {}
-        if config.context_parallel_size > 1 and config.cp_comm_type is not None:
+        if config.context_parallel_size > 1 and config.cp_comm_type is not None: #确定Context Parallel 通信类型
             if isinstance(config.cp_comm_type, list):
                 # layer_number is 1-indexed, so we need to subtract 1 to get the correct index
                 attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[
@@ -330,7 +330,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             config=self.config,
             layer_number=self.layer_number,
             **attention_optional_kwargs,
-        )
+        )#构建attention模块
 
         # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
@@ -340,7 +340,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
-        )
+        )#没有的模块就设置为identifyop，恒等变换
 
         # [Module 5: CrossAttention]
         self.cross_attention = build_module(

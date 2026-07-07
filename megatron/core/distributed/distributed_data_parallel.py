@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class DistributedDataParallel(_BaseDataParallel):
-    """
+    """ #DDP将grad统一放在连续的buffer中
     DDP wrapper which stores grads in contiguous buffers. Also has option of overlapping
     communication with backprop computation by breaking up full model's gradients into smaller
     buckets and running all-reduce / reduce-scatter on each bucket asynchronously. This class
@@ -62,14 +62,14 @@ class DistributedDataParallel(_BaseDataParallel):
         # Setup process groups, handling both None and provided pg_collection values.
         process_group_dict = ProcessGroupCollection.setup_process_groups_for_ddp(
             pg_collection, config, ddp_config
-        )
+        )#为 DDP 准备所有需要的进程组
 
         # If bucket_size is not provided as an input, use sane default based on dp_group size.
         dp_group = process_group_dict['dp_group']
         if ddp_config.bucket_size is None:
             ddp_config.bucket_size = max(40000000, 1000000 * dp_group.size())
         # Set bucket_size to infinity if overlap_grad_reduce is False.
-        if not ddp_config.overlap_grad_reduce:
+        if not ddp_config.overlap_grad_reduce: #没有启用overlap_grad_reduce就不进行bucket分桶
             ddp_config.bucket_size = None
 
         self.ddp_config = ddp_config
@@ -79,7 +79,7 @@ class DistributedDataParallel(_BaseDataParallel):
             f'Setting up DistributedDataParallel with config {self.ddp_config}',
         )
 
-        # Assign all required process groups
+        # Assign all required process groups #设置通信组，包含dp intra分层
         self.dp_group = process_group_dict['dp_group']
         self.dp_cp_group = process_group_dict['dp_cp_group']
         self.intra_dp_cp_group = process_group_dict['intra_dp_cp_group']
@@ -89,7 +89,7 @@ class DistributedDataParallel(_BaseDataParallel):
         self.pp_group = process_group_dict['pp_group']
         self.ep_group = process_group_dict['ep_group']
 
-        # Set inter_dist_opt_group if multiple optimizer instances
+        # Set inter_dist_opt_group if multiple optimizer instances #设置inter_dist_opt_group，应对多instance的DP
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_dist_opt_group = process_group_dict['inter_dist_opt_group']
 
@@ -109,9 +109,9 @@ class DistributedDataParallel(_BaseDataParallel):
         self.param_to_bucket_group = {}
 
         # Collect all trainable parameters.
-        param_to_name = {}
-        self.params_with_grad = []
-        all_params = []
+        param_to_name = {} #param到name的映射，方便后续通过param查找name
+        self.params_with_grad = [] #记录了所有需要优化的参数
+        all_params = [] #所有需要优化的参数的集合
         for name, param in self.module.named_parameters():
             if not param.requires_grad:
                 continue
@@ -124,13 +124,13 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
             all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
+        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel). #将所有参数按照BufferKey分组
         buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
         # This maintains backward compatibility for callers that create DDP directly
         # without pre-computing layouts (e.g., tests, external code).
-        if full_param_layout is None and self.ddp_config.use_distributed_optimizer:
+        if full_param_layout is None and self.ddp_config.use_distributed_optimizer: #没有提供full_param_layout，就自动计算
             log_single_rank(
                 logger,
                 logging.WARNING,
@@ -144,14 +144,14 @@ class DistributedDataParallel(_BaseDataParallel):
             full_param_layout = DistributedOptimizer.compute_full_param_layout(
                 all_params,
                 self.bucket_size,
-                self.intra_dp_cp_group.size(),
+                self.intra_dp_cp_group.size(), #world_size是intra实例内部的rank数量
                 self.ddp_config,
                 expert_data_parallel_world_size=self.intra_expt_dp_group.size(),
             )
 
         # When a full_param_layout is provided, verify that the grouping is consistent
         # with the layout (same buffer keys, same params per key, same param_indices).
-        if full_param_layout is not None:
+        if full_param_layout is not None: #提供了full_param_layout，就进行验证
             assert set(buffer_groups.keys()) == set(full_param_layout.layouts.keys()), (
                 f"Buffer keys from param grouping {set(buffer_groups.keys())} do not match "
                 f"full_param_layout keys {set(full_param_layout.layouts.keys())}"
@@ -165,8 +165,8 @@ class DistributedDataParallel(_BaseDataParallel):
                     param_indices == layout.param_indices
                 ), f"param_indices for {buffer_key} do not match between grouping and layout"
 
-        # Compute gradient scaling factors.
-        if config.calculate_per_token_loss:
+        # Compute gradient scaling factors. #计算gradient scaling factors
+        if config.calculate_per_token_loss: #calculate_per_token_loss=True 时，DDP 不缩放（factor=1.0），通信做纯 SUM。真正的除法（/ 全局总 token 数）在 finalize_model_grads 中统一完成，那里已经拿到了跨所有 DP rank 汇总的 token 总数，所以不需要 DDP 层面再处理。
             assert (
                 not self.ddp_config.average_in_collective
             ), "Cannot average in collective when calculating per-token loss!"
@@ -193,10 +193,10 @@ class DistributedDataParallel(_BaseDataParallel):
             #   1. Scale gradients by 1/dp_size before reduction
             #   2. Do sum reduction across data parallel ranks
             #   3. Final result is scaled by 1/dp_size as desired
-            if self.ddp_config.average_in_collective:
+            if self.ddp_config.average_in_collective: #通信做 average，本地只需补偿 expert 的 group size 差异（这样通信自动会除以expt_dp_group.size()，整体就是乘以 1/self.dp_cp_group.size()）。专家部分也是要除以self.dp_cp_group.size()的原因是本身就是dp_cp_group.size()个dp组，edp只是用部分rank来完成所有dp组的数据，所以梯度还是按照所有dp组来算，是dp_cp_group.size()
                 gradient_scaling_factor = 1.0
                 expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
-            else:
+            else: #通信不做 average，dense和expert部分都是乘以 1/dp_size
                 data_parallel_world_size = self.dp_cp_group.size()
 
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
@@ -206,15 +206,15 @@ class DistributedDataParallel(_BaseDataParallel):
         self.buffers = []
         self.expert_parallel_buffers = []
         pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
-        for buffer_key, (params, param_indices) in buffer_groups.items():
+        for buffer_key, (params, param_indices) in buffer_groups.items(): #对每一组param（buffer）
             if buffer_key.is_expert_parallel:
-                data_parallel_group = self.intra_expt_dp_group
+                data_parallel_group = self.intra_expt_dp_group ##intra_dp_cp_group 对应一个expert部分的分布式 optimizer 实例
                 scaling_factor = expert_gradient_scaling_factor
             else:
-                data_parallel_group = self.intra_dp_cp_group
+                data_parallel_group = self.intra_dp_cp_group  #intra_dp_cp_group 对应一个dense部分的分布式 optimizer 实例
                 scaling_factor = gradient_scaling_factor
 
-            if not config.calculate_per_token_loss:
+            if not config.calculate_per_token_loss: #梯度缩放因子校验
                 target_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
                 if self.ddp_config.average_in_collective:
                     if self.ddp_config.num_distributed_optimizer_instances == 1:
@@ -234,8 +234,8 @@ class DistributedDataParallel(_BaseDataParallel):
 
             param_layout = (
                 full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
-            )
-            params_with_names = [(p, param_to_name[p]) for p in params]
+            ) #获取这个 buffer_key 对应的布局信息
+            params_with_names = [(p, param_to_name[p]) for p in params] #获取参数和参数名称的列表
             buffer = _ParamAndGradBuffer(
                 self.ddp_config,
                 buffer_key.param_dtype,
@@ -249,8 +249,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.nccl_ub,
                 pg_collection,
                 param_layout=param_layout,
-            )
-            if buffer_key.is_expert_parallel:
+            )#按照param_layout构造_ParamAndGradBuffer对象
+            if buffer_key.is_expert_parallel: #将buffer添加到属性中
                 self.expert_parallel_buffers.append(buffer)
             else:
                 self.buffers.append(buffer)
@@ -270,7 +270,7 @@ class DistributedDataParallel(_BaseDataParallel):
             reduce_scatter_with_fp32_accumulation=(
                 self.ddp_config.reduce_scatter_with_fp32_accumulation
             ),
-        )
+        )#将bucket聚合为组_ParamAndGradBucketGroup，没有fp8就每个bucket自成一组
         self.expert_parallel_bucket_groups = partition_buckets(
             self.expert_parallel_buffers,
             force_single_bucket_group=disable_bucketing,
@@ -289,14 +289,14 @@ class DistributedDataParallel(_BaseDataParallel):
                     bucket_group.inter_distributed_optimizer_instance_group = (
                         self.inter_dist_opt_group
                     )
-                    bucket_group.communication_stream = communication_stream
+                    bucket_group.communication_stream = communication_stream #所有 bucket group 共享同一个 communication_stream，确保多个 DistOpt instance 之间的通信在同一个 stream 上串行化
 
         # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
         # buckets in reverse order (since all-gathers happen in reverse order of buckets).
         # Note: overlap_param_gather covers both the distributed optimizer and the
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True
-        # without use_distributed_optimizer.
-        if self.ddp_config.overlap_param_gather:
+        # without use_distributed_optimizer. #确定每个bucket group的next_param_gather_bucket_group
+        if self.ddp_config.overlap_param_gather: #反向遍历：从最后一个 bucket group 开始，把它的 next_param_gather_bucket_group 指向前一个 bucket group（因为bucket是逆序构建的，指向前一个实际上代表后面的layer），指定每个bucket group的next_param_gather_bucket_group
             for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
@@ -304,7 +304,7 @@ class DistributedDataParallel(_BaseDataParallel):
                         bucket_groups[num_bucket_groups - i - 1]
                     )
 
-        # Create map from param to bucket group, used in pre_hook.
+        # Create map from param to bucket group, used in pre_hook. #构建从param到bucket group的映射，用于pre_hook
         for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
             for bucket_group in bucket_groups:
                 for bucket in bucket_group.buckets:
@@ -328,7 +328,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # Accumulation function for the gradients need to be stored so they
         # don't go out of scope.
         self.grad_accs = []
-        for param in self.module.parameters():
+        for param in self.module.parameters(): #由于使用了grad buffer，需要拦截torch的自动梯度累计，注册backward钩子来手动进行梯度累计，累计到grad buffer中
             if param.requires_grad:
                 # When delay_wgrad_compute is True and the param is marked with
                 # skip_backward_post_hook, register the backward post hook for its module
@@ -348,20 +348,20 @@ class DistributedDataParallel(_BaseDataParallel):
                                     break
                 else:
                     # Expand so we get access to grad_fn.
-                    param_tmp = param.expand_as(param)
+                    param_tmp = param.expand_as(param) #创建param_tmp就是为了访问到param叶子节点的grad_acc算子（这个是torch自动生成的）
                     # Get the gradient accumulator function.
-                    grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    grad_acc.register_hook(self._make_backward_post_hook(param))
+                    grad_acc = param_tmp.grad_fn.next_functions[0][0] #获取到param叶子节点的grad_acc算子
+                    grad_acc.register_hook(self._make_backward_post_hook(param)) #对torch的grad_acc算子注册hook，在grad_acc累计完了grad之后，把grad累计到grad buffer中
                     self.grad_accs.append(grad_acc)
 
         # Note: overlap_param_gather covers both the distributed optimizer and the
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True
         # without use_distributed_optimizer.
-        self.use_forward_hook = self.ddp_config.overlap_param_gather
+        self.use_forward_hook = self.ddp_config.overlap_param_gather #决定是否启用 forward pre-hook。overlap_param_gather=True 时，需要通过 pre-hook 在 forward 之前等待/触发 all-gather。注意注释：这个配置覆盖了 DO 和 layer-wise optimizer 两种场景
         self.remove_forward_pre_hook_handles = {}
-        if self.use_forward_hook:
+        if self.use_forward_hook: #对每个module注册forward pre-hook，module在前传前进行allgather
             self.enable_forward_pre_hook()
-        self.overlap_param_gather_with_optimizer_step = False
+        self.overlap_param_gather_with_optimizer_step = False #__init__ 默认 False，由后续代码（条件满足时）再打开
 
     def enable_forward_pre_hook(self):
         """
@@ -373,7 +373,7 @@ class DistributedDataParallel(_BaseDataParallel):
         for module in self.module.modules():
             self.remove_forward_pre_hook_handles[module] = module.register_forward_pre_hook(
                 self._make_forward_pre_hook()
-            )
+            )#添加hook，在forward之前进行allgather
 
     def disable_forward_pre_hook(self, param_sync: bool = True):
         """
@@ -407,7 +407,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 return
 
             # Make sure all parameters in this module have been all-gathered as necessary.
-            for param in module.parameters(recurse=False):
+            for param in module.parameters(recurse=False):#对module的每个param都进行finish_param_sync
                 # Skip parameters without an associated buffer (such parameters have a
                 # .requires_grad field equal to False).
                 if param not in self.param_to_bucket_group:
@@ -418,13 +418,13 @@ class DistributedDataParallel(_BaseDataParallel):
                 # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
                 # If overlapping param all-gather with optimizer step, then all-gather has
                 # already been dispatched in optimizer step.
-                skip_next_bucket_dispatch = (
-                    self.ddp_config.align_param_gather
-                    or self.overlap_param_gather_with_optimizer_step
+                skip_next_bucket_dispatch = (#是否跳过下一个bucket的allgather
+                    self.ddp_config.align_param_gather #参数 all-gather 需要跨 pipeline stage 对齐，由 pipeline schedule 统一调度
+                    or self.overlap_param_gather_with_optimizer_step #all-gather 已在 optimizer step 中被提前发起了，不需要 pre-hook 再发下一个
                 )
                 self.param_to_bucket_group[param].finish_param_sync(
                     skip_next_bucket_dispatch=skip_next_bucket_dispatch
-                )
+                )#完成当前param对应的bucket group的gather通信
 
         return hook
 
@@ -448,8 +448,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
-                    param.main_grad.add_(param.grad.data)
-                param.grad = None
+                    param.main_grad.add_(param.grad.data) #将param的梯度累加到main_grad（grad buffer）中
+                param.grad = None #清空param的梯度
 
                 if self.ddp_config.overlap_grad_reduce:
                     self.param_to_bucket_group[param].register_grad_ready(
@@ -592,7 +592,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 data_parallel_group = self.dp_cp_group
             torch.distributed.broadcast(
                 param.data,
-                src=torch.distributed.get_global_rank(data_parallel_group, 0),
+                src=torch.distributed.get_global_rank(data_parallel_group, 0), #源 rank 在 group 中的 rank id（从 0 到 group.size()-1）
                 group=data_parallel_group,
             )
 

@@ -2278,7 +2278,7 @@ def unwrap_model(model, module_instances=None):
         )
         from megatron.core.transformer.module import Float16Module
 
-        module_instances = (DDP, torch_FSDP, megatron_FSDP, Float16Module)
+        module_instances = (DDP, torch_FSDP, megatron_FSDP, Float16Module) #模型实例的可能类型，指定了需要被剥离的 wrapper 类型
 
     return_list = True
     if not isinstance(model, list): #判断model本身是不是列表，如果本身是列表，那解包之后也应该返回一个列表，反之依然
@@ -2286,7 +2286,7 @@ def unwrap_model(model, module_instances=None):
         return_list = False
     unwrapped_model = []
     for model_module in model:
-        while isinstance(model_module, module_instances):
+        while isinstance(model_module, module_instances): #如果是这些wrapper类型，就继续剥离直到不再匹配为止
             model_module = model_module.module
         unwrapped_model.append(model_module)
     if not return_list:

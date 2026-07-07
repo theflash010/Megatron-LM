@@ -25,9 +25,9 @@ def model_provider(
         pre_process (bool): Include the embedding layer in the gpt decoder (used with pipeline parallelism). Defaults to True.
         post_process (bool): Include an output layer and a layernorm in the gpt decoder (used with pipeline parallelism). Defaults to True.
         add_encoder (bool): Construct the encoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the encoder
-            will live on only a subset of the pipeline stages (specifically, only the first stage).
+            will live on only a subset of the pipeline stages (specifically, only the first stage). #是否添加encoder
         add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
-            will live on only a subset of the pipeline stages (specifically, every stage after the first one).
+            will live on only a subset of the pipeline stages (specifically, every stage after the first one). #是否添加decoder
         parallel_output (bool): Enable parallel model output.
         vp_stage: Optional virtual pipeline stage. Used with virtual pipeline parallelism.
         config: Optional transformer config. If None, will be created from args.
@@ -41,7 +41,7 @@ def model_provider(
 
     print_rank_0('building a multimodal model ...')
 
-    num_image_embeddings = get_num_image_embeddings(
+    num_image_embeddings = get_num_image_embeddings( #获取一个tile的token数量，如果一个图片没有被tile切分，那就相当于图片的token数量
         args.img_h,
         args.img_w,
         args.patch_dim,
@@ -53,8 +53,8 @@ def model_provider(
         args.max_num_tiles,
         args.tokenizer_prompt_format
     )
-    old_seq_length = args.seq_length
-    args.seq_length = args.encoder_seq_length = num_image_embeddings
+    old_seq_length = args.seq_length #保存原始的序列长度
+    args.seq_length = args.encoder_seq_length = num_image_embeddings #更新序列长度为单个tile的token的数量
     if old_seq_length != args.seq_length:
         log_single_rank(
             logging.getLogger(__name__),
@@ -62,12 +62,12 @@ def model_provider(
             f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
         )
 
-    max_num_image_embeddings = max((args.max_num_tiles + int(args.use_thumbnail)), args.num_frames) * num_image_embeddings
+    max_num_image_embeddings = max((args.max_num_tiles + int(args.use_thumbnail)), args.num_frames) * num_image_embeddings #全图所有 tile 的总 visual token 数 / 全视频所有帧的总 visual token 数
 
     assert (
         args.decoder_seq_length is not None
     ), "Please provide --decoder-seq-length to set the language model sequence length"
-    assert (
+    assert ( #--decoder-seq-length代表LLM 总序列长度，包括vision部分和text部分，这里要求这个长度要大于视觉部分的token数量
         args.decoder_seq_length > max_num_image_embeddings
     ), "Language model sequence length must be greater than the maximum number of image embeddings"
     if args.decoder_seq_length > args.max_position_embeddings:
@@ -76,16 +76,16 @@ def model_provider(
             f"Expanded max_position_embeddings to {args.max_position_embeddings} to accommodate the maximum language model sequence length"
         )
 
-    language_model_type = args.language_model_type
-    vision_model_type = args.vision_model_type
+    language_model_type = args.language_model_type #'mistral-7b'
+    vision_model_type = args.vision_model_type #''clip'
 
-    base_config = core_transformer_config_from_args(get_args())
+    base_config = core_transformer_config_from_args(get_args()) #利用args构建TransformerConfig对象
     base_config.language_model_type = args.language_model_type
     base_config.vision_model_type = args.vision_model_type
     base_config.calculate_per_token_loss = True
 
     language_config = deepcopy(base_config)
-    language_config = get_language_model_config(language_config)
+    language_config = get_language_model_config(language_config) #根据language_model_type，参数设置与语言模型结构对齐
 
     if language_model_type.startswith("hf://"):
         assert args.tensor_model_parallel_size == 1, "Huggingface models do not support --tensor-model-parallel-size > 1"
@@ -105,14 +105,14 @@ def model_provider(
                 is_vit=False, padding=padding
             )  # TENorm detects LayerNorm/RMS automatically.
     else:
-        language_transformer_layer_spec = get_layer_spec(
+        language_transformer_layer_spec = get_layer_spec( #确定decoder的层spec
             is_vit=False, normalization=language_config.normalization
         )
 
     vision_config = deepcopy(base_config)
     vision_config = get_vision_model_config(
         vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling
-    )
+    ) #按照vision_model_type，参数设置与视觉模型结构对齐
     if vision_model_type.startswith("hf://"):
         assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
         assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
@@ -125,7 +125,7 @@ def model_provider(
         else:
             vision_transformer_layer_spec = get_layer_spec(
                 is_vit=True, normalization=vision_config.normalization
-            )
+            ) #确定encoder的层spec
     elif vision_model_type == "radio-g":
         if use_te:
             from radio.radio_g import get_radio_g_layer_spec_te
@@ -150,19 +150,19 @@ def model_provider(
 
     vision_projection_config = get_vision_projection_config(
         vision_projection_config, language_config.hidden_size
-    )
+    )#按照decoder的类型'mistral-7b'确定视觉投影层的config
 
     # Make sure vision model pipeline parallel size is not inherited from the language model pipeline parallel size.
-    vision_config.pipeline_model_parallel_size = 1
-    vision_projection_config.pipeline_model_parallel_size = vision_config.pipeline_model_parallel_size
+    vision_config.pipeline_model_parallel_size = 1 #让encoder的PP=1
+    vision_projection_config.pipeline_model_parallel_size = vision_config.pipeline_model_parallel_size #让视觉投影层的PP=1
 
     # Make sure the vision model does not inherit first and last pipeline num layers from the language model.
     vision_config.first_pipeline_num_layers = vision_config.last_pipeline_num_layers = None
 
     if vision_projection_config.normalization:
-        vision_projection_layer_spec = get_norm_mlp_module_spec_te().submodules
+        vision_projection_layer_spec = get_norm_mlp_module_spec_te().submodules #有normalize
     else:
-        vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
+        vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules #无normalizee，取视觉投影层的spec，但是好奇怪，竟然是submodules
 
     # Toggle --recompute* for the vision and language model separately.
     if args.recompute_vision:
@@ -178,21 +178,21 @@ def model_provider(
     vision_projection_config.recompute_num_layers = None
 
     # TODO: Vision model and projection do not use SP/CP yet.
-    vision_config.sequence_parallel = False
-    vision_config.context_parallel_size = 1
-    vision_config.tp_comm_overlap = False
+    vision_config.sequence_parallel = False #不让encoder进行SP/CP/TP细粒度GEMM通算并行
+    vision_config.context_parallel_size = 1 
+    vision_config.tp_comm_overlap = False 
 
-    vision_projection_config.sequence_parallel = False
-    vision_projection_config.context_parallel_size = 1
-    vision_projection_config.tp_comm_overlap = False
+    vision_projection_config.sequence_parallel = False #不让视觉投影层进行SP/CP/TP通算并行
+    vision_projection_config.context_parallel_size = 1 
+    vision_projection_config.tp_comm_overlap = False 
 
-    tokenizer = get_tokenizer()
-    image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
+    tokenizer = get_tokenizer() #获取tokenizer
+    image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN) #获取图像token <image>的索引32768
     assert image_token_index is not None, f"IMAGE_TOKEN={IMAGE_TOKEN} needs to be added using the --special-tokens arg."
 
-    tile_tags = _get_tile_tags(args, tokenizer)
+    tile_tags = _get_tile_tags(args, tokenizer) #没有使用tile tags
 
-    model = LLaVAModel(
+    model = LLaVAModel(#构建llava模型，占用空间
         language_transformer_config=language_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
         language_vocab_size=args.padded_vocab_size,
@@ -226,7 +226,7 @@ def model_provider(
         tokenizer_type=args.tokenizer_prompt_format,
     )
 
-    model.freeze(
+    model.freeze(#可选冻结模块
         freeze_language_model=args.freeze_LM,
         freeze_vision_model=args.freeze_ViT,
         freeze_vision_projection=False,

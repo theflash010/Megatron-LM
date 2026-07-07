@@ -28,7 +28,7 @@ class PipelineParallelLayerLayout:
 
         self.input_data = layout
         if isinstance(layout, str):
-            layout = PipelineParallelLayerLayout.parse_str_to_list(layout)
+            layout = PipelineParallelLayerLayout.parse_str_to_list(layout) #把string转换为list结构
         else:
             layout = copy.deepcopy(layout)
         assert all(isinstance(row, list) for row in layout), (
@@ -42,7 +42,7 @@ class PipelineParallelLayerLayout:
             f" by pipeline_model_parallel_size ({len(layout)=},"
             f" {pipeline_model_parallel_size=})"
         )
-        virtual_pipeline_model_parallel_size = len(layout) // pipeline_model_parallel_size
+        virtual_pipeline_model_parallel_size = len(layout) // pipeline_model_parallel_size #len(layout)代表模型总stage数量，virtual_pipeline_model_parallel_size代表每个物理 pipeline rank 上分配的虚拟 stage 数量。
 
         # Convert 1D layout to 2D layout
         layout = [
@@ -51,9 +51,9 @@ class PipelineParallelLayerLayout:
                 for vpp_rank in range(virtual_pipeline_model_parallel_size)
             ]
             for pp_rank in range(pipeline_model_parallel_size)
-        ]
+        ]#转换为二维列表，layout_2d[pp_rank][vpp_rank] = layout_1d[vpp_rank * PP + pp_rank]
 
-        # Convert all strings in pipeline_model_parallel_layout to LayerType
+        # Convert all strings in pipeline_model_parallel_layout to LayerType #确保layout_2d[pp_rank][vpp_rank]每个元素都是 LayerType 枚举类型
         for pp_rank in range(pipeline_model_parallel_size):
             for vpp_rank in range(virtual_pipeline_model_parallel_size):
                 transferred_layout = []
@@ -67,12 +67,12 @@ class PipelineParallelLayerLayout:
                         assert (
                             layer_type in LayerType.__members__
                         ), f"{layer_type} is not a valid LayerType"
-                        layer_type = LayerType[layer_type]
+                        layer_type = LayerType[layer_type] #转换为枚举类型LayerType
                     transferred_layout.append(layer_type)
                 layout[pp_rank][vpp_rank] = transferred_layout
 
         # Flatten the pipeline layout in layer id order.
-        flatten_layout = []
+        flatten_layout = [] #flatten_layout 代表了全局统一的层 ID 顺序，用于给每层分配一个全局唯一的 layer id
         for vpp_rank in range(virtual_pipeline_model_parallel_size):
             for row in layout:
                 flatten_layout.extend(row[vpp_rank])
@@ -281,7 +281,7 @@ class PipelineParallelLayerLayout:
 
     @staticmethod
     def parse_str_to_list(layout_str: str):
-        """Parse a layout string to a list of lists.
+        """Parse a layout string to a list of lists. #将紧凑的字符串描述解析成结构化的层类型列表
         Example: "Ettt|(tt|)*29,m|L" will be parsed to
         [["E","t","t","t"]]+[["t","t"]]*29+[["m"],["L"]]"""
 
@@ -301,10 +301,10 @@ class PipelineParallelLayerLayout:
             layout_str = re.sub(pattern, lambda x: x.group(1) * int(x.group(2)), layout_str)
 
         char2layer_type = {
-            "E": LayerType.embedding,
-            "L": LayerType.loss,
-            "t": LayerType.decoder,  # t denotes "transformer"
-            "m": LayerType.mtp,
+            "E": LayerType.embedding, #Embedding 层
+            "L": LayerType.loss, #Loss 计算层
+            "t": LayerType.decoder,  # t denotes "transformer" #Transformer decoder 层
+            "m": LayerType.mtp, #Multi-Token Prediction 层
         }
 
         # parse the layout string

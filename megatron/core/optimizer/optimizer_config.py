@@ -145,25 +145,25 @@ class OptimizerConfig:
 
     lr: Optional[float] = None
     """Initial learning rate. Depending on decay style and initial warmup, the learning rate at each
-       iteration would be different.
+       iteration would be different. #lr 在这里既是"初始学习率"也是"最大学习率"。因为 warmup 从 0（或 lr_warmup_init）起步，升到 lr 就停了，所以 lr 就是整个调度曲线的峰值。
     """
 
     min_lr: Optional[float] = None
-    """Minumum value for learning rate. The scheduler clip values below this threshold."""
+    """Minumum value for learning rate. The scheduler clip values below this threshold.""" #学习率的下限。scheduler decay 到该值后就不再继续降低，起"兜底"作用
 
     decoupled_lr: Optional[float] = None
-    """Separate learning rate for the input and output layer."""
+    """Separate learning rate for the input and output layer.""" #是 lr / min_lr 的解耦版本，专门给输入层和输出层（embedding + LM head）用的
 
     decoupled_min_lr: Optional[float] = None
     """Minimum value for learning rate for the input and output layer. The scheduler clip values
-       below this threshold.
+       below this threshold. #是 lr / min_lr 的解耦版本，专门给输入层和输出层（embedding + LM head）用的
     """
 
     weight_decay: float = 0.01
-    """Weight decay coefficient for L2 regularization."""
+    """Weight decay coefficient for L2 regularization.""" #权重衰减系数，用于L2正则化
 
     apply_wd_to_qk_layernorm: bool = False
-    """If true, apply weight decay to qk layernorm as a special case."""
+    """If true, apply weight decay to qk layernorm as a special case.""" #控制是否对 QK LayerNorm 施加 weight decay
 
     ##############
     # Precision
@@ -171,10 +171,10 @@ class OptimizerConfig:
     fp8_recipe: Optional[str] = None
     """The type of fp8 recipe will affect the processing logic inside distributed optimizer."""
 
-    fp16: bool = False
+    fp16: bool = False #标记训练是fp16混合精度
     """If true, train with fp16 mixed precision training. Defaults to False."""
 
-    bf16: bool = False
+    bf16: bool = False #标记训练是bf16混合精度
     """If true, train with bf16 mixed precision training. Defaults to False."""
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
@@ -186,7 +186,7 @@ class OptimizerConfig:
 
     use_precision_aware_optimizer: bool = False
     """If true, allows optimizer-related tensors (master_param, gradients and optimizer states)
-    to be set to lower precision. Defaults to False.
+    to be set to lower precision. Defaults to False. #是否选择优化器状态的相关tensor降低精度，默认 False，此时所有 optimizer 相关 tensor 强制 FP32。设为 True 后，下面的 main_grads_dtype、main_params_dtype、exp_avg_dtype、exp_avg_sq_dtype 才会生效。
     """
 
     store_param_remainders: bool = True
@@ -194,16 +194,16 @@ class OptimizerConfig:
         16 bits shared with the BF16 parameters. This lowers GPU memory usage. Defaults to True.
     """
 
-    main_grads_dtype: torch.dtype = torch.float32
+    main_grads_dtype: torch.dtype = torch.float32 #主梯度的 dtype。开启精度感知后，梯度可以降精度存（比如 torch.bfloat16），减少梯度通信和存储开销。
     """dtype of main grads when enabling precision-aware-optimizer"""
 
-    main_params_dtype: torch.dtype = torch.float32
+    main_params_dtype: torch.dtype = torch.float32 #主参数（FP32 master weights）的 dtype。可以降到 BF16
     """dtype of main params when enabling precision-aware-optimizer"""
 
-    exp_avg_dtype: torch.dtype = torch.float32
+    exp_avg_dtype: torch.dtype = torch.float32 #Adam 动量（一阶矩）的 dtype。可降到 BF16。
     """dtype of exp_avg when enabling precision-aware-optimizer"""
 
-    exp_avg_sq_dtype: torch.dtype = torch.float32
+    exp_avg_sq_dtype: torch.dtype = torch.float32 #Adam 方差（二阶矩）的 dtype。可降到 BF16。
     """dtype of exp_avg_sq when enabling precision-aware-optimizer"""
 
     optimizer: str = 'adam'

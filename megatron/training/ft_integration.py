@@ -74,8 +74,8 @@ def get_rank_monitor_client() -> Optional[Any]:
 
 
 def setup() -> None:
-    """Initialize fault tolerance before initialize_megatron"""
-    args = arguments.parse_args(ignore_unknown_args=True)
+    """Initialize fault tolerance before initialize_megatron""" #容错设置
+    args = arguments.parse_args(ignore_unknown_args=True) #防御性设计，重新解析参数，反正也不会设置为全局参数，仅仅在这里使用
     if not args.enable_ft_package:
         return
 

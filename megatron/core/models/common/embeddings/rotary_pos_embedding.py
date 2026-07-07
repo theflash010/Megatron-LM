@@ -38,7 +38,7 @@ class RotaryEmbedding(nn.Module):
 
     Args:
         kv_channels (int): Projection weights dimension in multi-head attention. Obtained
-            from transformer config
+            from transformer config #单个注意力头维度，即 hidden_size / num_attention_heads
         rotary_percent (float): Percent of rotary dimension to use for rotary position
             embeddings.
         rotary_interleaved (bool, optional): If True, interleaved rotary position embeddings.
@@ -172,7 +172,7 @@ class RotaryEmbedding(nn.Module):
             )
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
-        return emb
+        return emb #输出的是原始旋转角度（弧度值），不是 cos/sin。
 
     @lru_cache(maxsize=32)
     @internal_api
@@ -201,7 +201,7 @@ class RotaryEmbedding(nn.Module):
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group) #对cp，只选择这个rank负责的部分embedding
 
         return emb
 

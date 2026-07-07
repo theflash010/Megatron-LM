@@ -182,7 +182,7 @@ class ProcessGroupCollection:
         if required_pgs is None: #确定需要初始化的进程组
             required_pgs = list(all_pgs)
 
-        # Validate requested process groups
+        # Validate requested process groups #检查required_pgs有没有不合法的pg
         invalid_pgs = [pg for pg in required_pgs if pg not in all_pgs]
         if invalid_pgs:
             raise ValueError(f"Invalid process groups requested: {invalid_pgs}")
@@ -454,7 +454,7 @@ class ProcessGroupCollection:
     def setup_process_groups_for_ddp(
         pg_collection: Optional['ProcessGroupCollection'], config, ddp_config
     ):
-        """
+        """ #为 DDP 准备所有需要的进程组
         Helper method to set up process groups for DDP with proper validation and fallbacks.
 
         Args:

@@ -893,7 +893,7 @@ def pretrain(
 
     # Early fault tolerance setup - must be done before initialize_megatron
     # to enable monitoring of the initialization process
-    ft_integration.setup()
+    ft_integration.setup() #设置容错
     timestamp_after_in_job_setup = time.time()
 
     # Initalize and get arguments, timers, and Tensorboard writer.
@@ -901,25 +901,25 @@ def pretrain(
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
-    )
+    )#完成megatron初始化
 
     timestamp_after_initialize_megatron = time.time()
 
     args = get_args()
     timers = get_timers()
 
-    if args.fine_grained_activation_offloading:
+    if args.fine_grained_activation_offloading: #如果细粒度的激活值offload
         from megatron.core.pipeline_parallel.utils import (
             set_ideal_affinity_for_current_gpu
         )
-        set_ideal_affinity_for_current_gpu()
+        set_ideal_affinity_for_current_gpu() #按照GPU确定进程的NUMA亲和性
 
 
     if cfg_container.logger.log_progress:
         append_to_progress_log("Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+    set_jit_fusion_options() #预热部分融合算子，后面要使用的话需要显示调用融合算子，不会自动识别
 
     timestamp_after_set_jit_fusion_options = time.time()
 
@@ -934,9 +934,9 @@ def pretrain(
     program_start_global = _TRAIN_START_TIME
     if _STARTUP_TIMESTAMPS['program_start'] is not None:
         program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
-        torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
+        torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN) #全局获取最小值
         program_start_global = program_start_global.item()
-    set_startup_timestamps(program_start=program_start_global)
+    set_startup_timestamps(program_start=program_start_global) #设置全局最小值，最早开始时间点
 
     global _LEGACY_TRAIN_START_TIME
     start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
@@ -960,7 +960,7 @@ def pretrain(
     print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
     print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
 
-    if program_start is not None and main_entry is not None and pretrain_entry is not None:
+    if program_start is not None and main_entry is not None and pretrain_entry is not None: #计算各阶段耗时并注入 Timer
         # Inject startup deltas into timers
         startup_timers = {
             'startup-program-entry-spread': program_start - program_start_global, # Local program start timestamp vs the global earliest program start timestamp
@@ -995,7 +995,7 @@ def pretrain(
     one_logger_utils.on_pretrain_start()
 
     # Context used for persisting some state between checkpoint saves.
-    if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':
+    if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':#设定checkpoint context
         try:
             from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
                 LocalCheckpointManager,
@@ -1025,7 +1025,7 @@ def pretrain(
                 cfg_container.checkpoint.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
             )
         }
-    else:
+    else: #默认
         checkpointing_context = {}
 
     # Model, optimizer, and learning rate.
@@ -1313,11 +1313,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     args = get_args()
     args.model_type = model_type
     if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups() #创建pg_collection对象
 
-        if args.create_all_gather_group:
+        if args.create_all_gather_group: #是否创建all-gather组（用于通信-通信重叠场景，讲RS和AG流水重叠起来）
             timeout = timedelta(minutes=args.distributed_timeout_minutes) if args.distributed_timeout_minutes else None
-            dp_cp_ag, expt_dp_ag = create_all_gather_groups(
+            dp_cp_ag, expt_dp_ag = create_all_gather_groups(#创建dp_cp_ag和expt_dp_ag两个all-gather组，只有 Megatron FSDP 路径（use_megatron_fsdp=True）会消费这两个组，传统 DDP 路径不使用它们。
                 for_expert_parallelism=(args.expert_model_parallel_size > 1),
                 timeout=timeout,
             )
@@ -1344,58 +1344,72 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         if (
             get_pg_size(pg_collection.pp) > 1
             and args.virtual_pipeline_model_parallel_size is not None
-        ):
+        ): ##有vpp时，每个vpp stage构造一个模型，build_model() 返回一个 model 列表
             model = []
             vp_size = args.virtual_pipeline_model_parallel_size
             for i in range(vp_size):
                 # Set pre_process and post_process only after virtual rank is set.
                 pre_process = is_pp_first_stage(pg_collection.pp) and is_vp_first_stage(
                     vp_stage=i, vp_size=vp_size
-                )
+                )#判断是不是位于pp的第一个stage
                 post_process = is_pp_last_stage(pg_collection.pp) and is_vp_last_stage(
                     vp_stage=i, vp_size=vp_size
-                )
+                )#判断是不是位于pp的最后一个stage
                 this_model = model_provider_func(
                     pre_process=pre_process,
                     post_process=post_process,
                     vp_stage=i,
                     config=config,
                     pg_collection=pg_collection,
-                )
+                )#用户自定义的模型构造函数
                 this_model.model_type = model_type
                 this_model.vp_stage = i
-                model.append(this_model)
-        else:
-            pre_process = is_pp_first_stage(pg_collection.pp)
-            post_process = is_pp_last_stage(pg_collection.pp)
+                model.append(this_model)#把model_chunk加入到model列表中
+        else: #没有vpp就只构造一个模型
+            pre_process = is_pp_first_stage(pg_collection.pp) #判断是不是位于pp的第一个stage
+            post_process = is_pp_last_stage(pg_collection.pp) #判断是不是位于pp的最后一个stage
+            import debugpy, os
+            local_rank = int(os.environ.get("LOCAL_RANK", "0")) #从环境变量中读取 `LOCAL_RANK`。如果没读到，则默认为 `"0"`。将其转换为整数赋值给 `local_rank`。
+            try:#使用异常处理适配多进程代码，这样只有一个进程会监听5678端口
+                # 仅主进程开启调试监听
+                if local_rank == 0:
+                    debugpy.listen(("localhost", 5678))
+                    print("Waiting for debugger attach")
+                    debugpy.wait_for_client()
+                else:
+                    # 非0号进程：永久阻塞，卡死在这里，不执行任何后续代码
+                    while True: pass
+            except Exception as e:
+                pass
             model = model_provider_func(
                 pre_process=pre_process,
                 post_process=post_process,
                 config=config,
                 pg_collection=pg_collection,
-            )
+            )#用户自定义的模型构造函数
             model.model_type = model_type
         return model
-
 
     if args.init_model_with_meta_device:
         with torch.device('meta'):
             model = build_model()
     else:
-        model = build_model()
+        model = build_model() #构建模型
 
-    if not isinstance(model, list):
+
+
+    if not isinstance(model, list): #如果model不是list类型，则将其包装为list
         model = [model]
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
     # attributes set for them. We should make sure the default attributes
     # are set for all params so the optimizer can use them.
-    for model_module in model:
+    for model_module in model: #对所有参数统一设置tp属性，不一定代表参与tp切分，只是为了兼容性，这里设置的tp属性是默认的，对于非TP切分参数不会有影响
         for param in model_module.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
-    # Print number of parameters.
+    # Print number of parameters. #打印这个rank负责的参数数量（每个参数 tensor 中的一个标量元素记为1）
     num_parameters = sum(
         [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
     )
@@ -1416,13 +1430,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if (
         not (args.use_torch_fsdp2 and args.use_cpu_initialization)
         and not args.init_model_with_meta_device
-    ):
+    ): #统一GPU分配，所有参数都挪到GPU上
         for model_module in model:
             model_module.cuda(torch.cuda.current_device())
 
     # Fp16 conversion.
-    if args.fp16 or args.bf16:
-        config = get_model_config(model[0])
+    if args.fp16 or args.bf16: #对model嵌套fp16/bf16逻辑，混合精度训练
+        config = get_model_config(model[0]) #transformer config
         model = [Float16Module(config, model_module) for model_module in model]
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
@@ -1437,12 +1451,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     correct_amax_history_if_needed(model)
 
     if wrap_with_ddp:
-        if args.use_torch_fsdp2:
+        if args.use_torch_fsdp2: # PyTorch 原生 FSDP2，不支持 PP（纯 DP 或 TP+DP 场景），由 reshard_after_forward 这一个参数决定ZeRO-2(False)还是ZeRO-3（True）
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
-        elif args.use_megatron_fsdp:
+        elif args.use_megatron_fsdp: #Megatron 自实现的 FSDP 变体，支持PP，用 data_parallel_sharding_strategy 控制分片程度（ZeRO-1 'optim'，ZeRO-2 'optim_grads'，ZeRO-3 'optim_grads_params'），Megatron-FSDP 内置了 DistOpt
             DP = megatron_FSDP
-        else:
+        else: #Megatron 自实现的分布式数据并行，可选分布式优化器use_distributed_optimizer，对应ZeRO-1
             DP = DDP
 
         config = get_model_config(model[0])
@@ -1458,11 +1472,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     "--ddp-num-buckets must be greater than 0"
                 bucket_size = num_parameters // args.ddp_num_buckets
             else:
-                bucket_size = args.ddp_bucket_size
+                bucket_size = args.ddp_bucket_size #计算桶大小
 
             # Initialize DDPConfig.
-            ddp_config = get_megatron_ddp_config(args)
-            ddp_config.bucket_size = bucket_size
+            ddp_config = get_megatron_ddp_config(args) #获取ddp相关配置
+            ddp_config.bucket_size = bucket_size #设置桶大小
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             # If bucket_size is not provided as an input, use sane default.
@@ -1472,16 +1486,16 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             if ddp_config.bucket_size is None:
                 ddp_config.bucket_size = max(
                     40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
-                )
+                )#如果没有设置，就设置默认值
             # Set bucket_size to infinity if overlap_grad_reduce is False.
-            if not ddp_config.overlap_grad_reduce:
-                ddp_config.bucket_size = None
+            if not ddp_config.overlap_grad_reduce: #不用通算并行，就不做桶的拆分，整批梯度合为一个大桶
+                ddp_config.bucket_size = None #设置为None，表示不限制桶大小，即整批梯度合为一个大桶
 
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
-        ddp_stream = torch.cuda.Stream()
+        ddp_stream = torch.cuda.Stream() #创造一个CUDA Stream，做DDP的初始化
         # Wait for the default stream to complete before starting ddp_stream
-        ddp_stream.wait_stream(torch.cuda.current_stream())
+        ddp_stream.wait_stream(torch.cuda.current_stream()) #wait_stream 会在 ddp_stream 中插入一个同步点，等 default stream（当前主 stream）上已排队的操作全部完成后，ddp_stream 才开始执行。
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
             # Megatron-FSDP reads dtypes from ddp_config; pass pg_collection for AG/RS overlap.
@@ -1490,11 +1504,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 dp_init_kwargs["pg_collection"] = pg_collection
 
             wrapped_model = []
-            for model_chunk_idx, model_chunk in enumerate(model):
+            for model_chunk_idx, model_chunk in enumerate(model):#只有vpp才会有多个chunk
                 chunk_kwargs = dict(dp_init_kwargs)
-                disable_bucketing = (
-                    (model_chunk_idx > 0)
-                    or args.overlap_param_gather_with_optimizer_step
+                disable_bucketing = ( #只有通信是关键路径的pp/vpp stage，才进行bucket分桶reduce/gather，只有第一个stage是这样的，其他stage的通信不是瓶颈
+                    (model_chunk_idx > 0) #非第一个 vpp stage的chunk不进行bucket分桶reduce，因为不是瓶颈
+                    or args.overlap_param_gather_with_optimizer_step #这个参数控制将第一个 chunk 的参数 all-gather 提前到 optimizer step 完成后立即触发，而不是等到下一轮 forward 的 pre-hook 才触发
                 )
 
                 # Pre-compute parameter layouts for the distributed optimizer.
@@ -1502,13 +1516,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 if args.use_distributed_optimizer and DP is DDP:
                     all_params = [
                         p for p in model_chunk.parameters() if p.requires_grad
-                    ]
-                    pp_rank = mpu.get_pipeline_model_parallel_rank()
+                    ] #torch.nn.Parameter的集合，代表这个chunk中所有需要优化的参数
+                    pp_rank = mpu.get_pipeline_model_parallel_rank() #获取pp rank
                     effective_bucket_size = (
                         None
                         if disable_bucketing or pp_rank > 0
                         else ddp_config.bucket_size
-                    )
+                    )#只有不是第一个阶段(pp>0)的chunk才进行bucket分桶reduce和gather
                     chunk_kwargs["full_param_layout"] = (
                         DistributedOptimizer.compute_full_param_layout(
                             all_params,
@@ -1518,27 +1532,27 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                             expert_data_parallel_world_size=(
                                 mpu.get_expert_data_parallel_world_size()
                             ),
-                        )
+                        )#将param按照BufferKey进行分组，然后对每组param进行确定layout（多少param组成一个bucket），所有layout组成一个完整的param layout方案
                     )
 
-                wrapped_model.append(
+                wrapped_model.append( #对每个model_chunk进行DP封装
                     DP(
                         config=config,
                         ddp_config=ddp_config,
                         module=model_chunk,
-                        disable_bucketing=disable_bucketing,
+                        disable_bucketing=disable_bucketing, #是否允许bucket分桶
                         **chunk_kwargs,
-                    )
+                    )#封装DP逻辑
                 )
-            model = wrapped_model
+            model = wrapped_model #将DP封装好的model列表返回
         # End of setup_stream
         # Critical: ensure side-stream work completes before touching params on default stream
-        torch.cuda.current_stream().wait_stream(ddp_stream)
+        torch.cuda.current_stream().wait_stream(ddp_stream) #确保DP初始化完成
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
-        if args.data_parallel_random_init:
+        if args.data_parallel_random_init: #如果各 rank 的模型参数初始化受不同随机种子影响。此时必须从 rank 0 广播到所有 rank，确保训练开始时所有 DP 副本参数相同
             for model_module in model:
-                model_module.broadcast_params()
+                model_module.broadcast_params() #broadcast_params 是 DistributedDataParallel 类的成员方法（distributed_data_parallel.py@L582-597），用于在训练开始时将 rank 0 的参数广播到所有 DP rank。
 
     return model
 
@@ -1615,7 +1629,7 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     return config, config_overrides
 
 def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallelConfig:
-    """Return an MCore DDPConfig from the argparse arguments."""
+    """Return an MCore DDPConfig from the argparse arguments.""" #将args转换为DistributedDataParallelConfig
 
     kwargs = {}
     for f in dataclasses.fields(DistributedDataParallelConfig):
@@ -1635,7 +1649,7 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
     kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
     kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
 
-    return DistributedDataParallelConfig(**kwargs)
+    return DistributedDataParallelConfig(**kwargs) #创建并返回DistributedDataParallelConfig对象
 
 
 def setup_model_and_optimizer(
@@ -1652,10 +1666,10 @@ def setup_model_and_optimizer(
     has_normal_optimizer = not args.skip_train
     # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
     has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
-    skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
-    wrap_with_ddp = not skip_optimizer
-    model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
-    unwrapped_model = unwrap_model(model)
+    skip_optimizer = not (has_normal_optimizer or has_rl_optimizer) #判断是否需要optimizer
+    wrap_with_ddp = not skip_optimizer #是否对模型嵌套数据并行逻辑
+    model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp) #获取模型，model会进行混合精度还有数据并行DDP的封装
+    unwrapped_model = unwrap_model(model) #剥离模型的wrapper，获取最原始的模型
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     if skip_optimizer:
@@ -1666,7 +1680,7 @@ def setup_model_and_optimizer(
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
         config.timers = timers
-        if getattr(args, "use_mup", False):
+        if getattr(args, "use_mup", False): #是否使用mup(Maximal Update Parameterization，没学过)，一般不用。如果 args 上有 use_mup 属性 → 返回 args.use_mup 的值，如果 args 上没有这个属性 → 返回默认值 False，一般是不用mup
             model_config_source = (
                 unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
             )

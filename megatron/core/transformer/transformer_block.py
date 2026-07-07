@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 def get_num_layers_to_build(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
-    """
+    """ #确定当前block需要构建的layer数量
     Determine the number of transformer layers to build for the current pipeline stage.
     Args:
         config (TransformerConfig): Configuration object containing transformer model parameters.
@@ -83,10 +83,10 @@ def get_num_layers_to_build(
     """
     # If we have a custom PP layout, straightforwardly
     # return the number of decoders in the layout array.
-    if config.pipeline_model_parallel_layout is not None:
+    if config.pipeline_model_parallel_layout is not None: #pipeline_model_parallel_layout 是一种自定义的 PP 层分配方案，允许精确控制每个 pipeline stage 包含哪些层，而不是用默认的均匀切分。
         return config.pipeline_model_parallel_layout.get_num_layers_to_build(
             layer_type=LayerType.decoder, vp_stage=vp_stage
-        )
+        )#按照pp_rank,vp_stage确定当前block需要构建的layer数量
 
     # Fallback for legacy tests.
     if pp_rank is None:
@@ -246,13 +246,13 @@ def _get_block_submodules(
     # is implemented in `transformer_layer.py` or if it subclasses
     # `BaseTransformerLayer` from the `transformer_layer.py` file.
     elif isinstance(spec, ModuleSpec):
-        if issubclass(spec.module, TransformerBlock): #用于检查一个类是否是另一个类的子类   issubclass(子类, 父类) → bool。
+        if issubclass(spec.module, TransformerBlock): #用于检查一个类是否是另一个类的继承子类   issubclass(子类, 父类) → bool。
             return spec.submodules
-        elif issubclass(spec.module, BaseTransformerLayer):
-            num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
+        elif issubclass(spec.module, BaseTransformerLayer): #是不是BaseTransformerLayer子类，比如<class 'megatron.core.transformer.transformer_layer.TransformerLayer'>
+            num_layers = get_num_layers_to_build(config, vp_stage, pp_rank) #确定这个block需要构建的layer数量
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
-            )
+            )#按照layer_specs来构造TransformerBlockSubmodules类
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
     else:
@@ -266,9 +266,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self,
         config: TransformerConfig,
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
-        post_layer_norm: bool = True,
-        pre_process: bool = True,
-        post_process: bool = True,
+        post_layer_norm: bool = True, #是否在每层末尾追加 LayerNorm
+        pre_process: bool = True, #block 是否会额外处理 embedding 输入
+        post_process: bool = True, #block 是否会额外输出到 loss 层
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ):
@@ -320,7 +320,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.config._cpu_offloading_context = None
 
         self._build_layers() #构建Block内部的各个子layer
-        self.num_layers_per_pipeline_rank = len(self.layers)
+        self.num_layers_per_pipeline_rank = len(self.layers) #记录这个rank处理的layer数量
 
     def _build_layers(self):
         # Transformer layers.
@@ -332,7 +332,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         def build_layer(layer_spec, layer_number):
             global_layer_number = layer_number + get_transformer_layer_offset(
                 self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
-            )  # 1-based index
+            )  # 1-based index #layer_number是这个block的layer编号，从1开始计数，get_transformer_layer_offset获取这个block的layer偏移量，加起来是全局的layer编号
             if self.config.heterogeneous_block_specs:
                 layer_config = self.config.get_config_for_layer(global_layer_number)
             else:

@@ -23,7 +23,7 @@ class LanguageModelEmbedding(MegatronModule):
         embedding_dropout_prob (float): dropout probability for embeddings
         num_tokentypes (int): Set to 0 without binary head, and 2 with a binary head. Defaults to 0.
         scatter_to_sequence_parallel (bool): Set to False to disable scatter of embedding
-            across sequence parallel region. Defaults to True.
+            across sequence parallel region. Defaults to True. #决定embedding是否进行sp切分（切分之后allreduce变成reduce-scatter）
     """
 
     def __init__(
@@ -41,11 +41,11 @@ class LanguageModelEmbedding(MegatronModule):
         self.config: TransformerConfig = config
         self.vocab_size: int = vocab_size
         self.max_sequence_length: int = max_sequence_length
-        self.add_position_embedding: bool = position_embedding_type == 'learned_absolute'
+        self.add_position_embedding: bool = position_embedding_type == 'learned_absolute' #只有是绝对位置编码，才会将位置编码的逻辑放在embedding中
         self.num_tokentypes = num_tokentypes
         self.scatter_to_sequence_parallel = scatter_to_sequence_parallel
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group)
-        self.reduce_scatter_embeddings = (
+        self.reduce_scatter_embeddings = ( #这里不允许添加位置编码的embedding进行SP，只是Megatron实现上限制，感觉就算有位置编码也没啥，可以最后加位置编码
             (not self.add_position_embedding)
             and self.num_tokentypes <= 0
             and self.config.sequence_parallel
@@ -63,7 +63,7 @@ class LanguageModelEmbedding(MegatronModule):
         )
 
         # Position embedding (serial).
-        if self.add_position_embedding:
+        if self.add_position_embedding: #添加绝对位置编码
             self.position_embeddings = torch.nn.Embedding(
                 self.max_sequence_length, self.config.hidden_size
             )
@@ -82,7 +82,7 @@ class LanguageModelEmbedding(MegatronModule):
         else:
             self.tokentype_embeddings = None
 
-        # Embeddings dropout
+        # Embeddings dropout #添加dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
 
     def zero_parameters(self):

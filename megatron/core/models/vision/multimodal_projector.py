@@ -37,14 +37,14 @@ class MultimodalProjector(MegatronModule):
     ):
         super().__init__(config=config)
         self.projector_type = projector_type
-        tp_group = pg_collection.tp if pg_collection is not None else tp_group
-        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+        tp_group = pg_collection.tp if pg_collection is not None else tp_group #设置tp通信组
+        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group)#获取tp通信组
 
         assert submodules is not None, "MLPSubmodules must be provided"
 
         fp8_init_context = get_fp8_context(config, 0, is_init=True)
         with fp8_init_context:
-            if self.projector_type == "mlp":
+            if self.projector_type == "mlp": #是MLP投影
                 self.encoder = MLP(
                     config=config, submodules=submodules, input_size=input_size, tp_group=tp_group
                 )

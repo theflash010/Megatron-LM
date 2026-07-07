@@ -13,42 +13,42 @@ class DistributedDataParallelConfig:
     grad_reduce_in_fp32: bool = False
     """If true, reduce grads in fp32."""
 
-    overlap_grad_reduce: bool = False
+    overlap_grad_reduce: bool = False #是否将梯度 all-reduce / reduce-scatter 与反向计算重叠，通过流水线方式掩盖通信延迟。
     """If true, overlap grad all-reduce / reduce-scatter with backward compute."""
 
-    overlap_param_gather: bool = False
+    overlap_param_gather: bool = False #是否将参数 all-gather 与前向计算重叠
     """If true, overlap param all-gather with forward compute."""
 
-    align_param_gather: bool = False
+    align_param_gather: bool = False #若为 True，所有 PP 阶段同时启动参数 all-gather；否则每个 PP 阶段按需独立启动。
     """If true, all PP stages will launch param all-gathers simultaneously. Otherwise, each
     PP stage will independently launch as needed.
     """
 
-    use_distributed_optimizer: bool = False
+    use_distributed_optimizer: bool = False #是否使用分布式优化器，开启后使用 reduce-scatter 聚合梯度并清理原始分配的内存（减少显存），否则使用 all-reduce。
     """If true, issue reduce-scatter collectives to aggregate gradients and clean up
        originally allocated model parameters, otherwise issue all-reduce collectives.
     """
 
-    num_distributed_optimizer_instances: int = 1
+    num_distributed_optimizer_instances: int = 1 #将 DP 域分片为多少个部分启用部分分布式优化器。默认为 1（整个 DP 域为一个 DistOpt）。增大此值可以减少每个实例的显存开销。
     """Sets the factor by which the DP domain is sharded to have the partial DistOpt
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
     """
 
-    check_for_nan_in_grad: bool = False
+    check_for_nan_in_grad: bool = False #是否将 bucket 大小填充到 2^16 的倍数
     """
     If true, check for NaNs and Infs in gradients _before_ communication collective.
     Invoked by `start_grad_sync` such as in the Megatron-LM DDP training API.
     """
 
-    check_for_large_grads: bool = False
+    check_for_large_grads: bool = False #在通信集合执行前检查是否出现异常大的梯度
     """If true, check for unexpectedly large gradients _before_ communication collective."""
 
-    bucket_size: Optional[int] = None
+    bucket_size: Optional[int] = None #参数梯度的桶大小
     """Maximum number of parameters in each bucket. If unspecified, MCore uses a default
        value of max(40000000, 1000000 * dp_size) parameters (larger DP sizes need larger
        buckets to ensure collectives do not become latency-bound)."""
 
-    pad_buckets_for_high_nccl_busbw: bool = False
+    pad_buckets_for_high_nccl_busbw: bool = False #是否将 bucket 大小填充到 2^16 的倍数
     """If true, make sure the bucket size is divisible by a large power of 2 (2^16) to
        ensure NCCL collectives have high bus bandwidth at large DP counts, since NCCL
        message size (which for ring algorithms is bucket_size / dp_size) apparently needs
@@ -80,24 +80,24 @@ class DistributedDataParallelConfig:
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
 
-    use_megatron_fsdp: bool = False
+    use_megatron_fsdp: bool = False #是否使用 FSDP 代码路径进行 DDP
     """If true, use the FSDP code path for DDP."""
 
-    use_custom_fsdp: bool = False
+    use_custom_fsdp: bool = False #已废弃，将迁移至 use_megatron_fsdp。
     """
     NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
     Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
     Future updates will drop support for `use_custom_fsdp` to avoid confusion.
     """
 
-    data_parallel_sharding_strategy: str = 'no_shard'
+    data_parallel_sharding_strategy: str = 'no_shard' #FSDP 的分片策略：'no_shard'（不分片）、'optim'（仅分片优化器状态）、'optim_grads'、'optim_grads_params'（完整 ZeRO-3）。
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
       'optim_grads', 'optim_grads_params'."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
 
-    suggested_communication_unit_size: int = None
+    suggested_communication_unit_size: int = None #FSDP 操作中每次通信的元素数。
     """Specifies the number of elements to communicate at once during
       FSDP (Fully Sharded Data Parallel) operations. 
       This flag also affects FSDP all-gather prefetch behavior. Setting a larger
@@ -108,7 +108,7 @@ class DistributedDataParallelConfig:
     keep_fp8_transpose_cache: bool = False
     """If true, keep the fp8 transpose cache when using Megatron FSDP."""
 
-    nccl_ub: bool = False
+    nccl_ub: bool = False #为 param/grad buffer 分配并注册 NCCL user buffer。
     """If true, allocate and register NCCL userbuffer for param and grad buffer.
       This flag enables SM efficient nccl algorithm that could improve the performance
       of FSDP and DP with comm_overlap. This flag will be much more effective when used

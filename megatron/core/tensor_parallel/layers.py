@@ -106,9 +106,9 @@ def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
     for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
         assert not hasattr(tensor, attribute)
     # Set the attributes.
-    setattr(tensor, "tensor_model_parallel", is_parallel)
-    setattr(tensor, "partition_dim", dim)
-    setattr(tensor, "partition_stride", stride)
+    setattr(tensor, "tensor_model_parallel", is_parallel) #设置模型并行标志
+    setattr(tensor, "partition_dim", dim) #确定切分为度
+    setattr(tensor, "partition_stride", stride)# #stride（步长）描述的是 TP 切分后各 rank 的分片在原始维度上的间隔方式。标准 TP 下几乎总是 stride=1，表示连续切分。Rank 0: [0, 1, 2]。stride>1 用于非连续切分（极少见），比如某些自定义层需要交错分布， Rank 0: [0, 2, 4] 
 
 
 def set_defaults_if_not_set_tensor_model_parallel_attributes(tensor):
@@ -136,13 +136,13 @@ def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
 def _initialize_affine_weight_gpu(weight, init_method, partition_dim, stride=1, is_expert=False):
     """Initialize affine weight for model parallel on GPU."""
 
-    set_tensor_model_parallel_attributes(
+    set_tensor_model_parallel_attributes(#对weight tensor设置一些TP相关属性
         tensor=weight, is_parallel=True, dim=partition_dim, stride=stride
-    )
+    )#stride（步长）描述的是 TP 切分后各 rank 的分片在原始维度上的间隔方式。标准 TP 下几乎总是 stride=1，表示连续切分。Rank 0: [0, 1, 2]。stride>1 用于非连续切分（极少见），比如某些自定义层需要交错分布， Rank 0: [0, 2, 4] 
 
     if not is_expert:
         with get_cuda_rng_tracker().fork():
-            init_method(weight)
+            init_method(weight) #按照传入的init_method，初始化参数
     else:
         with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
             init_method(weight)
@@ -228,15 +228,15 @@ class VocabParallelEmbedding(torch.nn.Module): #支持TP的embedding层
         self.reduce_scatter_embeddings = reduce_scatter_embeddings
         self.tp_group = tp_group
 
-        self.tp_group = get_tensor_model_parallel_group_if_none(self.tp_group)
+        self.tp_group = get_tensor_model_parallel_group_if_none(self.tp_group) #获取tp通信组
 
-        (self.vocab_start_index, self.vocab_end_index) = (
+        (self.vocab_start_index, self.vocab_end_index) = ( #确定这个rank负责的vocab范围
             VocabUtility.vocab_range_from_global_vocab_size(
                 self.num_embeddings, get_pg_rank(self.tp_group), get_pg_size(self.tp_group)
             )
         )
-        self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index #每个TP负责的vocab数量。对于saver来说这里只是创建，所以不需要vocab_end_index和vocab_start_index对应上tp rank，只需要每个rank的形状是正确的，即num_embeddings_per_partition = vocab_size / TP数，后面加载参数的时候需要看一下是不是按照这个逻辑做的TODO
-        self.deterministic_mode = config.deterministic_mode
+        self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index #每个TP负责的vocab数量。对于saver来说这里只是创建，所以不需要vocab_end_index和vocab_start_index对应上tp rank，只需要每个rank的形状是正确的，即num_embeddings_per_partition = vocab_size / TP数，后面加载参数的时候需要看一下是不是按照这个逻辑做的
+        self.deterministic_mode = config.deterministic_mode #控制 embedding lookup 用哪种实现方式。deterministic_mode=True保证精度复现，就是效率低一点
         self.config = config
 
         self.use_inference_optimized_reduce_scatter = (
@@ -276,9 +276,9 @@ class VocabParallelEmbedding(torch.nn.Module): #支持TP的embedding层
                 )
             )
             if config.perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
+                _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1) #设置TP属性+初始化
             else:
-                set_tensor_model_parallel_attributes(
+                set_tensor_model_parallel_attributes( #设置TP属性
                     tensor=self.weight, is_parallel=True, dim=0, stride=1
                 )
 
@@ -297,7 +297,7 @@ class VocabParallelEmbedding(torch.nn.Module): #支持TP的embedding层
         else:
             masked_input = input_
         # Get the embeddings.
-        if self.deterministic_mode:
+        if self.deterministic_mode: #output_parallel是部分结果
             output_parallel = self.weight[masked_input]
         else:
             # F.embedding currently has a non-deterministic backward function
@@ -306,7 +306,7 @@ class VocabParallelEmbedding(torch.nn.Module): #支持TP的embedding层
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0
 
-        if self.reduce_scatter_embeddings:
+        if self.reduce_scatter_embeddings: #SP+TP的通信逻辑
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
             output_parallel = output_parallel.transpose(0, 1).contiguous()
             if self.use_inference_optimized_reduce_scatter and not self.training:
@@ -320,7 +320,7 @@ class VocabParallelEmbedding(torch.nn.Module): #支持TP的embedding层
                 output = reduce_scatter_to_sequence_parallel_region(
                     output_parallel, group=self.tp_group
                 )
-        else:
+        else: #纯TP通信逻辑
             # Reduce across all the model parallel GPUs.
             output = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
         return output
@@ -780,7 +780,7 @@ class ColumnParallelLinear(torch.nn.Module):
             second dimension of matrix A.
         bias:
             If true, add bias
-        gather_output:
+        gather_output: #判断是否需要将ColumnParallelLinear的结果进行allgather，一般不需要
             If true, call all-gather on output and make Y available to all GPUs,
             otherwise, every GPU will have its output which is Y_i = XA_i
         init_method:
@@ -854,8 +854,8 @@ class ColumnParallelLinear(torch.nn.Module):
 
         self.tp_group = get_tensor_model_parallel_group_if_none(
             self.tp_group, is_expert=self.is_expert
-        )
-        world_size = get_pg_size(self.tp_group)
+        ) #设置tp通信组
+        world_size = get_pg_size(self.tp_group) #tp并行度
         rank = get_pg_rank(self.tp_group)
         self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
         self.output_size_per_partition = divide(output_size, world_size)
@@ -908,7 +908,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 else:
                     set_tensor_model_parallel_attributes(
                         tensor=self.weight, is_parallel=True, dim=0, stride=stride
-                    )
+                    )#为参数tensor添加tp属性
 
             setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
         else:
@@ -1073,7 +1073,7 @@ class ColumnParallelLinear(torch.nn.Module):
         if runtime_gather_output is not None:
             gather_output = runtime_gather_output
 
-        if gather_output:
+        if gather_output: #如果需要gather才进行通信
             # All-gather across the partitions.
             if self.use_inference_optimized_all_gather and not self.training:
                 # Deferred to avoid circular import: inference_layers → TE → layers.
@@ -1143,7 +1143,7 @@ class RowParallelLinear(torch.nn.Module):
             second dimension of matrix A.
         bias:
             If true, add bias. Note that bias is not parallelized.
-        input_is_parallel:
+        input_is_parallel: #判断输入input是不是已经被切分了
             If true, we assume that the input is already split across the GPUs
             and we do not split again.
         init_method:
@@ -1258,7 +1258,7 @@ class RowParallelLinear(torch.nn.Module):
             else:
                 set_tensor_model_parallel_attributes(
                     tensor=self.weight, is_parallel=True, dim=1, stride=stride
-                )
+                )#对权重tensor设置TP属性
         setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
 
         if bias:
@@ -1293,7 +1293,7 @@ class RowParallelLinear(torch.nn.Module):
         if not weight.requires_grad:
             return linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
-            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
+            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs) #这个名称里的reduce是反传的，前传的reduce逻辑在函数外面实现
 
     def forward(self, input_: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward of RowParallelLinear
@@ -1333,9 +1333,9 @@ class RowParallelLinear(torch.nn.Module):
             sequence_parallel=False,
             tp_group=None,
             grad_output_buffer=None,
-        )
+        )#output_parallel 是 未聚合的部分结果
 
-        # All-reduce across all the partitions.
+        # All-reduce across all the partitions. #完成reduce通信
         if self.explicit_expert_comm:
             assert self.skip_bias_add
             output_ = output_parallel

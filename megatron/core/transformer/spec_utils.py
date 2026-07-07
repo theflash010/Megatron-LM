@@ -114,7 +114,7 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
     # Add the `submodules` argument to the module init call if it exists in the
     # spec.
     if hasattr(spec_or_module, "submodules") and spec_or_module.submodules is not None:
-        kwargs["submodules"] = spec_or_module.submodules
+        kwargs["submodules"] = spec_or_module.submodules #组装子模块参数
 
     try:
         return module(

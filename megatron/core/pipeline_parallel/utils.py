@@ -103,18 +103,18 @@ def set_ideal_affinity_for_current_gpu():
             import cuda.cudart as cuda_runtime
         except:
             raise RuntimeError("Please install cuda-python to enable GPU affinity setting")
-    import pynvml
+    import pynvml #导入 NVIDIA Management Library 的 Python 绑定
 
     # Get current CUDA device ID
-    err, device_id = cuda_runtime.cudaGetDevice()
+    err, device_id = cuda_runtime.cudaGetDevice() #调用 cudaGetDevice() 获取当前 CUDA context 绑定的 GPU 设备号（0, 1, 2...）。
     assert err == cuda_runtime.cudaError_t.cudaSuccess
     # Get device UUID
-    err, device_uuid = cuda_driver.cuDeviceGetUuid(device_id)
-    assert err == cuda_driver.CUresult.CUDA_SUCCESS
+    err, device_uuid = cuda_driver.cuDeviceGetUuid(device_id) #通过 CUDA Driver API 获取该 GPU 的 UUID。UUID 是每个 GPU 的硬件唯一标识符，不会因为 PCIe 槽位变化而改变，比设备号更可靠。
+    assert err == cuda_driver.CUresult.CUDA_SUCCESS #确保 UUID 获取成功。
     # Set CPU affinity based on GPU's NUMA node
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
-    pynvml.nvmlDeviceSetCpuAffinity(handle)
+    pynvml.nvmlInit() #初始化 NVML 库
+    handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))#用 UUID 获取 NVML 设备句柄。
+    pynvml.nvmlDeviceSetCpuAffinity(handle)#调用 nvmlDeviceSetCpuAffinity() 函数设置进程的 CPU 亲和性，将当前进程绑定到与 GPU 同一 NUMA 节点的 CPU 核心上，从而优化数据在 CPU 和 GPU 之间的传输效率。
 
     log_single_rank(
         logger,

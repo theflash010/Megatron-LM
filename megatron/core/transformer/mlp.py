@@ -223,9 +223,9 @@ class MLP(MegatronModule):
             stride=fc1_stride,
         )#这个是LayerNorm+Linear，Linear包含gate Linear和up Linear，这两个Linear矩阵是合并形式
 
-        if self.config.use_te_activation_func and not (submodules.activation_func is None):
+        if self.config.use_te_activation_func and not (submodules.activation_func is None): #确定激活函数
             self.activation_func = apply_module(submodules.activation_func(config=self.config))
-        else:
+        else: #用 config.activation_func 的默认激活函数
             self.activation_func = self.config.activation_func
 
         self.linear_fc2 = submodules.linear_fc2(

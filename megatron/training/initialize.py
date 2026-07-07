@@ -62,7 +62,7 @@ def initialize_megatron(
     # set logging level
     setup_logging()
 
-    if args.async_save and args.use_persistent_ckpt_worker:
+    if args.async_save and args.use_persistent_ckpt_worker: #设置异步检查点机制（创建后台进程，专门写检查点）
         init_persistent_async_worker(args.rank, 'forkserver')
 
     # init rerun state
@@ -74,10 +74,10 @@ def initialize_megatron(
             tensor_parallel.get_cuda_rng_tracker().set_states(state_dict['rng_tracker_states'])
 
     args = get_args()
-    initialize_rerun_state_machine(
-        state_save_func=state_save_func,
-        state_restore_func=state_restore_func,
-        mode=RerunMode(args.rerun_mode),
+    initialize_rerun_state_machine( # Rerun 状态机 的初始化，用于训练任务失败后自动重跑修复
+        state_save_func=state_save_func, # 如何保存当前 RNG 状态
+        state_restore_func=state_restore_func, # 如何恢复 RNG 状态
+        mode=RerunMode(args.rerun_mode), # 重跑模式（由 --rerun-mode 控制）
         error_injector=RerunErrorInjector(
             error_injection_rate=args.error_injection_rate,
             error_injection_type=RerunDiagnostic(args.error_injection_type),
@@ -115,7 +115,7 @@ def initialize_megatron(
         return None
 
     args = get_args()
-    if args.lazy_mpu_init:
+    if args.lazy_mpu_init: #是否延迟分布式环境的初始化
         # TODO is this still a necessary option?
         args.use_cpu_initialization = True
         # delayed initialization of DDP-related stuff
@@ -125,19 +125,19 @@ def initialize_megatron(
         # to call when it has DDP initialized
         mpu.set_tensor_model_parallel_rank(args.rank)
         return finish_mpu_init
-    else:
+    else: #默认，立即初始化
         # Megatron's MPU is the master. Complete initialization right away.
-        finish_mpu_init()
+        finish_mpu_init() #完成分布式环境的初始化
 
         # Autoresume.
         _init_autoresume()
 
         # Compile dependencies.
-        _compile_dependencies()
+        _compile_dependencies() #把数据集的 C++ 索引构建器编译出来。
 
         if args.tp_comm_overlap:
             # TODO: Should this be activated with just decoder-tp-comm-overlap too?
-            _initialize_tp_communicators()
+            _initialize_tp_communicators() #初始化TP通算并行，预分配好通信缓冲区
 
         # No continuation function
         return None
@@ -189,12 +189,12 @@ def _initialize_tp_communicators():
         ub_cfgs = {}
 
     if getattr(args, 'decoder_tp_comm_overlap', False):
-        input_shape = [
+        input_shape = [ #确定输入激活值shape
             (args.decoder_seq_length * args.micro_batch_size) // args.context_parallel_size,
             args.hidden_size,
         ]
     else:
-        input_shape = [
+        input_shape = [ #确定输入激活值shape
             (args.seq_length * args.micro_batch_size) // args.context_parallel_size,
             args.hidden_size,
         ]
@@ -211,7 +211,7 @@ def _initialize_tp_communicators():
         ):
             quantization_modes.append(UserBufferQuantizationMode.NONE)
         # The process group with the target bootstrap backend is created in Transformer Engine.
-        te_module.base.initialize_ub(
+        te_module.base.initialize_ub( #初始化用户缓冲区（UB）用于张量模型并行通信，缓冲区大小为输入激活值shape
             shape=input_shape,
             tp_size=args.tensor_model_parallel_size,
             quantization_modes=quantization_modes,
@@ -248,7 +248,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     args = get_args()
 
     device_count = torch.cuda.device_count()
-    if torch.distributed.is_initialized():
+    if torch.distributed.is_initialized(): #判断torch的分布式环境是否已经初始化
 
         print_rank_0("torch distributed is already initialized, skipping initialization ...")
         args.rank = torch.distributed.get_rank()
@@ -256,10 +256,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
 
     else:
 
-        print_rank_0("> initializing torch distributed ...")
+        print_rank_0("> initializing torch distributed ...") #全局RANK = 0的节点print信息
         # Manually set the device ids.
         if device_count > 0:
-            torch.cuda.set_device(args.local_rank)
+            torch.cuda.set_device(args.local_rank) #绑定每个进程使用的GPU
             device_id = torch.device(f'cuda:{args.local_rank}')
         else:
             device_id = None
@@ -318,7 +318,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             'world_size': args.world_size,
             'rank': args.rank,
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
-        }
+        }#分布式进程组的参数，包括分布式通信后端、world_size、rank、超时时间等
         if args.fake_process_group:
             assert is_torch_min_version(
                 "2.3.0"
@@ -329,16 +329,16 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             init_process_group_kwargs['backend'] = 'fake'
             init_process_group_kwargs['store'] = store
 
-        torch.distributed.init_process_group(**init_process_group_kwargs)
+        torch.distributed.init_process_group(**init_process_group_kwargs) #初始化PyTorch分布式环境，创建default precess group
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
-    # data-parallel communicators.
+    # data-parallel communicators. #TP/DP/PP等分布式训练的进程组初始化
     if device_count > 0:
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
-            mpu.initialize_model_parallel(
+            mpu.initialize_model_parallel(#构建分布式训练的通信组
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
@@ -433,7 +433,7 @@ def set_jit_fusion_options():
         torch._C._jit_override_can_fuse_on_cpu(True)
         torch._C._jit_override_can_fuse_on_gpu(True)
 
-    _warmup_jit_function()
+    _warmup_jit_function() #预热消除了第一个 training step 中 JIT 编译带来的额外延迟，让第一个 step 就能达到稳定性能。只编译代码中写死的几个 Megatron 自定义 fused 算子（bias_gelu / bias_swiglu）
 
 
 def _warmup_jit_function():

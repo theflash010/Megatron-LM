@@ -72,13 +72,13 @@ class DotProductAttention(MegatronModule):
                 pg_collection, 'tp'
             ), "DotProductAttention pg_collection must have tp process group"
         self.pg_collection = pg_collection
-        self.tp_group = self.pg_collection.tp
+        self.tp_group = self.pg_collection.tp #设置tp通信组
 
-        world_size = pg_collection.tp.size()
-        self.hidden_size_per_partition = divide(projection_size, world_size)
-        self.hidden_size_per_attention_head = divide(projection_size, config.num_attention_heads)
-        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
-        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+        world_size = pg_collection.tp.size() #TP并行度
+        self.hidden_size_per_partition = divide(projection_size, world_size) #每个TPrank划分到的hidden state维度
+        self.hidden_size_per_attention_head = divide(projection_size, config.num_attention_heads) #每个attention头划分到的hidden state维度
+        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size) #每个TP rank划分到的attention头数量
+        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size) #每个TP rank划分到的KV头数量
 
         coeff = None
         if softmax_scale is None:

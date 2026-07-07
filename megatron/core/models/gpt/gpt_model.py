@@ -41,7 +41,7 @@ from megatron.core.utils import (
 
 
 class GPTModel(LanguageModule):
-    """GPT Transformer language model.
+    """GPT Transformer language model. #一个 GPTModel 实例就是完整大模型在某个并行维度组合（tp rank, pp rank, dp rank, cp rank, ep rank, vp stage）下的一个切片
 
     Args:
         config (TransformerConfig):
@@ -92,7 +92,7 @@ class GPTModel(LanguageModule):
         pre_process: bool = True,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
-        parallel_output: bool = True,
+        parallel_output: bool = True, #判断在计算LM Head的时候是否保留分布式输出，不进行AllGather聚合
         share_embeddings_and_output_weights: bool = False,
         position_embedding_type: Literal[
             'learned_absolute', 'rope', 'mrope', 'yarn', 'none'
@@ -157,7 +157,7 @@ class GPTModel(LanguageModule):
             )#创建了embedding层，开始占用了显存，但是还没赋值
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            self.rotary_pos_emb = RotaryEmbedding(
+            self.rotary_pos_emb = RotaryEmbedding( #添加旋转位置编码
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
                 rotary_interleaved=self.config.rotary_interleaved,

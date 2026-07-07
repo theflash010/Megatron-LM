@@ -599,7 +599,7 @@ def initialize_model_parallel(
             The backend to use for pipeline parallel communication.
             If None, the default backend will be used.
 
-        use_sharp (bool, default = False):
+        use_sharp (bool, default = False): #是否开启SHARP通信优化
             Set the use of SHARP for the collective communications of
             data-parallel process groups. When `True`, run barrier
             within each data-parallel process group, which specifies
@@ -635,12 +635,12 @@ def initialize_model_parallel(
 
         num_distributed_optimizer_instances (int, default = 1):
             The number of distributed optimizer replicas across the data-
-            parallel domain.
+            parallel domain. #针对ZeRO-1/2的逻辑，数值代表优化器状态切成几分
 
         expert_tensor_parallel_size (int, default = tp_size):
             The number of GPUs to split individual tensors of expert.
 
-        nccl_communicator_config_path (str, default = None):
+        nccl_communicator_config_path (str, default = None): #NCCL通信优化配置文件路径
             Path to the yaml file of NCCL communicator configurations.
             `min_ctas`, `max_ctas`, and `cga_cluster_size` can be set
             for each communicator.
@@ -667,7 +667,7 @@ def initialize_model_parallel(
             Create Gloo process groups if set to True. If set to False, Gloo process groups are
             not created and calls to get Gloo process groups will result in assertion errors.
 
-        high_priority_stream_groups (List[str], default = None):
+        high_priority_stream_groups (List[str], default = None): #高优先级通信组的名单，后续会对这些通信组加上高优先级属性
             Specify which communicator groups should use high priority streams during creation.
             Assigning high priority to communication streams ensures that communication kernels
             are scheduled with higher priority, minimizing the exposed communication when it is
@@ -699,14 +699,14 @@ def initialize_model_parallel(
     # NCCL restricts IB SHARP usage to a single communicator group—the first one created
     # with NCCL_COLLNET_ENABLE=1. After this group is created, NCCL_COLLNET_ENABLE must be
     # set to 0 for subsequent groups.
-    if "NCCL_COLLNET_ENABLE" in os.environ:
+    if "NCCL_COLLNET_ENABLE" in os.environ: #删除 NCCL_COLLNET_ENABLE，先清理SHARP环境变量，后续要用到再设置
         del os.environ["NCCL_COLLNET_ENABLE"]
 
-    if use_sharp:
-        if sharp_enabled_group is None:
+    if use_sharp: #如果使用SHARP技术
+        if sharp_enabled_group is None: #如果没有指定使用SHARP的组，默认用于DP组
             # By default, SHARP is enabled from dp group.
             sharp_enabled_group = "dp"
-        else:
+        else:#否则使用指定的组
             # Currently, only dp and dp_replica groups are supported for SHARP.
             assert sharp_enabled_group in ["dp", "dp_replica"], "Invalid sharp_enabled_group"
             if sharp_enabled_group == "dp_replica":
@@ -718,10 +718,10 @@ def initialize_model_parallel(
             sharp_enabled_group is None
         ), "sharp_enabled_group is only valid when use_sharp is True"
 
-    if get_embedding_ranks is None:
+    if get_embedding_ranks is None: #确定get_embedding_ranks函数
         get_embedding_ranks = default_embedding_ranks
 
-    if get_position_embedding_ranks is None:
+    if get_position_embedding_ranks is None: #确定get_position_embedding_ranks函数
         get_position_embedding_ranks = default_position_embedding_ranks
 
     # Get world size and rank. Ensure some consistencies.
@@ -730,12 +730,12 @@ def initialize_model_parallel(
         local_world_size if local_world_size is not None else torch.distributed.get_world_size()
     )
 
-    model_size = tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
+    model_size = tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size #一份完整模型副本需要多少张卡
 
     if world_size % model_size != 0:
         raise RuntimeError(f"world_size ({world_size}) is not divisible by {model_size}")
 
-    data_parallel_size: int = world_size // model_size
+    data_parallel_size: int = world_size // model_size #确定DP并行度
 
     if virtual_pipeline_model_parallel_size is not None:
         if not pipeline_model_parallel_size > 1:
@@ -747,9 +747,9 @@ def initialize_model_parallel(
         _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
         _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size
 
-    rank = torch.distributed.get_rank()
+    rank = torch.distributed.get_rank() #获取全局rank
 
-    nccl_comm_cfgs = {}
+    nccl_comm_cfgs = {} #读取NCCL通信组配置
     if nccl_communicator_config_path is not None:
         try:
             import yaml
@@ -763,7 +763,7 @@ def initialize_model_parallel(
             nccl_comm_cfgs = yaml.safe_load(stream)
 
     # Set is_high_priority_stream flag to the nccl_comm_cfgs if it is in high_priority_stream_groups
-    high_priority_stream_groups = high_priority_stream_groups or []
+    high_priority_stream_groups = high_priority_stream_groups or [] #设置通信组的stream为高优先级
     for pg_name in high_priority_stream_groups:
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
 
@@ -775,15 +775,15 @@ def initialize_model_parallel(
         cp=context_parallel_size,
         order=order,
         rank_offset=rank_offset,
-    )
+    )#Dense部分（attention）的RankGenerator
 
     # Build expert rank generator
-    if expert_tensor_parallel_size is None:
+    if expert_tensor_parallel_size is None: #如果未指定专家张量并行度，那么专家张量并行度等于模型张量并行度
         expert_tensor_parallel_size = tensor_model_parallel_size
     expert_tensor_model_pipeline_parallel_size = (
         expert_tensor_parallel_size * expert_model_parallel_size * pipeline_model_parallel_size
-    )
-    expert_data_parallel_size = world_size // expert_tensor_model_pipeline_parallel_size
+    ) #一份完整 MoE expert 模型副本需要多少张 GPU
+    expert_data_parallel_size = world_size // expert_tensor_model_pipeline_parallel_size #算出 expert 的数据并行度
     if world_size % expert_tensor_model_pipeline_parallel_size != 0:
         raise RuntimeError(
             f"world_size ({world_size}) is not divisible by expert_tensor_model_pipeline_parallel size ({expert_tensor_model_pipeline_parallel_size})"
@@ -798,7 +798,7 @@ def initialize_model_parallel(
         cp=1,
         order=order,
         rank_offset=rank_offset,
-    )
+    )#MoE部分的RankGenerator
 
     assert (
         order.endswith("pp")
@@ -829,12 +829,12 @@ def initialize_model_parallel(
     ) % num_distributed_optimizer_instances == 0, (
         "Data parallel size should be divisible by partial DistOpt shard factor"
     )
-    intra_partial_data_parallel_size = (
-        data_parallel_size * context_parallel_size
-    ) // num_distributed_optimizer_instances
+    intra_partial_data_parallel_size = ( #结果就是每个 optimizer shard 有多少 rank 共同维护同一份 shard。
+        data_parallel_size * context_parallel_size #因为 CP 组的 rank 在数据维度上也参与 DP 通信，所以 DP 域要乘上 CP 度来覆盖所有参与 DP 通信的 rank
+    ) // num_distributed_optimizer_instances #num_distributed_optimizer_instances：optimizer state 切几份
 
     # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp group.
-    if sharp_enabled_group == "dp":
+    if sharp_enabled_group == "dp": #为 DP group 开启 SHARP
         os.environ["NCCL_COLLNET_ENABLE"] = "1"
 
     # In case of using SHARP, the dp-cp group requires to use NCCL COLLNET feature.
@@ -843,13 +843,13 @@ def initialize_model_parallel(
     # Therefore, dp-cp group, which potentially requires SHARP-enablement,
     # need to be created before all the other groups
     for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
-        group_with_cp = create_group(
+        group_with_cp = create_group(#创建dp-cp通信组，backend复用default_pg的backend
             ranks_with_cp,
             timeout=timeout,
             pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
             group_desc="DATA_PARALLEL_GROUP_WITH_CP",
         )
-        if create_gloo_process_groups:
+        if create_gloo_process_groups: #是否创建备份gloo
             group_with_cp_gloo = create_group(
                 ranks_with_cp,
                 timeout=timeout,
@@ -858,12 +858,12 @@ def initialize_model_parallel(
             )
         else:
             group_with_cp_gloo = None
-        if rank in ranks_with_cp:
+        if rank in ranks_with_cp: #如果在这个组里，设置单例
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
             _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
 
-        if num_distributed_optimizer_instances > 1:
+        if num_distributed_optimizer_instances > 1: #如果有num_distributed_optimizer_instances，优化器状态切分（ZeRO-1/2）
             # Create groups for intra-partial DP domain
             for i in range(num_distributed_optimizer_instances):
                 intra_partial_dp_ranks_with_cp = ranks_with_cp[
@@ -876,7 +876,7 @@ def initialize_model_parallel(
                     timeout=timeout,
                     pg_options=get_nccl_options("intra_dp_cp", nccl_comm_cfgs),
                     group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
-                )
+                )#创建intra_partial_dp_group_with_cp通信组
                 if create_gloo_process_groups:
                     intra_partial_dp_group_with_cp_gloo = create_group(
                         intra_partial_dp_ranks_with_cp,
@@ -886,19 +886,19 @@ def initialize_model_parallel(
                     )
                 else:
                     intra_partial_dp_group_with_cp_gloo = None
-                if rank in intra_partial_dp_ranks_with_cp:
+                if rank in intra_partial_dp_ranks_with_cp: #如果在这个组里，设置单例
                     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = intra_partial_dp_group_with_cp
                     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
                         intra_partial_dp_group_with_cp_gloo
                     )
-        else:
+        else: #如果没有 num_distributed_optimizer_instances，直接复用 dp-cp 组
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
 
     # Apply SHARP to the dp group.
     if sharp_enabled_group == "dp":
         if rank == 0:
-            logger.info(
+            logger.info( #打印 SHARP 的硬件限制：QM1 交换机最多 8 个 SHARP group，QM2 最多 256 个。如果 DP group 数量超过这个上限，自动 fallback 到普通 all-reduce。
                 "The number of process groups to use SHARP with depends on the type "
                 "of the network switch. Nvidia QM1 switch supports SAHRP up to 8 "
                 "process groups and QM2 supports up to 256 process groups. We apply "
@@ -910,29 +910,29 @@ def initialize_model_parallel(
             )
         # PyTorch is performing lazy initialization of the communicator group.
         # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
-        torch.distributed.barrier(
+        torch.distributed.barrier( #强制 dp-cp group 的 NCCL communicator 真正初始化
             group=get_data_parallel_group(with_context_parallel=True),
             device_ids=[torch.cuda.current_device()],
         )
         torch.cuda.synchronize()
         # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to the dp group.
-        if "NCCL_COLLNET_ENABLE" in os.environ:
+        if "NCCL_COLLNET_ENABLE" in os.environ: #清理环境变量，SHARP只能有一个通信组
             del os.environ["NCCL_COLLNET_ENABLE"]
 
-    if hybrid_context_parallel:
+    if hybrid_context_parallel: #如果使用混合上下文并行
         global _HYBRID_DP_CP_GROUPS
         for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
             assert (
                 len(ranks_with_cp) % 2 == 0
             ), "Hybrid context parallel requires an even number of ranks"
-            _HYBRID_DP_CP_GROUPS.update(
+            _HYBRID_DP_CP_GROUPS.update(#创建多个不同CP size的通信组，并设置为单例
                 create_hybrid_dp_cp_groups(
                     rank, ranks_with_cp, get_nccl_options("dp_cp", nccl_comm_cfgs)
                 )
             )
         # TODO: Are gloo groups needed for hybrid cp?
 
-    for ranks in decoder_rank_generator.get_ranks('dp'):
+    for ranks in decoder_rank_generator.get_ranks('dp'): #创建dense部分的DP通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -954,7 +954,7 @@ def initialize_model_parallel(
     global _CONTEXT_PARALLEL_GROUP
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('cp'):
+    for ranks in decoder_rank_generator.get_ranks('cp'): #创建dense部分的CP通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -964,7 +964,7 @@ def initialize_model_parallel(
         if rank in ranks:
             _CONTEXT_PARALLEL_GROUP = group
             _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks
-        if hierarchical_context_parallel_sizes:
+        if hierarchical_context_parallel_sizes: #如果有层次化CP结构（可以优化通信），就创建CP组内的子通信组
             assert np.prod(hierarchical_context_parallel_sizes) == context_parallel_size
             global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
             hierarchical_groups, _ = create_hierarchical_groups(
@@ -983,7 +983,7 @@ def initialize_model_parallel(
     global _MODEL_PARALLEL_GROUP
     global _MODEL_PARALLEL_GLOBAL_RANKS
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-pp'):
+    for ranks in decoder_rank_generator.get_ranks('tp-pp'): #创建tp-pp通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1000,7 +1000,7 @@ def initialize_model_parallel(
     assert (
         _TENSOR_MODEL_PARALLEL_GROUP is None
     ), 'tensor model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp'):
+    for ranks in decoder_rank_generator.get_ranks('tp'): #创建tp通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1076,7 +1076,7 @@ def initialize_model_parallel(
         os.environ["UCX_NET_DEVICES"] = "all"
         os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
-    for ranks in decoder_rank_generator.get_ranks('pp'):
+    for ranks in decoder_rank_generator.get_ranks('pp'): #创建pp通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1105,8 +1105,8 @@ def initialize_model_parallel(
                 _PIPELINE_MODEL_PARALLEL_GROUP = [_PIPELINE_MODEL_PARALLEL_GROUP, group]
                 _PIPELINE_GLOBAL_RANKS = [_PIPELINE_GLOBAL_RANKS, ranks]
 
-        embedding_ranks = get_embedding_ranks(ranks)
-        group = create_group(
+        embedding_ranks = get_embedding_ranks(ranks) #选出具有embedding参数的rank，一般是第一个和最后一个rank
+        group = create_group( #创建embedding通信组
             embedding_ranks,
             timeout=timeout,
             pg_options=get_nccl_options("embd", nccl_comm_cfgs),
@@ -1116,8 +1116,8 @@ def initialize_model_parallel(
             _EMBEDDING_GROUP = group
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
-        position_embedding_ranks = get_position_embedding_ranks(ranks)
-        group = create_group(
+        position_embedding_ranks = get_position_embedding_ranks(ranks) #选出具有position embedding参数的rank
+        group = create_group( #创建position embedding通信组
             position_embedding_ranks,
             timeout=timeout,
             pg_options=get_nccl_options("pos_embd", nccl_comm_cfgs),
@@ -1133,7 +1133,7 @@ def initialize_model_parallel(
     assert (
         _TENSOR_AND_DATA_PARALLEL_GROUP is None
     ), 'Tensor + data parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-dp-cp'):
+    for ranks in decoder_rank_generator.get_ranks('tp-dp-cp'): #创建tp-dp-cp通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1142,7 +1142,7 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
-    for ranks in decoder_rank_generator.get_ranks('tp-dp'):
+    for ranks in decoder_rank_generator.get_ranks('tp-dp'): #创建tp-dp通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1156,7 +1156,7 @@ def initialize_model_parallel(
     assert (
         _TENSOR_AND_CONTEXT_PARALLEL_GROUP is None
     ), 'Tensor + context parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-cp'):
+    for ranks in decoder_rank_generator.get_ranks('tp-cp'): #创建tp-cp通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1170,7 +1170,7 @@ def initialize_model_parallel(
     # Build the expert model parallel group
     global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
     assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
-    for ranks in expert_decoder_rank_generator.get_ranks('ep'):
+    for ranks in expert_decoder_rank_generator.get_ranks('ep'): #创建ep通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1186,7 +1186,7 @@ def initialize_model_parallel(
     assert (
         _EXPERT_TENSOR_PARALLEL_GROUP is None
     ), 'Expert tensor model parallel group is already initialized'
-    for ranks in expert_decoder_rank_generator.get_ranks('tp'):
+    for ranks in expert_decoder_rank_generator.get_ranks('tp'): #创建etp通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1201,7 +1201,7 @@ def initialize_model_parallel(
     assert (
         _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP is None
     ), 'Expert tensor + model parallel group is already initialized'
-    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep'):
+    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep'): #创建tp-ep通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1216,7 +1216,7 @@ def initialize_model_parallel(
     assert (
         _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is None
     ), 'The expert_tensor_model_pipeline parallel group is already initialized'
-    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp'):
+    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp'): #创建tp-ep-pp通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1251,7 +1251,7 @@ def initialize_model_parallel(
         expert_data_parallel_size // num_distributed_optimizer_instances
     )
 
-    for ranks in expert_decoder_rank_generator.get_ranks('dp'):
+    for ranks in expert_decoder_rank_generator.get_ranks('dp'): #创建edp通信组
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1268,14 +1268,14 @@ def initialize_model_parallel(
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
 
-        if num_distributed_optimizer_instances > 1:
+        if num_distributed_optimizer_instances > 1: ##如果有num_distributed_optimizer_instances，优化器状态切分（ZeRO-1/2）
             # Create groups for Partial DistOpt, one for intra-partial DP domain
             # Another for inter-partial DP domain
 
             # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp_replica group.
             if sharp_enabled_group == "dp_replica":
                 os.environ["NCCL_COLLNET_ENABLE"] = "1"
-            hierarchical_groups, hierarchical_groups_gloo = create_hierarchical_groups(
+            hierarchical_groups, hierarchical_groups_gloo = create_hierarchical_groups( #创建层次化edp通信组
                 rank,
                 ranks,
                 [intra_partial_expert_data_parallel_size, num_distributed_optimizer_instances],
@@ -1288,14 +1288,14 @@ def initialize_model_parallel(
                 group_desc="EXPERT_DATA_PARALLEL_GROUP",
             )
             if rank in ranks:
-                _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[0]
+                _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[0] #赋值intra
                 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = hierarchical_groups_gloo[0]
-                _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[1]
+                _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[1] #赋值inter
 
             if sharp_enabled_group == "dp_replica":
                 # PyTorch is performing lazy initialization of the communicator group.
                 # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
-                if _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None:
+                if _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None:  #强制直接初始化，避免lazy初始化
                     torch.distributed.barrier(
                         group=_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
                         device_ids=[torch.cuda.current_device()],
@@ -1304,7 +1304,7 @@ def initialize_model_parallel(
                 # Set NCCL_COLLNET_ENABLE to 0 to restrict SHARP application to the dp_replica group.
                 if "NCCL_COLLNET_ENABLE" in os.environ:
                     del os.environ["NCCL_COLLNET_ENABLE"]
-        else:
+        else: #如果没有num_distributed_optimizer_instances，即优化器状态不切分（ZeRO-0），则edp通信组层次化处理退化为单层
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
     ### End of expert related parallel groups initialization
@@ -1317,7 +1317,7 @@ def initialize_model_parallel(
 
     model_parallel_group_id = 0
     intra_dist_opt_ranks = []
-    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp'):
+    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp'): #构建单个 optimizer shard 内所有与 expert 计算相关的通信组
         model_parallel_group_id += 1
         intra_dist_opt_ranks.extend(ranks)
         if model_parallel_group_id % intra_partial_expert_data_parallel_size == 0:
@@ -1335,7 +1335,7 @@ def initialize_model_parallel(
     # This isn't really "parallel state" but there isn't another good place to
     # put this. If we end up with a more generic initialization of megatron-core
     # we could stick it there
-    _set_global_memory_buffer()
+    _set_global_memory_buffer() #初始化全局内存缓冲区
 
 
 def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None):
@@ -1384,7 +1384,7 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
         tp=tp_size, ep=1, dp=dp_size, pp=pp_size, cp=cp_size, order='tp-cp-ep-dp-pp', rank_offset=0
     )
 
-    for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
+    for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):#创建一个和dp-cp一样的通信组，只不过这个用于ag，通信-通信重叠
         group_with_cp_ag = create_group(
             ranks_with_cp,
             timeout=timeout,
@@ -1410,7 +1410,7 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
             rank_offset=0,
         )
 
-        for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
+        for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):##创建一个和edp一样的通信组，只不过这个用于ag
             expert_dp_ag = create_group(
                 expert_dp_ranks,
                 timeout=timeout,

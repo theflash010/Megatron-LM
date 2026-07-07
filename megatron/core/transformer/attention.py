@@ -263,19 +263,19 @@ class Attention(MegatronModule, ABC):
 
         self.config = config
         self.layer_number = layer_number
-        self._pp_layer_offset = pp_layer_offset
+        self._pp_layer_offset = pp_layer_offset #确定这个layer的全局偏移，全局索引=全局偏移+局部序号
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
 
-        assert self.config.kv_channels is not None
-        assert self.config.num_query_groups is not None
+        assert self.config.kv_channels is not None #单个attention头的kv维度
+        assert self.config.num_query_groups is not None  #注意力机制中 key/value 头的分组数
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
-        self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
-        self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups  #num_query_groups用于适配GQA
+        self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads #Q矩阵投影大小
+        self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups  #K和V矩阵投影大小
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
@@ -290,7 +290,7 @@ class Attention(MegatronModule, ABC):
         self.tp_group = pg_collection.tp
 
         # Per attention head and per partition values
-        world_size = get_pg_size(self.pg_collection.tp)
+        world_size = get_pg_size(self.pg_collection.tp) #TP并行度
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
@@ -305,8 +305,8 @@ class Attention(MegatronModule, ABC):
         else:
             # When num_kv_heads >= tp_size, each TP rank produces activations for
             # (num_kv_heads / tp_size) kv_heads and (num_q_heads / tp_size) q_heads.
-            self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
-            self.num_attention_heads_per_partition = divide(
+            self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size) #均分kv头数量
+            self.num_attention_heads_per_partition = divide( #均分q头数量
                 self.config.num_attention_heads, world_size
             )
         self.world_size = world_size
@@ -366,7 +366,7 @@ class Attention(MegatronModule, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
-        )#这个对应Attention中的linear_proj，即 O*W
+        )#这个对应Attention中的linear_proj，即 O*W，包含前传reduce逻辑
 
         if (
             HAVE_TE

@@ -57,16 +57,16 @@ def get_pos_emb_on_this_cp_rank(
     """
     if cp_group is None:
         raise ValueError("cp_group must be provided to get positional embedding per CP rank")
-    cp_size = cp_group.size()
-    cp_rank = cp_group.rank()
-    cp_idx = torch.tensor(
+    cp_size = cp_group.size() #CP并行度
+    cp_rank = cp_group.rank() #CP组内rank
+    cp_idx = torch.tensor( #每个 CP rank 需要取两个特定位置（对称选取模式）
         [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
     ).cuda(non_blocking=True)
     pos_emb = pos_emb.view(
         *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1) :]
-    )
-    pos_emb = pos_emb.index_select(seq_dim, cp_idx)
-    pos_emb = pos_emb.view(*pos_emb.shape[:seq_dim], -1, *pos_emb.shape[(seq_dim + 2) :])
+    )#把完整序列维切成 2 * cp_size 块
+    pos_emb = pos_emb.index_select(seq_dim, cp_idx) #用 cp_idx 从这 8 块中选出属于自己的两块
+    pos_emb = pos_emb.view(*pos_emb.shape[:seq_dim], -1, *pos_emb.shape[(seq_dim + 2) :]) #展平回正常的序列维
     return pos_emb
 
 
