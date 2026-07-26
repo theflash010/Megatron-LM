@@ -122,10 +122,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     @classmethod
     def _build_model_gbuf_param_range_map(
         cls,
-        param_world_index_map: Dict[torch.nn.Parameter, Tuple],
-        gbuf_world_range: Range,
-        bucket_offset: int,
-    ):
+        param_world_index_map: Dict[torch.nn.Parameter, Tuple], #当前buffer的所有参数，以及它们在buffer中的范围
+        gbuf_world_range: Range, #当前bucket被当前DP rank处理的分片的开始结束位置（局部位置，相对于bucket的内部地址）
+        bucket_offset: int, #当前bucket的全局offset（相对于整体buffer）
+    ): #处理所有param在当前dp rank负责部分（当前bucket的分片）的的range
         """Build mapping from param reference to grad buffer shard ranges.
 
         This method builds a mapping from parameter references to grad
@@ -158,36 +158,36 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Param range map.
         param_range_map = {}
-        for param, param_world_indexes in param_world_index_map.items():
+        for param, param_world_indexes in param_world_index_map.items(): #遍历buffer中每个param，param_world_indexes包括这个param在buffer中的范围，start，end，还有位于哪一个bucket
 
             # Param range.
-            param_world_start, param_world_end, _ = param_world_indexes
-            param_local_start = max(0, param_world_start - gbuf_world_range.start)
-            param_local_end = min(gbuf_world_range.size, param_world_end - gbuf_world_range.start)
+            param_world_start, param_world_end, _ = param_world_indexes #获取param在buffer中的绝对范围
+            param_local_start = max(0, param_world_start - gbuf_world_range.start) #确定这个param在这个dp rank负责的范围内（当前bucket的分片部分）的相对起始位置
+            param_local_end = min(gbuf_world_range.size, param_world_end - gbuf_world_range.start) #确定这个param在这个dp rank负责的范围内（当前bucket的分片部分）的相对结束位置
 
             # Add param, if within local gbuf range.
-            if param_local_end > param_local_start:
+            if param_local_end > param_local_start: #有可能param不在这个dp rank负责的范围内（当前bucket的分片部分）
                 param_local_range = Range(param_local_start, param_local_end)
                 param_world_range = param_local_range.normalize(
                     param_local_start + gbuf_world_range.start
-                )
+                )#将这个param在这个dp rank负责的bucket分片内的相对范围变成buffer的绝对范围
                 param_world_range_in_bucket = Range(
                     param_world_range.start - bucket_offset, param_world_range.end - bucket_offset
-                )
-                sub_param_start = max(0, gbuf_world_range.start - param_world_start)
-                sub_param_range = param_local_range.normalize(sub_param_start)
+                )#将这个param在这个dp rank负责的范围内的部分从buffer的绝对范围变成bucket的相对范围
+                sub_param_start = max(0, gbuf_world_range.start - param_world_start) #代表这个param在这个dp rank负责的范围内的部分的开头相对整个param的位移
+                sub_param_range = param_local_range.normalize(sub_param_start) #将这个param在这个dp rank负责的范围内的部分从这个rank负责的相对范围变成整个param的相对范围
                 param_range_map[param] = {
                     "gbuf_world": param_world_range,
                     "gbuf_world_in_bucket": param_world_range_in_bucket,
                     "gbuf_local": param_local_range,
                     "param": sub_param_range,
-                }
+                } #从param映射到一堆范围
 
         return param_range_map
 
     @classmethod
     def _build_model_gbuf_range(cls, param_and_grad_buffer: _ParamAndGradBuffer, bucket_index: int):
-        """
+        """ #处理单个bucket
         Build mapping between params and their grad buffers.
 
         This method does the initial setup for the method above. This setup
@@ -201,31 +201,31 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_world_size = param_and_grad_buffer.data_parallel_group.size()
 
         bucket = param_and_grad_buffer.buckets[bucket_index]
-        gbuf_size = bucket.grad_data.numel()
-        assert (
+        gbuf_size = bucket.grad_data.numel() #grad bucket的元素数量，就是一个bucket的元素数量，不区分param和grad
+        assert ( #每个bucket的元素数量需要能被DP size整除，这样才可以进行均分
             gbuf_size % data_parallel_world_size == 0
         ), f"Each bucket's buffer size should be divisible by {data_parallel_world_size}"
-        max_gbuf_range_size = gbuf_size // data_parallel_world_size
+        max_gbuf_range_size = gbuf_size // data_parallel_world_size #每个dp rank负责的bucket元素数量
 
         # All world ranges (i.e., across all data parallel ranks).
-        gbuf_world_all_ranges = []
+        gbuf_world_all_ranges = [] #存储每个dp rank针对这个bucket在buffer中负责的范围
         for r in range(data_parallel_world_size):
             # Compute start of chunk in this bucket.
-            gbuf_world_start = r * max_gbuf_range_size
-            gbuf_world_end = min(gbuf_size, gbuf_world_start + max_gbuf_range_size)
+            gbuf_world_start = r * max_gbuf_range_size #第r个rank在buffer中负责的bucket分片的起始位置
+            gbuf_world_end = min(gbuf_size, gbuf_world_start + max_gbuf_range_size) #第r个rank在buffer中负责的bucket分片的结束位置
             # Add bucket's offset in grad buffer.
             gbuf_world_range = Range(
                 gbuf_world_start + bucket.offset, gbuf_world_end + bucket.offset
-            )
+            )#将负责的范围从bucket的相对位置变成buffer中的绝对位置
             gbuf_world_all_ranges.append(gbuf_world_range)
 
-        # Local DP's ranges.
+        # Local DP's ranges. #当前进程负责的范围
         gbuf_world_range = gbuf_world_all_ranges[data_parallel_rank]
 
         # Get each param's ranges.
         param_range_map = cls._build_model_gbuf_param_range_map(
             param_and_grad_buffer.param_index_map, gbuf_world_range, bucket.offset
-        )
+        )#确定每个param在当前DP rank负责部分的range属性
 
         # Group into dict.
         data = {"param_map": param_range_map}
@@ -247,10 +247,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Returns:
             Dict: Mapping of parameter dtypes to bucket ranges.
         """
-        return {
+        return {#key:(param_dtype, grad_dtype)，value:[bucket信息]，bucket信息是{"param_map": param_range_map}，代表所有param在当前dp rank负责的部分的range属性
             (param_and_grad_buffer.param_dtype, param_and_grad_buffer.grad_dtype): [
                 cls._build_model_gbuf_range(param_and_grad_buffer, bucket_index)
-                for bucket_index in range(len(param_and_grad_buffer.buckets))
+                for bucket_index in range(len(param_and_grad_buffer.buckets)) #遍历buffer的bucket，每个bucket有一个range，组成整个列表
             ]
         }
 
@@ -262,15 +262,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Create a reverse of the gbuf_ranges, for referencing in opposite direction.
         """
         param_gbuf_map = {}
-        for gbuf_index, gbuf_range_map in enumerate(gbuf_ranges):
-            for dtype, gbuf_range_map_for_all_buckets in gbuf_range_map.items():
-                for bucket_index, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
-                    for param, _ in gbuf_range_map["param_map"].items():
+        for gbuf_index, gbuf_range_map in enumerate(gbuf_ranges): #遍历每个buffer
+            for dtype, gbuf_range_map_for_all_buckets in gbuf_range_map.items(): #dtype包括param和grad的dtype
+                for bucket_index, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets): #遍历每个bucket的range
+                    for param, _ in gbuf_range_map["param_map"].items():#每个param和对应的range属性
                         assert param not in param_gbuf_map, (
                             "Param should not be in param_gbuf_map; each param only belongs "
                             "to a single bucket."
                         )
-                        param_gbuf_map[param] = (gbuf_index, dtype, bucket_index)
+                        param_gbuf_map[param] = (gbuf_index, dtype, bucket_index)#这个param对应的buffer索引，dtype，bucket索引
         return param_gbuf_map
 
     @classmethod
@@ -292,7 +292,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   parameters. This mapping only for use in the next step of building
         #   the local mapping over this DP rank's parameters.
         world_param_group_map = {}
-        for group_index, group in enumerate(param_groups):
+        for group_index, group in enumerate(param_groups): #标记每个参数对应的group
             for param in group["params"]:
                 assert param.requires_grad
                 world_param_group_map[param] = group_index
@@ -302,16 +302,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   from parameters to their containing group index and order within
         #   the group. The group index and order are particularly important for
         #   saving and loading checkpoints.
-        local_param_group_map = {}
-        group_ranges = [{"params": []} for _ in param_groups]
-        for gbuf_range_map in gbuf_ranges:
+        local_param_group_map = {} #key:param，value:(group_index 位于第几个group, len(group_range["params"]) - 1 在组中的位置)
+        group_ranges = [{"params": []} for _ in param_groups] #字典列表，每个param group对应一个字典元素，字典的'params'代表当前rank负责的这个组中的param，"orig_group"代表当前param_group，"orig_group_idx"代表当前param_group在所有group中的索引
+        for gbuf_range_map in gbuf_ranges: #遍历buffer
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_map.items():
-                for gbuf_range_map in gbuf_range_map_for_all_buckets:
-                    for param in gbuf_range_map["param_map"]:
-                        group_index = world_param_group_map[param]
-                        group_range = group_ranges[group_index]
-                        group_range["params"].append(param)
-                        local_param_group_map[param] = (group_index, len(group_range["params"]) - 1)
+                for gbuf_range_map in gbuf_range_map_for_all_buckets: #遍历bucket
+                    for param in gbuf_range_map["param_map"].keys(): #遍历当前dp rank负责的param
+                        group_index = world_param_group_map[param] #参数在哪个组
+                        group_range = group_ranges[group_index] #获取组
+                        group_range["params"].append(param) #组中参数加入当前param
+                        local_param_group_map[param] = (group_index, len(group_range["params"]) - 1) #参数对应的组和在组中的位置
 
         # Squeeze zero-size group ranges.
         for group_index, group_range in enumerate(group_ranges):
@@ -372,7 +372,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 gbuf_index, dtype, bucket_index = param_gbuf_map[model_param]
                 gbuf_range = gbuf_ranges[gbuf_index][dtype][bucket_index]
-                param_range = gbuf_range["param_map"][model_param]["param"]
+                param_range = gbuf_range["param_map"][model_param]["param"] #param内部范围
 
                 # fp16, bf16 params.
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
@@ -386,10 +386,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     else:
                         shard_model_param = model_param.detach().view(-1)[
                             param_range.start : param_range.end
-                        ]
+                        ]#这个dp rank需要负责的param部分
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_model_param, model_param
-                        )
+                        )#把TP属性复制
                         if hasattr(model_param, 'shared'):
                             shard_model_param.shared = model_param.shared
 
@@ -415,7 +415,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     param_range.start : param_range.end
                                 ]
                         else:
-                            shard_main_param = shard_model_param.clone().float()
+                            shard_main_param = shard_model_param.clone().float() #把当前 DP rank 负责的那一段参数从 fp16/bf16 转成 fp32。
 
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
@@ -427,8 +427,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         shard_main_param = None
 
                     # Store handle to main_param.
-                    model_param.main_param = shard_main_param
-                    model_param.main_param_sharded = True
+                    model_param.main_param = shard_main_param #设置32位主参数切片
+                    model_param.main_param_sharded = True #这个参数切片是32位的
 
                     # Add to group.
                     model_float16_params_this_group.append(model_param)
@@ -457,10 +457,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             # Update optimizer's params.
             if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                group_range["orig_group"]["params"] = [
+                group_range["orig_group"]["params"] = [ #把原始param_group中的params替换为分片后的fp32参数
                     *shard_fp32_params_this_group,
                     *shard_fp32_from_float16_params_this_group,
-                ]
+                ] #shard_fp32_params_this_group和shard_fp32_from_float16_params_this_group是互斥的，只有一个有值
             else:
                 group_range["orig_group"]["params"] = [
                     *shard_fp32_params_this_group,
@@ -650,12 +650,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        super().__init__(optimizer, config, grad_scaler, init_state_fn)
+        super().__init__(optimizer, config, grad_scaler, init_state_fn) #初始化MixedPrecisionOptimizer
         self.model_chunks = model_chunks
         self.ddp_config = self.model_chunks[0].ddp_config
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
-        self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
+        self.distributed_optimizer_instance_id = distributed_optimizer_instance_id #确定分布式优化器实例ID
 
         assert (
             isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
@@ -666,7 +666,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         )
 
         # when freezing sub-models we have no real optimizer
-        # but still need a stub DistributedOptimizer class
+        # but still need a stub DistributedOptimizer class #当传入的 optimizer 参数为 None 时，说明子模型被冻结（freezing sub-models，即参数不参与训练）。这种情况下不需要真正的优化器对象，但为了代码一致性（比如其他地方会检查 distrib_optimizer 是否存在），仍需要一个**桩（stub）**实例。
         if optimizer is None:
             self.is_stub_optimizer = True
             return
@@ -678,26 +678,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Model grad buffer ranges.
         assert per_model_buffers is not None, "per_model_buffers must be provided"
-        self.buffers = list(itertools.chain(*per_model_buffers.values()))
+        self.buffers = list(itertools.chain(*per_model_buffers.values())) #拿到一个按 model_chunk 顺序排列的扁平 buffer 列表
         self.per_model_buffers = per_model_buffers
         self.data_parallel_group = data_parallel_group
         self.data_parallel_group_gloo = data_parallel_group_gloo
         self.data_parallel_group_idx = data_parallel_group_idx
 
-        self.gbuf_idx_to_model_idx_map = {}
+        self.gbuf_idx_to_model_idx_map = {} #建立grad buffers索引到模型分片索引的映射，给定一个grad buffer 在 self.buffers 中的位置，能立即知道它属于哪个 model_chunk
         gbuf_idx = 0
         for model_idx, buffers in self.per_model_buffers.items():
             for _ in buffers:
                 self.gbuf_idx_to_model_idx_map[gbuf_idx] = model_idx
                 gbuf_idx += 1
 
-        self.per_model_bucket_groups = {}
+        self.per_model_bucket_groups = {} #key为模型分片索引，value为模型分片对应的 _ParamAndGradBucketGroup 列表
         for model_idx, buffers in self.per_model_buffers.items():
             self.per_model_bucket_groups[model_idx] = partition_buckets(buffers)
 
         self.gbuf_ranges = []
-        self.per_bucket_numel = []
-        self.per_bucket_numel_unpadded = []
+        self.per_bucket_numel = [] #每个buffer中的bucket信息，key是 (param_dtype, grad_dtype)，value是每个bucket的grad_data.numel()组成的列表，元素数量（与dtype无关）
+        self.per_bucket_numel_unpadded = [] #每个buffer中的bucket信息，key是 (param_dtype, grad_dtype)，value是每个bucket的numel_unpadded组成的列表，元素数量（与dtype无关）
         for buffer in self.buffers:
 
             self.per_bucket_numel.append(
@@ -705,17 +705,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     (buffer.param_dtype, buffer.grad_dtype): [
                         bucket.grad_data.numel() for bucket in buffer.buckets
                     ]
-                }
+                }#每个buffer中的bucket信息，key是 (param_dtype, grad_dtype)，value是每个bucket的grad_data.numel()组成的列表，元素数量（与dtype无关）
             )
             self.per_bucket_numel_unpadded.append(
                 {
                     (buffer.param_dtype, buffer.grad_dtype): [
                         bucket.numel_unpadded for bucket in buffer.buckets
                     ]
-                }
+                }#每个buffer中的bucket信息，key是 (param_dtype, grad_dtype)，value是每个bucket的numel_unpadded组成的列表，元素数量（与dtype无关）
             )
-            self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
-        self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
+            self.gbuf_ranges.append(self._build_gbuf_range_map(buffer)) #添加 buffer 所有bucket 的 range 信息到 gbuf_ranges
+        self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges) #每个param对应的buffer索引，dtype，bucket索引
 
         # Add main_param field to each parameter. We will use this fp32 copy to compute
         # the param norm.
@@ -727,31 +727,31 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if param.requires_grad:
                     # fp32 copy only needed for 16-bit parameters.
                     if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
-                        param.main_param = None
+                        param.main_param = None #Megatron动态设置的属性，main_grad也是
                         param.main_param_sharded = True
 
         # Optimizer ranges.
         self.model_param_group_index_map, self.opt_group_ranges = (
             self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
-        )
+        )#从当前 rank 负责的参数中，按原始 optimizer 的 group 结构重新分组
 
         # Allocate main param shards.
         (
-            self.model_float16_groups,
+            self.model_float16_groups, #这个参数组的所有参数fp16
             self.model_fp32_groups,
-            self.shard_float16_groups,
+            self.shard_float16_groups, #这个参数组里所有参数需要被该rank处理的分片fp16
             self.shard_fp32_groups,
-            self.shard_fp32_from_float16_groups,
+            self.shard_fp32_from_float16_groups, #这个参数组里所有参数需要被该rank处理的分片，fp32格式的副本
         ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
-        )
+        ) #将opt_group_ranges里每个参数组里的参数group_range["orig_group"]["params"]替换为了参数分片，fp32
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
                 params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
             )
         else:
-            self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
+            self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]  #重新设置optimizer的参数组
             self.optimizer.load_state_dict(self.optimizer.state_dict())
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):

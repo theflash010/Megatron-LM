@@ -959,7 +959,7 @@ def validate_args(args, defaults={}):
         assert args.overlap_param_gather, \
             'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
         assert args.virtual_pipeline_model_parallel_size is not None, \
-            '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
+            '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism' #只有VPP才能重叠gather和优化器更新，因为需要每个节点有多个chunk才能完成重叠
         assert not args.use_dist_ckpt, \
             '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
 

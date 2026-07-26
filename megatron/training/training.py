@@ -1032,7 +1032,7 @@ def pretrain(
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context
-    )
+    ) #获取模型，优化器，学习率调度器
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -1148,7 +1148,7 @@ def pretrain(
     else:
         train_data_iterator, valid_data_iterator, test_data_iterator = (
             build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
-        )
+        )#获取dataloader iterator，这个iterator每次吐出的都是micro batch个样本。每个进程都会有iterator（当前可能train_valid_test_dataset_provider里面会自动判断哪些进程不需要iterator，设置为None）
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -1183,16 +1183,16 @@ def pretrain(
 
         iteration = 0
         args.curr_iteration = iteration
-        if args.do_train and (args.train_iters or 0) > 0:
+        if args.do_train and (args.train_iters or 0) > 0: #进行训练
             iteration, num_floating_point_operations_so_far = train(
-                forward_step_func,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                train_data_iterator,
-                valid_data_iterator,
-                process_non_loss_data_func,
-                model_cfg,
+                forward_step_func,  #前向传播函数。训练循环中每步调用它做 forward + backward，返回 loss。不同模型定义不同的 forward_step_func
+                model, #模型对象列表（通常 [model]）
+                optimizer, #优化器
+                opt_param_scheduler, #学习率调节器
+                train_data_iterator, #训练数据迭代器。
+                valid_data_iterator, #验证数据迭代器
+                process_non_loss_data_func, #非 loss 数据处理回调。用于从 forward 输出中提取额外信息（如 attention logits 监控）
+                model_cfg, #模型配置（如 TransformerConfig）
                 checkpointing_context,
                 non_loss_data_func,
                 inference_model,
@@ -1284,7 +1284,7 @@ def pretrain(
     one_logger_utils.finish()
 
 
-def update_train_iters(args):
+def update_train_iters(args): #将 sample 数反算为 iteration 数
 
     # For iteration-based training, we don't need to do anything
     if args.train_iters:
@@ -1565,10 +1565,10 @@ def get_optimizer_param_scheduler(optimizer):
     if args.train_iters:
         if args.lr_decay_iters is None:
             args.lr_decay_iters = args.train_iters
-        lr_decay_steps = args.lr_decay_iters * args.global_batch_size
-        wd_incr_steps = args.train_iters * args.global_batch_size
-        wsd_decay_steps = None
-        if args.lr_wsd_decay_iters is not None:
+        lr_decay_steps = args.lr_decay_iters * args.global_batch_size #LR 调度覆盖的总长度
+        wd_incr_steps = args.train_iters * args.global_batch_size #wd一直增长
+        wsd_decay_steps = None #针对lr是warmup stable decay的情况，最后一段快速衰减decay的长度
+        if args.lr_wsd_decay_iters is not None:#确定lr的warmup的样本数
             wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size
         if args.lr_warmup_fraction is not None:
             lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
@@ -1579,13 +1579,13 @@ def get_optimizer_param_scheduler(optimizer):
         # We need to set training iters for later use. Technically
         # we need to adjust the training samples too (due to last
         # batch being incomplete) but we leave it as is for now.
-        update_train_iters(args)
+        update_train_iters(args) #将 sample 数反算为 iteration 数
         if args.lr_decay_samples is None:
             args.lr_decay_samples = args.train_samples
-        lr_decay_steps = args.lr_decay_samples
-        wd_incr_steps = args.train_samples
-        wsd_decay_steps = args.lr_wsd_decay_samples
-        if args.lr_warmup_fraction is not None:
+        lr_decay_steps = args.lr_decay_samples #确定LR调度覆盖的总长度
+        wd_incr_steps = args.train_samples ##wd一直增长
+        wsd_decay_steps = args.lr_wsd_decay_samples #针对lr是warmup stable decay的情况，最后一段快速衰减decay的长度
+        if args.lr_warmup_fraction is not None: #确定warmup的样本数
             lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
         else:
             lr_warmup_steps = args.lr_warmup_samples
@@ -1608,7 +1608,7 @@ def get_optimizer_param_scheduler(optimizer):
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
         lr_wsd_decay_style=args.lr_wsd_decay_style,
-    )
+    )#构建OptimizerParamScheduler类
 
     return opt_param_scheduler
 
@@ -1620,11 +1620,11 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     for f in dataclasses.fields(OptimizerConfig):
         if hasattr(args, f.name):
             kwargs[f.name] = getattr(args, f.name)
-    config = OptimizerConfig(**kwargs)
+    config = OptimizerConfig(**kwargs) #从args里读取字段创建OptimizerConfig对象
 
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
-    config_overrides = get_standard_config_overrides(config=config)
+    config_overrides = get_standard_config_overrides(config=config) #构建参数分组覆盖规则，让不同参数可以用不同的优化器超参。返回一个 Dict[ParamKey, ParamGroupOverride]，即"参数匹配器 → 覆盖什么配置"。
 
     return config, config_overrides
 
@@ -1678,7 +1678,7 @@ def setup_model_and_optimizer(
         if args.perform_rl_step:
             update_train_iters(args)
     else:
-        config, config_overrides = get_megatron_optimizer_config(args)
+        config, config_overrides = get_megatron_optimizer_config(args) #获取optimizer的配置，参数覆盖配置
         config.timers = timers
         if getattr(args, "use_mup", False): #是否使用mup(Maximal Update Parameterization，没学过)，一般不用。如果 args 上有 use_mup 属性 → 返回 args.use_mup 的值，如果 args 上没有这个属性 → 返回默认值 False，一般是不用mup
             model_config_source = (
@@ -1695,12 +1695,12 @@ def setup_model_and_optimizer(
 
         optimizer = get_megatron_optimizer(
             config,
-            model,
+            model, #这里传入的是model_chunk列表
             config_overrides=config_overrides,
             use_gloo_process_groups=args.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
-        )
-        opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+        )#优化器构建，实际更新参数的组件
+        opt_param_scheduler = get_optimizer_param_scheduler(optimizer) #优化器的配套组件，scheduler用于调节学习率 LR 和权重衰减Weight Decay
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
@@ -1753,18 +1753,18 @@ def setup_model_and_optimizer(
 
     if (
         args.load is not None or args.pretrained_checkpoint is not None
-    ) and not args.moe_use_upcycling:
+    ) and not args.moe_use_upcycling: #指定了 checkpoint 路径，从 checkpoint 恢复训练。
         one_logger and one_logger.log_metrics(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
-        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
+        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint( #加载检查点，num_floating_point_operations_so_far是记录浮点运算次数的，用于统计
             model,
             optimizer,
             opt_param_scheduler,
             checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2
+            skip_load_to_model_and_opt=HAVE_FSDP2 #用于 FSDP2 + torch_dist 格式的场景：checkpoint 加载由 FSDP 框架自己管理，不需要 Megatron 的 load_checkpoint 去写参数。
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
         )
@@ -1776,7 +1776,7 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
-    else:
+    else: #无 checkpoint 时，iteration 和浮点运算数都初始化为 0。
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
 
@@ -1784,7 +1784,7 @@ def setup_model_and_optimizer(
     # This catches the case where GPUs were scaled up mid-training but the
     # current position in the batch size schedule yields a batch size that
     # is too small for the number of data-parallel replicas.
-    num_microbatches = get_num_microbatches()
+    num_microbatches = get_num_microbatches() #验证当前batch size
     current_global_batch_size = get_current_global_batch_size()
     data_parallel_size = mpu.get_data_parallel_world_size()
     assert num_microbatches is not None and num_microbatches >= 1, (
@@ -1807,7 +1807,7 @@ def setup_model_and_optimizer(
             optimizer.reload_model_params()
 
     # Convert checkpoint format.
-    if args.ckpt_convert_format is not None:
+    if args.ckpt_convert_format is not None: #如果是为了转换检查点格式，进行转换然后结束程序
         load_ckpt_format = args.ckpt_format
         args.ckpt_format = args.ckpt_convert_format
         args.save = os.path.join(args.ckpt_convert_save, args.ckpt_convert_format)
@@ -1841,7 +1841,7 @@ def dummy_train_step(data_iterator):
 
 
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
-    """Single training step."""
+    """Single training step.""" #执行一个step，处理的数据量是global batch size
     args = get_args()
     timers = get_timers()
 
@@ -1856,13 +1856,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
-    while rerun_state_machine.should_run_forward_backward(data_iterator):
+    while rerun_state_machine.should_run_forward_backward(data_iterator): #rerun状态机循环
         # Set grad to zero.
         for model_chunk in model:
-            model_chunk.zero_grad_buffer()
+            model_chunk.zero_grad_buffer() #将每个模型分片的梯度置0
             # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
-        optimizer.zero_grad()
+        optimizer.zero_grad() #优化器梯度置0
 
         if has_nvidia_modelopt:
             # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
@@ -1899,7 +1899,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
-        losses_reduced = forward_backward_func(
+        losses_reduced = forward_backward_func( #根据是否使用的PP调度器来执行n个micro batch的前向后向
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
@@ -2901,7 +2901,7 @@ def train(
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
-    forward_backward_func = get_forward_backward_func()
+    forward_backward_func = get_forward_backward_func() #返回的是PP 调度器——控制 N 个 micro batch 如何在各 PP stage 间流动（1F1B、interleaved 等）
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
     if args.optimizer_cuda_graph:
@@ -3125,7 +3125,7 @@ def train(
                 max_attention_logit,
             ) = train_step(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
-            )
+            ) #进行训练。forward_backward_func是get_forward_backward_func() 返回的 PP 调度器
             ft_integration.on_training_step_end()
         if should_checkpoint:
             save_checkpoint_and_time(
@@ -3645,7 +3645,7 @@ def cyclic_iter(iterable):
 
 
 def get_train_valid_test_num_samples():
-    """Train/valid/test num samples."""
+    """Train/valid/test num samples.""" #计算训练/验证/测试阶段各需要处理多少个样本，最终返回一个三元组供构建 dataset 时使用。
 
     args = get_args()
 
@@ -3690,7 +3690,7 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, tr
     print_rank_0('    train:      {}'.format(train_valid_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
     print_rank_0('    test:       {}'.format(train_valid_test_num_samples[2]))
-    return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
+    return build_train_valid_test_datasets_provider(train_valid_test_num_samples) #获取数据集，但是多模态使用Megatron Energon返回的是EnergonDataloader，直接就是dataloader
 
 
 def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
@@ -3709,18 +3709,18 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         ), 'Only backward compatiblity support for iteration-based training'
 
         args.consumed_train_samples = args.iteration * args.global_batch_size
-    if args.iteration > 0 and args.consumed_valid_samples == 0:
+    if args.iteration > 0 and args.consumed_valid_samples == 0: #args.iteration：当前已经完成的训练步数，args.consumed_train_samples：已经消耗的训练样本总数
         if args.train_samples is None:
             effective_start = args.start_eval_at_iter if args.start_eval_at_iter is not None else 0
             skipped_intervals = effective_start // args.eval_interval
-            args.consumed_valid_samples = (
+            args.consumed_valid_samples = ( #args.consumed_valid_samples：已消耗的验证样本数
                 max(0, args.iteration // args.eval_interval - skipped_intervals)
                 * args.eval_iters
                 * getattr(args, 'eval_global_batch_size', args.global_batch_size)
             )
 
     # Get consumed train samples in this phase.
-    if args.phase_transition_iterations:
+    if args.phase_transition_iterations: #consumed_train_samples_in_current_phase：当前阶段内已经消耗的样本数，而不是全量
         last_transition = max(iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= args.iteration)
         consumed_train_samples_in_current_phase = (args.iteration - last_transition) * args.global_batch_size
     else:
@@ -3730,7 +3730,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
 
     # Construct the data pipeline
-    if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
+    if is_distributed or mpu.get_tensor_model_parallel_rank() == 0: #只有 TP rank 0（或分布式数据集）才真正构建 dataloader。TP rank > 0 的不需要 dataloader——它们的数据由 TP rank 0 通过 broadcast 获得。
 
         # Build datasets and dataloders.
         if args.perform_rl_step:
@@ -3744,12 +3744,12 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
         else:
             # Build datasets.
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)#获取dataset，但是多模态使用Megatron Energon这里就是dataloader
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
             if args.skip_train:
                 train_dataloader = None
             else:
-                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
+                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase) #直接穿透，train_dataloader=train_ds
             valid_dataloaders = []
             for valid_d in valid_ds:
                 if args.skip_train or args.full_validation:
@@ -3763,9 +3763,9 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             if not args.multiple_validation_sets:
                 assert len(valid_dataloaders) == 1
             test_dataloader = build_pretraining_data_loader(test_ds, 0)
-            do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
-            do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
-            do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
+            do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0) #         有训练 dataloader               并且（跳过训练步 或 还有训练步要跑）
+            do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0) #   有验证 dataloader              并且（全验证 或 还有验证步要跑）
+            do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)    #   有测试 dataloader              并且（全验证 或 还有验证步要跑）
 
         flags = torch.tensor(
             [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
@@ -3773,7 +3773,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     else:
         flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
 
-    torch.distributed.broadcast(flags, 0)
+    torch.distributed.broadcast(flags, 0) #TP rank 0 构建了 dataloader，其他 rank 没有。但所有 rank 都需要知道"本轮该训练还是验证还是测试"。三个 bool 打包成 tensor broadcast 到所有 rank，保证行为一致。
 
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
@@ -3789,11 +3789,11 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
         build_train_valid_test_datasets_provider
-    )
+    )#得到dataloader，后面把 dataloader 转成训练循环实际用的 data iterator
 
     # Build iterators.
     dl_type = args.dataloader_type
-    assert dl_type in ['single', 'cyclic', 'external']
+    assert dl_type in ['single', 'cyclic', 'external'] #多模态这里是external
 
     def _get_iterator(dataloader_type, dataloader):
         """Return dataset iterator."""
@@ -3806,7 +3806,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
             if isinstance(dataloader, list):
                 return [RerunDataIterator(d) for d in dataloader]
             else:
-                return RerunDataIterator(dataloader)
+                return RerunDataIterator(dataloader) #EnergonDataloader 在 __init__ 里直接把迭代器创建好了，所以EnergonDataloader 本身就是一个 iterator（有 __next__），RerunDataIterator 内部 next(self.iterable) 直接就能调到它的 __next__。
         else:
             raise RuntimeError("unexpected dataloader type")
 
@@ -3862,7 +3862,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     else:
         test_data_iterator = None
 
-    return train_data_iterator, valid_data_iterators, test_data_iterator
+    return train_data_iterator, valid_data_iterators, test_data_iterator #返回dataloader iterator
 
 
 def should_disable_forward_pre_hook(args):

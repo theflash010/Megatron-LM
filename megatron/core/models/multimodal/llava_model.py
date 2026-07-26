@@ -448,7 +448,7 @@ class LLaVAModel(MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
-        """Preprocess input data before input to language model.
+        """Preprocess input data before input to language model. #将文本embedding中的<image>替换为image_embeddings，同时labels和loss_mask都会自动对齐到新的embedding
 
         This function is adopted from
         https://github.com/huggingface/transformers/blob/85817d98fb60977c97e3014196a462b732d2ed1a/src/transformers/models/llava_next/modeling_llava_next.py#L409
@@ -859,11 +859,11 @@ class LLaVAModel(MegatronModule):
                 0, 0, 0
             )
         elif self.add_encoder and has_images:
-            image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
-            if self._drop_vision_class_token:
+            image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision] #将images输入给ViT模块
+            if self._drop_vision_class_token: #如果丢掉ViT的 clss token就进行裁剪
                 image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
 
-            if self._pixel_shuffle:
+            if self._pixel_shuffle: #如果进行patch merge。这个函数做的事是 PixelUnshuffle（空间缩小、通道扩大），不是 PixelShuffle（空间放大、通道缩小）
                 image_embeddings = pixel_shuffle(
                     image_embeddings
                 )  # [num_tiles, img_seq_len_shuffled, h_vision_shuffled]
@@ -873,12 +873,12 @@ class LLaVAModel(MegatronModule):
                 1, 0, 2
             ).contiguous()  # [img_seq_len, num_tiles, h_vision]
 
-            # map vision model output size to language model input size.
+            # map vision model output size to language model input size. #将ViT的输出映射到语言模型的输入维度
             image_embeddings = self.vision_projection(
                 image_embeddings
             )  # [img_seq_len, num_tiles, h_language]
 
-            # Apply tile tagging if enabled and an image token is present.
+            # Apply tile tagging if enabled and an image token is present. #如果有多个tile，就应用tile tagging。给每个图块前面加上 <tile_1>、<tile_2> 等标记，让语言模型知道当前处理的是第几个图块。
             if self._tile_tags is not None and torch.any(input_ids == self.image_token_index):
                 image_embeddings = self._apply_tile_tagging(image_embeddings, num_image_tiles)
 
@@ -898,11 +898,11 @@ class LLaVAModel(MegatronModule):
         language_embeddings = None
         if self.pre_process:
             input_ids_text = input_ids.clone()
-            input_ids_text[input_ids_text == self.image_token_index] = 0
+            input_ids_text[input_ids_text == self.image_token_index] = 0 #把input_ids_text中等于self.image_token_index的元素变成0
             # Note: This adds absolute position embedding but not RoPE.
             # Each image is counted as one position.
             # RoPE is added in language_model forward. Each image embedding is one position.
-            language_embeddings = self.language_model.embedding(
+            language_embeddings = self.language_model.embedding( #语言模型的embedding层。将input_ids和position_ids传入，输出的就是语言部分的embedding
                 input_ids=input_ids_text, position_ids=position_ids
             )  # [text_seq_len, b, h_language]
 
@@ -918,7 +918,7 @@ class LLaVAModel(MegatronModule):
         #   [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
         # else:
         #   [b, combined_seq_len, h_language], [b, combined_seq_len], [b, combined_seq_len]
-        combined_embeddings, new_labels, new_loss_mask = self._preprocess_data(
+        combined_embeddings, new_labels, new_loss_mask = self._preprocess_data( #将文本embedding中的<image>替换为image_embeddings，同时labels和loss_mask都会自动对齐到新的embedding
             image_embeddings,
             language_embeddings,
             input_ids,
@@ -937,7 +937,7 @@ class LLaVAModel(MegatronModule):
                 )
             )
 
-        output = self.language_model(
+        output = self.language_model( #进行语言模型的前传
             input_ids=None,
             position_ids=None,
             attention_mask=attention_mask,
@@ -1000,8 +1000,8 @@ def _load_state_dict_hook_ignore_extra_state(
 # pylint: disable-next=line-too-long
 # Based on https://github.com/OpenGVLab/InternVL/blob/c7c5af1a8930b4862afe8ed14672307082ef61fa/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py#L218
 # Copyright (c) 2023 OpenGVLab.
-def pixel_shuffle(x, scale_factor=0.5, version=2):
-    """Pixel shuffle based on InternVL but adapted for our use case.
+def pixel_shuffle(x, scale_factor=0.5, version=2): #做patch merger
+    """Pixel shuffle based on InternVL but adapted for our use case. #这个函数做的事是 PixelUnshuffle（空间缩小、通道扩大），不是 PixelShuffle（空间放大、通道缩小）
 
     Args:
         x (torch.Tensor): Vision model outputs [num_tiles, img_seq_len, h_vision]
@@ -1010,14 +1010,14 @@ def pixel_shuffle(x, scale_factor=0.5, version=2):
     Returns:
         Shuffled vision model outputs [num_tiles, (sq ** 2) * (scale ** 2), h_vision / (scale ** 2)]
     """
-    h = w = int(x.shape[1] ** 0.5)  # sq
-    x = x.reshape(x.shape[0], h, w, -1)  # [num_tiles, sq, sq, h_vision]
+    h = w = int(x.shape[1] ** 0.5)  # sq #sq = sqrt(img_seq_len)，如 576→24
+    x = x.reshape(x.shape[0], h, w, -1)  # [num_tiles, sq, sq, h_vision] #把展平的图像序列重塑为 2D 空间网格。[N, sq², C] → [N, sq, sq, C]
 
-    n, w, h, c = x.size()
+    n, w, h, c = x.size() #把相邻的 4 个 patch 合并成 1 个 patch，所有数据保留，只是位置从"平铺放"变成"叠起来放"。
     # N, W, H, C --> N, W, H * scale, C // scale
-    x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
+    x = x.view(n, w, int(h * scale_factor), int(c / scale_factor)) #第一轮：高度方向降采样，通道扩展
     # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
-    x = x.permute(0, 2, 1, 3).contiguous()
+    x = x.permute(0, 2, 1, 3).contiguous() #第二轮：宽度方向降采样，通道扩展
     # N, H * scale, W, C // scale --> N, H * scale, W * scale, C // (scale ** 2)
     x = x.view(
         n, int(h * scale_factor), int(w * scale_factor), int(c / (scale_factor * scale_factor))
@@ -1026,6 +1026,6 @@ def pixel_shuffle(x, scale_factor=0.5, version=2):
     if version == 2:
         x = x.permute(0, 2, 1, 3).contiguous()
 
-    x = x.reshape(x.shape[0], -1, x.shape[-1])
+    x = x.reshape(x.shape[0], -1, x.shape[-1]) #展平回序列格式输出
 
     return x

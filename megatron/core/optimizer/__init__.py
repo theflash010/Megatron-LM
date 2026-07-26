@@ -98,7 +98,7 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
     Returns:
         Dict[ParamKey, ParamGroupOverride]: standard config overrides.
     """
-    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {} #一个映射表，Key = ParamKey：参数匹配规则，Value = ParamGroupOverride：对命中的参数应用什么覆盖
     # First, figure out how we are going to do wd skipping. The two main approaches are:
     #  1. The classic megatron approach of skipping all len 1 and bias parameters.
     #  2. The Qwen3-Next approach of doing 1, other than qk layernorm parameters.
@@ -107,20 +107,20 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             name="s1_not_qkln",
             fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
             and not ("q_layernorm." in name or "k_layernorm." in name),
-        )
+        ) #shape=1 或 bias 的参数 → 跳过 wd，但排除 QK LayerNorm（因为这些参数即使 shape=1 也要施加 wd）。
         param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
     else:
-        param_length_1_match = ParamPredicate(
+        param_length_1_match = ParamPredicate(#ParamPredicate是对匹配函数fn的包装
             name="param_len_1", fn=lambda param: len(param.shape) == 1
-        )
-        param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
+        ) #shape=1 的参数 + 所有 bias → 跳过 wd。QK LayerNorm 的 1 维参数也跳过。
+        param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match) #ParamKey 是参数分组 key，包含三种匹配方式，任意一种匹配即命中（OR 关系）：name — 按参数名做 fnmatch 模式匹配（"*.bias" 匹配任何以 .bias 结尾的参数名）；attr — 按参数属性匹配（此处未使用）；predicate — 按自定义 predicate 匹配（上面定义的 1 维参数）
 
-    config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
+    config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0) #把所有ParamKey命中参数的 weight decay 乘数设为 0，即对这些参数不做 weight decay。
 
     if config.decoupled_lr is not None:
-        decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
-        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
-        if config.decoupled_min_lr is not None:
+        decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr} #对选定的参数设置解耦的lr
+        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter") #筛选 is_embedding_or_output_parameter=True 的参数
+        if config.decoupled_min_lr is not None: #如果 decoupled_min_lr 也设置了，一并覆盖 min_lr
             decoupled_lr_config["min_lr"] = config.decoupled_min_lr
         config_overrides[decoupled_param_key] = decoupled_lr_config
 
@@ -323,59 +323,60 @@ def _get_param_groups(
     """
 
     # Map (pg_overrides, is_expert_parallel) to params.
-    params_map = {}
+    params_map = {} #将param按照(param_override, is_expert_parallel)进行分组并生成字典
 
-    for model_chunk in model_chunks:
-        for name, param in model_chunk.named_parameters():
-            if not param.requires_grad:
+    for model_chunk in model_chunks: #遍历model_chunk
+        for name, param in model_chunk.named_parameters(): #遍历model_chunk中的参数
+            if not param.requires_grad: #不需要更新的参数，优化器不考虑
                 continue
 
             uses_default_config = False
             # Get optimizer config overrides for this parameter.
-            param_overrides_list: list[ParamGroupOverride] = []
+            param_overrides_list: list[ParamGroupOverride] = [] #将这个参数命中的ParamKey对应ParamGroupOverride记录下来，一个参数可能命中多个 ParamKey
             if config_overrides is not None:
                 for param_key, param_override in config_overrides.items():
-                    if param_key.matches(param, name):
+                    if param_key.matches(param, name): #如果参数命中某个ParamKey，则将该ParamKey的ParamGroupOverride记录下来
                         param_overrides_list.append(param_override)
 
             if param_overrides_list:
                 param_override: ParamGroupOverride | None = combine_param_group_overrides(
                     param_overrides_list
-                )
+                ) #param_overrides_list可能有多个元素，将针对该参数的重覆盖规则进行合并，检查是否有冲突的超参数设置，最终生成param_override
             else:
                 param_override = None
 
-            is_expert_parallel = not getattr(param, 'allreduce', True)
+            is_expert_parallel = not getattr(param, 'allreduce', True) #setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))，只有is_expert和expert_parallel都为True时，allreduce为False，其他情况为True，所以针对expert部分参数且使用ep的话，这些参数就会标记is_expert_parallel=True
+
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
-            )
-            key = (param_override_tuple, is_expert_parallel)
-            if key not in params_map:
+            )#把dict类型的param_group_override转换为tuple类型，可以作为key使用，因为dict是不可哈希的
+            key = (param_override_tuple, is_expert_parallel) #将param_override_tuple和is_expert_parallel一起作为key
+            if key not in params_map: #如果之前这种类型没有就创建
                 params_map[key] = []
-            params_map[key].append(param)
+            params_map[key].append(param) #把参数添加到这个key的list中
 
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have
     # runtime error when loading the checkpoint or numerical error when resuming training.
-    params_key = list(params_map.keys())
-    gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather_object(gathered_params_key, params_key)
-    for keys in gathered_params_key:
+    params_key = list(params_map.keys()) #获取params_map的所有key
+    gathered_params_key = [None for _ in range(torch.distributed.get_world_size())] #构建一个列表，用于接收从其他rank收集到的key，其他rank范围是所有节点所有rank
+    torch.distributed.all_gather_object(gathered_params_key, params_key) #allgather所有rank的key
+    for keys in gathered_params_key: #将其他rank的key收集到的key整合到自己的key中
         for key in keys:
             if key not in params_key:
                 params_key.append(key)
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
     # Sort keys, None first.
-    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
+    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])): #按param_override是否为None排序，None排在前面；然后按param_override的tuple排序
         param_override_tuple, is_expert_parallel = key
-        params = params_map[key] if key in params_map else []
+        params = params_map[key] if key in params_map else [] #如果key不存在于params_map中，则params为空，说明这个key来源于其他的rank
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
         else:
-            param_override: ParamGroupOverride = {k: v for (k, v) in param_override_tuple}
+            param_override: ParamGroupOverride = {k: v for (k, v) in param_override_tuple} #把tuple类型的param_override还原为dict类型
 
         # False if param_group_override is None or empty tuple or if we do not modify the
         #  LR schedule.
@@ -388,7 +389,7 @@ def _get_param_groups(
         )
 
         # TODO: Remove "backwards compatible" fields below eventually.
-        default_config: ParamGroupOverride = {
+        default_config: ParamGroupOverride = { #基础default值
             'wd_mult': 1.0,
             'lr_mult': 1.0,
             'is_decoupled_lr': False,
@@ -405,9 +406,9 @@ def _get_param_groups(
             'is_expert_parallel': is_expert_parallel,
             'default_config': uses_default_lr_schedule,
             **default_config,
-            **param_override,  # keep **param_override last so that users can override other fields.
-        }
-        param_groups.append(param_group)
+            **param_override,  # keep **param_override last so that users can override other fields. #Python 的 ** 解包顺序决定了同名 key 时后者胜出,所以如果用户通过 config_overrides 给某组参数指定了 max_lr，它就会覆盖 default_config 中的 max_lr。如果没指定，就用 config.lr 作为默认 max_lr。
+        }#构建param_group字典
+        param_groups.append(param_group)#添加param_group到param_groups列表中
 
     return param_groups
 
@@ -437,14 +438,14 @@ def _get_param_groups_and_buffers(
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
     """
-    param_groups = _get_param_groups(model_chunks, config, config_overrides)
-    param_groups = list(filter(filter_fn, param_groups))
+    param_groups = _get_param_groups(model_chunks, config, config_overrides) #获取参数分组
+    param_groups = list(filter(filter_fn, param_groups)) #读取param_groups的is_expert_parallel属性来过滤不符合条件的参数组param group
     buffers = {}
     for model_chunk_idx, model_chunk in enumerate(model_chunks):
-        if hasattr(model_chunk, buffer_name):
-            buffers[model_chunk_idx + model_chunk_offset] = getattr(model_chunk, buffer_name)
+        if hasattr(model_chunk, buffer_name): #buffer_name="buffers"
+            buffers[model_chunk_idx + model_chunk_offset] = getattr(model_chunk, buffer_name) #获取model_chunk对应的buffer，_ParamAndGradBuffer包括grad和param的buffer
 
-    return param_groups, buffers
+    return param_groups, buffers #返回参数组和buffer
 
 
 def _get_megatron_optimizer_based_on_param_groups(
@@ -452,14 +453,14 @@ def _get_megatron_optimizer_based_on_param_groups(
     model_chunks: List[MegatronModule],
     param_groups: List,
     per_model_buffers: Optional[Dict[int, List[_ParamAndGradBuffer]]] = None,
-    model_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    model_parallel_group: Optional[torch.distributed.ProcessGroup] = None, #非分布式场景的优化器包装（不使用 DistributedOptimizer 时才走这条分支），用model_parallel_group来梯度统计
     data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_idx: Optional[int] = None,
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
-    distributed_optimizer_instance_id: Optional[int] = 0,
+    distributed_optimizer_instance_id: Optional[int] = 0, #tp_pp通信组的idx，每个 dp_group_idx key 对应一个 TP×PP 分片
     pg_collection: Optional[ProcessGroupCollection] = None,
-    skip_megatron_wrapping: bool = False,
+    skip_megatron_wrapping: bool = False, #是否跳过Megatron优化器的包装
 ) -> Union[MegatronOptimizer, Tuple[Optional[torch.optim.Optimizer], Optional[Callable]]]:
     """Get Megatron optimizer based on parameter groups.
 
@@ -499,7 +500,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     # hence an empty param_groups. However, we still need to create an optimizer
     # for the purposes of grad stats reductions.
     if param_groups:
-        if config.optimizer_cpu_offload:
+        if config.optimizer_cpu_offload: #如果需要offload优化器状态
             if torch.__version__ < '2.3.0':
                 warnings.warn(
                     "CPU offload is recommended for PyTorch >= 2.3.0, "
@@ -508,8 +509,8 @@ def _get_megatron_optimizer_based_on_param_groups(
             assert (
                 config.decoupled_weight_decay
             ), "CPU offloading only supported with decoupled_weight_decay enabled (AdamW mode)."
-            gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
-            cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
+            gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD #默认optimizer是Adam
+            cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD #默认optimizer是Adam
             if config.use_torch_optimizer_for_cpu_offload:
                 gpu_optimizer_cls = cpu_optimizer_cls
             if config.optimizer == 'adam':
@@ -541,11 +542,11 @@ def _get_megatron_optimizer_based_on_param_groups(
                 **optimizer_defaults,
             )
             init_state_fn = None
-        elif config.optimizer == 'adam':
+        elif config.optimizer == 'adam': #默认优化器是Adam
             kwargs = {
-                "params": param_groups,
-                "lr": config.lr,
-                "weight_decay": config.weight_decay,
+                "params": param_groups, #param_groups是param_group的列表，每个param_group是字典，包括params，is_expert_parallel，max_lr这些超参
+                "lr": config.lr, #传给优化器作为兜底的默认值
+                "weight_decay": config.weight_decay, #传给优化器作为兜底的默认值
                 "betas": (config.adam_beta1, config.adam_beta2),
                 "eps": config.adam_eps,
                 "capturable": config.optimizer_cuda_graph,
@@ -553,7 +554,7 @@ def _get_megatron_optimizer_based_on_param_groups(
 
             # set Adam class and weight decay mode depending
             # on source of optimizer (Torch or TE/Apex)
-            if USING_PYTORCH_OPTIMIZER:
+            if USING_PYTORCH_OPTIMIZER: #对于PyTorch的优化器，区分使用Adam还是AdamW
                 adam_cls = torch.optim.AdamW if config.decoupled_weight_decay else torch.optim.Adam
             else:
                 kwargs["adam_w_mode"] = config.decoupled_weight_decay
@@ -583,9 +584,9 @@ def _get_megatron_optimizer_based_on_param_groups(
                 if is_te_min_version("2.1.0.dev0"):
                     kwargs.update({"store_param_remainders": config.store_param_remainders})
 
-            optimizer = adam_cls(**kwargs)
+            optimizer = adam_cls(**kwargs) #根据优化器类型进行创建
 
-            def init_state_fn(opt, config=None):
+            def init_state_fn(opt, config=None): #初始化函数，可以调用阻止lazy初始化，提前完成初始化（初始化指创建优化器状态）
                 for group in opt.param_groups:
                     for p in group['params']:
                         if len(opt.state[p]) == 0:
@@ -628,14 +629,14 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = None
         init_state_fn = None
 
-    if skip_megatron_wrapping:
+    if skip_megatron_wrapping: #如果配置项skip_megatron_wrapping为True，则直接返回优化器和初始化状态函数
         return optimizer, init_state_fn
 
     # Mixed precision optimizer.
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
     #   from the MixedPrecisionOptimizer, which manages any optimizer where
     #   the model params and main params are distinct.
-    if config.fp16 or config.bf16 or config.use_distributed_optimizer:
+    if config.fp16 or config.bf16 or config.use_distributed_optimizer: #如果使用混合精度或者分布式优化器，进行Megatron封装
 
         # Grad scaler:
         #    if loss-scale is provided, instantiate the constant scaler.
@@ -646,7 +647,7 @@ def _get_megatron_optimizer_based_on_param_groups(
         grad_scaler = None
 
         # Constant loss scale.
-        if config.loss_scale:
+        if config.loss_scale: #构建grad_scaler对象
             grad_scaler = ConstantGradScaler(config.loss_scale)
 
         # Dynamic loss scale.
@@ -661,7 +662,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                     hysteresis=config.hysteresis,
                 )
 
-        optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
+        optimizer_args = [optimizer, config, grad_scaler, init_state_fn] #聚合优化器参数
         if config.use_distributed_optimizer:
             optimizer = DistributedOptimizer(
                 *optimizer_args,
@@ -671,17 +672,17 @@ def _get_megatron_optimizer_based_on_param_groups(
                 data_parallel_group_gloo=data_parallel_group_gloo,
                 data_parallel_group_idx=data_parallel_group_idx,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
-            )
+            )#DistributedOptimizer封装
             # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
             # weight gradients are all-reduced across optimizer instances, so each instance has
             # the duplicated weight gradients, need to reduce gradient stats inside each instance.
-            setattr(optimizer, 'grad_stats_parallel_group', intra_dist_opt_group)
+            setattr(optimizer, 'grad_stats_parallel_group', intra_dist_opt_group) #设置优化器的grad_stats_parallel_group属性为intra_dist_opt_group，后续用于梯度统计
         else:
-            optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
+            optimizer = Float16OptimizerWithFloat16Params(*optimizer_args) #fp16/bf16 非分布式场景的优化器包装（不使用 DistributedOptimizer 时才走这条分支），用model_parallel_group来梯度统计
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
     else:
         # FP32 optimizer.
-        optimizer = FP32Optimizer(optimizer, config, init_state_fn)
+        optimizer = FP32Optimizer(optimizer, config, init_state_fn) #最轻量的包装器，纯fp32训练，参数、梯度、优化器状态都是fp32
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
     if pg_collection is None or not hasattr(pg_collection, 'tp'):
@@ -689,7 +690,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     else:
         tp_group = pg_collection.tp
     # TODO(M4): plumb tp_group through optimizer constructors so this setattr disappears.
-    setattr(optimizer, 'tp_group', tp_group)
+    setattr(optimizer, 'tp_group', tp_group) #设置优化器的tp通信组
 
     return optimizer
 
@@ -707,7 +708,7 @@ def check_config_overrides_consistency(
             'overlap_param_gather_with_optimizer_step',
             'optimizer',
             'optimizer_cpu_offload',
-        ]
+        ] #对 config_overrides 做一致性校验，防止用户在 override 中修改了不该动的全局配置。
         for field_name in fields_to_check_for_consistency:
             base_field = getattr(config, field_name, None)
             all_config_overrides = list(config_overrides.values())
@@ -891,11 +892,11 @@ def get_megatron_optimizer(
     if config_overrides is None:
         config_overrides = get_standard_config_overrides(config)
 
-    check_config_overrides_consistency(config, config_overrides)
+    check_config_overrides_consistency(config, config_overrides) #对 config_overrides 做一致性校验，防止用户在 override 中修改了不该动的全局配置。
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
-    if config.optimizer not in ('adam', 'sgd'):
+    if config.optimizer not in ('adam', 'sgd'): #为新兴优化器（Muon、Lion、Soap 等）构建 Megatron 优化器。
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,
@@ -906,9 +907,9 @@ def get_megatron_optimizer(
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
-    if config.overlap_param_gather_with_optimizer_step:
-        all_dense_model_chunks = [[model_chunks[0]], model_chunks[1:]]
-        overlap_param_gather_with_optimizer_step_flags = [True, False]
+    if config.overlap_param_gather_with_optimizer_step: #如果指定优化器更新与参数gather通信重叠执行的话，就将model_chunk划分为第一个chunk和其他chunk，这里只做第一个chunk的gather和后续chunk优化器更新重叠，因为前传的时候第一个chunk是关键节点，其他的chunk的gather不会和优化器的更新重叠，会在前传的时候和前传重叠（overlap_param_gather_with_optimizer_step开启一定需要--overlap-param-gather开启）
+        all_dense_model_chunks = [[model_chunks[0]], model_chunks[1:]] #将模型chunk进行分组，第一个chunk和其他chunk分开
+        overlap_param_gather_with_optimizer_step_flags = [True, False] #第一个chunk重叠，其他chunk不重叠
     else:
         all_dense_model_chunks = [model_chunks]
         overlap_param_gather_with_optimizer_step_flags = [False]
@@ -916,7 +917,7 @@ def get_megatron_optimizer(
     # Setup process groups using helper method
     process_groups_dict = ProcessGroupCollection.setup_process_groups_for_optimizer(
         pg_collection, model_chunks, use_gloo_process_groups
-    )
+    )#设置优化器相关通信组
 
     dp_cp_group = process_groups_dict['dp_cp_group']
     intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
@@ -927,18 +928,18 @@ def get_megatron_optimizer(
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
 
-    model_parallel_rank = get_pg_rank(mp_group)
+    model_parallel_rank = get_pg_rank(mp_group) #确定在tp_pp通信组内的rank
 
-    if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
+    if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group): #如果有多个优化器实例
         inter_dist_opt_group = process_groups_dict['inter_dist_opt_group']
         distributed_optimizer_instance_id = get_pg_rank(inter_dist_opt_group)
     else:
         distributed_optimizer_instance_id = 0
 
     optimizers = []
-    model_chunk_offset = 0
+    model_chunk_offset = 0 #offset偏移
     ddp_config = model_chunks[0].ddp_config  # Use the first model chunk's DDP config
-    if ddp_config.use_megatron_fsdp:
+    if ddp_config.use_megatron_fsdp:#如果使用megatron fsdp
         for model_chunk, overlap_param_gather_with_optimizer_step in zip(
             all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
         ):
@@ -991,16 +992,16 @@ def get_megatron_optimizer(
         param_group_id = 0
     for dense_model_chunks, overlap_param_gather_with_optimizer_step in zip(
         all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
-    ):
+    ): #处理dense部分，按overlap_param_gather_with_optimizer_step对dense部分的model_chunk进行了分组
         param_groups, buffers = _get_param_groups_and_buffers(
             dense_model_chunks,
-            model_chunk_offset=model_chunk_offset,
+            model_chunk_offset=model_chunk_offset, # #model_chunk_offset 确保在多组 model chunks 场景下 key 全局唯一
             config=config,
             config_overrides=config_overrides,
             filter_fn=lambda g: not g['is_expert_parallel'],
             buffer_name='buffers',
-        )
-        for model_chunk in dense_model_chunks:
+        )#获取参数组和buffer
+        for model_chunk in dense_model_chunks:#对每个model_chunk赋值overlap_param_gather_with_optimizer_step
             model_chunk.overlap_param_gather_with_optimizer_step = (
                 overlap_param_gather_with_optimizer_step
             )
@@ -1013,10 +1014,10 @@ def get_megatron_optimizer(
 
         # Pass Gloo process groups into optimizer only if needed.
         optimizers.append(
-            _get_megatron_optimizer_based_on_param_groups(
+            _get_megatron_optimizer_based_on_param_groups( #构造优化器
                 config=config,
-                model_chunks=dense_model_chunks,
-                param_groups=param_groups,
+                model_chunks=dense_model_chunks, #模型分片列表
+                param_groups=param_groups, #模型分片列表中所有参数分组
                 per_model_buffers=buffers,
                 model_parallel_group=mp_group,
                 data_parallel_group=intra_dp_cp_group,
@@ -1027,7 +1028,7 @@ def get_megatron_optimizer(
                 pg_collection=pg_collection,
             )
         )
-        model_chunk_offset += 1
+        model_chunk_offset += 1 #按道理应该+= len(dense_model_chunks)，这里只加1，是因为model_chunk分组，只分为第一个chunk和其余chunk，所以第一个dense_model_chunks里面的model_chunk数量肯定为1
 
     moe_param_groups, moe_buffers = _get_param_groups_and_buffers(
         model_chunks,
@@ -1036,14 +1037,14 @@ def get_megatron_optimizer(
         config_overrides=config_overrides,
         filter_fn=lambda g: g['is_expert_parallel'],
         buffer_name='expert_parallel_buffers',
-    )
+    )#获取expert且ep的参数组和buffer
     if dump_param_to_param_group_map is not None:
         for param_group in moe_param_groups:
             for param in param_group["params"]:
                 param_name = get_global_unique_param_name(model_chunks, param)
                 param_to_param_group[param_name] = param_group_id
             param_group_id += 1
-    if len(moe_param_groups) > 0:
+    if len(moe_param_groups) > 0: #如果有expert且ep的参数
         expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
         # Pass Gloo process groups into optimizer only if needed.
         if use_gloo_process_groups:
@@ -1056,14 +1057,14 @@ def get_megatron_optimizer(
                 model_chunks=model_chunks,
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
-                model_parallel_group=expt_tp_pp_group,
-                data_parallel_group=intra_expt_dp_group,
+                model_parallel_group=expt_tp_pp_group, #非分布式优化器（不使用 DistributedOptimizer 时才走这条分支），用model_parallel_group来梯度统计
+                data_parallel_group=intra_expt_dp_group, #dp通信组
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
-                intra_dist_opt_group=intra_dist_opt_group,
+                intra_dist_opt_group=intra_dist_opt_group, #分布式优化器（使用 DistributedOptimizer 时才走这条分支），用model_parallel_group来梯度统计
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
-            )
+            )#添加expert且ep的优化器
         )
 
     if dump_param_to_param_group_map is not None:
@@ -1071,4 +1072,4 @@ def get_megatron_optimizer(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
 
-    return ChainedOptimizer(optimizers)
+    return ChainedOptimizer(optimizers) #把创建的多个优化器包装为ChainedOptimizer对象

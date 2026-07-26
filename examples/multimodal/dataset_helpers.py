@@ -152,12 +152,12 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         self.args = get_args()
 
-        self.tokenizer = get_tokenizer()
-        with open(self.args.prompt_path, "r") as f:
+        self.tokenizer = get_tokenizer() #获取tokenzier，之前设置了单例
+        with open(self.args.prompt_path, "r") as f:#加载manual_prompts提示词
             self.manual_prompts = json.load(f)
-        self.dataloader_seq_length = self.args.dataloader_seq_length  # Always return samples of this length.
-        self.packing_seq_length = self.args.packing_seq_length     # Packing sequence length, if packing is enabled.
-        self.is_packing_enabled = self.args.packing_buffer_size is not None and self.args.packing_buffer_size > 0
+        self.dataloader_seq_length = self.args.dataloader_seq_length  # Always return samples of this length. #Dataloader 输出的序列长度。无论原始样本长短，dataloader 始终返回这个长度的样本。
+        self.packing_seq_length = self.args.packing_seq_length     # Packing sequence length, if packing is enabled. #Packing 时的序列长度。启用 packing 时，多个小样本会被拼接到这个长度。
+        self.is_packing_enabled = self.args.packing_buffer_size is not None and self.args.packing_buffer_size > 0 #是否启用 packing
 
         if self.dataloader_seq_length and self.packing_seq_length:
             assert self.dataloader_seq_length >= self.packing_seq_length, "dataloader sequence length must be greater than or equal to the packing sequence length"
@@ -176,28 +176,28 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             self.args.use_tile_tags,
             self.args.max_num_tiles,
             self.args.tokenizer_prompt_format,
-        )
+        )#获取每个tile的token数量，一般图片不tile的话就是图片的token数量
 
         self.txt_to_token_dict = {}
 
-        self.img_h, self.img_w = self.args.img_h, self.args.img_w
-        self.img_token_id = self.tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
+        self.img_h, self.img_w = self.args.img_h, self.args.img_w #设置每个tile的尺寸，tile一定是正方形
+        self.img_token_id = self.tokenizer.convert_tokens_to_ids(IMAGE_TOKEN) #将 IMAGE_TOKEN（图片占位符 token）转换成 tokenizer 对应的 token ID，保存到 self.img_token_id。
         # This map is used to reduce the number of tiles used per image if the number of tokens is
         # larger than the decoder_seq_length.
-        self.num_tiles_degradation_map = {12:8, 8:6, 6:4, 4:2, 2:1, 1:1}
+        self.num_tiles_degradation_map = {12:8, 8:6, 6:4, 4:2, 2:1, 1:1} #降级映射表，用于在图片拼接（tiling）过程中，当 token 数量超出模型限制时，自动减少每个图片的 tile（图块）数量
 
-        self.find_closest_aspect_ratio_fn = (
+        self.find_closest_aspect_ratio_fn = (#函数定位：根据原图的宽高比，选择一个最优的 tile 布局（行数 × 列数）。find_closest_aspect_ratio只关心宽高比，选一个和目标最接近的布局。find_closest_area_weighted_aspect_ratio综合考虑面积覆盖和宽高比匹配，选一个综合得分最高的。
             find_closest_area_weighted_aspect_ratio if self.args.use_area_weighted_aspect_ratio
             else find_closest_aspect_ratio)
 
-        self.transform_img = ImageTransform(self.img_h, self.args.vision_model_type)
+        self.transform_img = ImageTransform(self.img_h, self.args.vision_model_type) #这里只传img_h因为tile只能是正方形。构造图像处理管道
 
-    def _get_total_seq_length(self, input_ids, num_tiles):
+    def _get_total_seq_length(self, input_ids, num_tiles): #len(input_ids) 文本 token 数（含 <image> 占位符）；total_num_tiles * self.num_image_embeddings_per_tile 所有图像的 embedding token 总数； - total_num_images 减去 <image> 占位符（因为被替换了）
         """Calculate expected sequence length given text tokens length and number of tiles."""
         total_num_images = len(num_tiles)
         total_num_tiles = sum(num_tiles)
         total_len = len(input_ids) + total_num_tiles * self.num_image_embeddings_per_tile - total_num_images
-        return total_len
+        return total_len #获得backbone输入的最终token数量
 
     def _truncate_for_packing(self, input_ids, target, num_tiles):
         """Truncate tokens and labels if they exceed packing sequence length."""
@@ -231,7 +231,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
             if "llava" in sample.__key__ or is_llava_training:
                 yield self.encode_llava_pretrain(sample)
-            else:
+            else: #走这里
                 yield self.encode_any_single_turn_vqa(sample)
         elif isinstance(sample, SimilarityInterleavedSample):
             yield self.encode_llava_sft(sample)
@@ -601,9 +601,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             imgs = self.transform_img(
                 sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles,
                 self.args.use_thumbnail, augment, find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
-            )
+            )#将样本里的图像数据预处理，输入是PIL格式，预处理之后是tensor
 
-        num_tiles = [len(imgs)]
+        num_tiles = [len(imgs)] #tile的数量
 
         if isinstance(sample, MultiChoiceVQASample):
             cur_prompt = format_multichoice_question(sample.context, sample.choices)
@@ -615,24 +615,24 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 prompt_list = self.manual_prompts["VQASFT"]["docvqa"]
             elif sample.__subflavors__.get("VQASFT"):
                 prompt_list = self.manual_prompts["VQASFT"]["raw"]
-            else:
+            else: #默认
                 prompt_list = ["{}"]
 
-            prompt_idx = np.random.randint(len(prompt_list))
-            cur_prompt = prompt_list[prompt_idx]
+            prompt_idx = np.random.randint(len(prompt_list)) #随机选一个 prompt 模板
+            cur_prompt = prompt_list[prompt_idx] # 取出模板
 
-            cur_prompt = cur_prompt.format(sample.context)
+            cur_prompt = cur_prompt.format(sample.context) # 填入问题文本
 
-            if IMAGE_TOKEN not in cur_prompt:
+            if IMAGE_TOKEN not in cur_prompt: #统一在输入prompt最前面加 <image> token
                 cur_prompt = IMAGE_TOKEN + "\n" + cur_prompt
 
-            if isinstance(sample.answers, list):
+            if isinstance(sample.answers, list):# 多答案
                 answer_list = sample.answers
-                weight_list = np.array(sample.answer_weights).astype(np.float32)
+                weight_list = np.array(sample.answer_weights).astype(np.float32)  # 按权重随机选一个
                 weight_list = weight_list / np.sum(weight_list)
                 answer_idx = np.random.choice(weight_list.shape[0], 1, p=weight_list)[0]
                 cur_answer = answer_list[answer_idx]
-            else:
+            else: # 单答案直接取
                 cur_answer = sample.answers
         else:
             raise NotImplementedError("Unsupported data type provided", sample)
@@ -643,7 +643,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             {"role": "assistant", "content": str(cur_answer)},
         ]
 
-        input_ids, target = self.tokenizer.tokenize_conversation(conversation, True, False)
+        input_ids, target = self.tokenizer.tokenize_conversation(conversation, True, False) #返回input_ids：模型输入（模型拿到完整的对话）；target 训练标签（system和user的输入被覆盖为IGNORE_INDEX，loss 只在 assistant 回复上计算，模型只学习"如何回答"，不会学到"如何提问"）
 
         if self.is_packing_enabled:
             input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles)
@@ -790,30 +790,30 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
     def batch(self, samples: List[Union[ImageTaskSample, ImageTaskSamplePacked]]) -> ImageTaskBatchPacked:
         # Stack images to [num_tiles, c, h, w]. If there are no images (text-only), then use a dummy image.
-        imgs = [img for s in samples for img in s.imgs]
+        imgs = [img for s in samples for img in s.imgs] # 把批次内所有样本的图展开，每个图就是一个tile的数据，这里展开没关系，后面会通过num_tiles来记录每个样本的tile数量，就可以确定每个tile属于哪一部分
         if len(imgs) > 0:
-            imgs = torch.stack(imgs)
+            imgs = torch.stack(imgs) # → [total_num_tiles, C, H, W]
         else:
             imgs = torch.tensor([[0]], dtype=torch.float32)
 
         # If the user hasn't defined a target dataloader sequence length, then use the max along the sample lengths.
-        max_seq_len = self.dataloader_seq_length
-        if not max_seq_len:
+        max_seq_len = self.dataloader_seq_length #确定 batch 内最大序列长度（需要所有样本统一序列长度，这里只是文本部分的，没有考虑图像的，因为图像要在encoder做）  # 如果用户通过 CLI 指定就用它
+        if not max_seq_len: # 否则取样本中最长的
            max_seq_len = max(len(s.tokens) for s in samples)
 
-        tokens = torch.full((len(samples), max_seq_len), self.tokenizer.pad, dtype=torch.int64)
+        tokens = torch.full((len(samples), max_seq_len), self.tokenizer.pad, dtype=torch.int64) #构造 Padding 后的 tokens 和 labels，预分配 tensor，全部填 pad token
         # +1 to accommodate shift to left by one later.
-        labels = torch.full((len(samples), max_seq_len + 1), self.tokenizer.pad, dtype=torch.int64)
+        labels = torch.full((len(samples), max_seq_len + 1), self.tokenizer.pad, dtype=torch.int64) # 构造 Padding 后的 tokens 和 labels，预分配 tensor，全部填 pad token。注意这里多了一个，后续next迭代器获取数据时会额外做左移一个token，这里还没有进行偏移
 
-        for i, s in enumerate(samples):
+        for i, s in enumerate(samples): #遍历样本
             # If the sample/target length exceeds the target sequence length, then truncate.
-            text_len = min(max_seq_len, len(s.tokens))
-            target_len = min(max_seq_len+1, len(s.labels))
+            text_len = min(max_seq_len, len(s.tokens)) # 截断到 max_seq_len
+            target_len = min(max_seq_len+1, len(s.labels)) # 截断到 max_seq_len+1
 
-            tokens[i, :text_len] = s.tokens[:text_len]
-            labels[i, :target_len] = s.labels[:target_len]
+            tokens[i, :text_len] = s.tokens[:text_len] # 左对齐填充，剩下的都是padding
+            labels[i, :target_len] = s.labels[:target_len] # 左对齐填充，剩下的都是padding
 
-        num_tiles = torch.tensor([n for s in samples for n in s.num_tiles], dtype=torch.int32)
+        num_tiles = torch.tensor([n for s in samples for n in s.num_tiles], dtype=torch.int32) #记录每个样本的tile数量
         if len(num_tiles) == 0:
             num_tiles = torch.tensor([[0]], dtype=torch.int32)
 
@@ -862,8 +862,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         )
 
     def encode_batch(self, batch: ImageTaskBatchPacked) -> dict:
-        raw = dataclasses.asdict(batch)
-        del raw["__subflavors__"]
+        raw = dataclasses.asdict(batch) #将 ImageTaskBatchPacked dataclass 对象转为普通 dict
+        del raw["__subflavors__"] #删掉 __subflavors__ 字段，因为它只是内部元数据（数据增强标记等），模型不需要
         return raw
 
     def select_samples_to_pack(self, samples: List[ImageTaskSample]) -> List[List[ImageTaskSample]]:

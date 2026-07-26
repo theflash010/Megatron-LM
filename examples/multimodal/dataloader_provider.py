@@ -28,19 +28,19 @@ def datasets_provider(task_encoder,worker_config=None):
     """Create multimodal train, validation and test datasets."""
     args = get_args()
 
-    dname = args.data_path[0] if type(args.data_path) is list else args.data_path
+    dname = args.data_path[0] if type(args.data_path) is list else args.data_path #数据集路径
     train_dataset = get_train_dataset(
         dname,
-        batch_size=args.micro_batch_size,
+        batch_size=args.micro_batch_size, #每个batch size是micro batch size
         task_encoder=task_encoder,
-        virtual_epoch_length=1000,
-        max_samples_per_sequence=100,
-        shuffle_buffer_size=100,
+        virtual_epoch_length=1000, #每个dp rank在一个epoch处理的样本数量
+        max_samples_per_sequence=100, #每个 sample-sequence 最多包含多少个样本。用于数据打包（packing），把多个短序列拼成一个长序列以提高训练效率。
+        shuffle_buffer_size=100, #蓄水池打乱算法使用的buffer大小
         worker_config=worker_config,
-        packing_buffer_size=args.packing_buffer_size,
+        packing_buffer_size=args.packing_ƒbuffer_size, #打包需要"等"。你不能来一个样本就打包一个——你得攒一批样本，看看哪些短的能拼到一起，以减少 padding。这里的buffer就是用来攒样本的，buffer_size就是累积样本数量（样本为单位）
         handler=print_error_handler,
         image_decode="pil",
-    )
+    )#创建Megatron Energon训练数据集
 
     val_datasets = get_val_datasets(
         dname,
@@ -93,22 +93,22 @@ def is_dataloader_rank():
 
 
 def train_valid_test_dataloaders_provider(train_val_test_num_samples, task_encoder=None):
-    """Build multimodal train, validation and test dataloaders."""
+    """Build multimodal train, validation and test dataloaders.""" #直接得到dataloder
     args = get_args()
     
     if task_encoder is None:
-        task_encoder = TaskEncoder()
+        task_encoder = TaskEncoder() #构造taskencoder对象
 
     # Dataloader is only on specific ranks.
-    if not is_dataloader_rank():
+    if not is_dataloader_rank(): #只有pp rank=0的ranks有dataloader，其他rank不需要dataloader
         return None, None, None
 
     worker_debug_path = None
     worker_log_level = 0
 
-    rank = parallel_state.get_data_parallel_rank()
-    world_size = parallel_state.get_data_parallel_world_size()
-    data_parallel_group = parallel_state.get_data_parallel_group()
+    rank = parallel_state.get_data_parallel_rank() #获取数据并行组的rank
+    world_size = parallel_state.get_data_parallel_world_size() #获取数据并行组的world size
+    data_parallel_group = parallel_state.get_data_parallel_group() #获取数据并行组
 
     worker_config = WorkerConfig(
         rank=rank,
@@ -117,10 +117,10 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples, task_encod
         data_parallel_group=data_parallel_group,
         worker_debug_path=worker_debug_path,
         worker_log_level=worker_log_level,
-    )
-    train_ds, valid_ds1, test_ds = datasets_provider(task_encoder, worker_config)
+    )#构建当前进程的worker_config
+    train_ds, valid_ds1, test_ds = datasets_provider(task_encoder, worker_config) #返回Megatron Energon训练、验证和测试数据集
 
-    train_dataloader = get_savable_loader(train_ds, worker_config=worker_config)
+    train_dataloader = get_savable_loader(train_ds, worker_config=worker_config) #创建SavableDataLoader对象（实际上就是PyTorch的DataLoader）
     if args.load is not None:
         if getattr(args, "dataloader_save", None):
             dp_rank = parallel_state.get_data_parallel_rank()
@@ -146,7 +146,7 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples, task_encod
     ]
     test_dataloader = None
 
-    return EnergonDataloader(train_dataloader), valid_dataloader, EnergonDataloader(test_dataloader)
+    return EnergonDataloader(train_dataloader), valid_dataloader, EnergonDataloader(test_dataloader) #封装一层返回
 
 
 class EnergonDataloader:

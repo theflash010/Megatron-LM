@@ -264,7 +264,7 @@ class MegatronMultimodalTokenizer:
         if not return_target:
             return tokens
 
-        target = tokens.copy()
+        target = tokens.copy() # 初始全保留
 
         # Mask system and user tokens in the target. mask掉system和user的输入token，不参数loss计算，mask是在target上
         idx = 0
@@ -284,7 +284,7 @@ class MegatronMultimodalTokenizer:
             turn_len = len(turn_tokens)
 
             role = turn["role"].lower()
-            if role in ("system", "user"): #用户的输入打上 [IGNORE_INDEX]，表明训练模型不需要关注这些 token
+            if role in ("system", "user"): #对target打上 [IGNORE_INDEX]，表明训练模型不需要关注这些 token
                 target[idx : idx + turn_len] = IGNORE_INDEX
             elif role == "assistant":
                 if IMAGE_TOKEN in turn["content"]:
@@ -301,7 +301,7 @@ class MegatronMultimodalTokenizer:
 
         assert idx == len(tokens), f"mismatch in target masking the conversation {conversation}"
 
-        return tokens, target
+        return tokens, target #tokens是模型输入（模型拿到完整的对话，理解上下文），target是训练标签（loss 只在 assistant 回复上计算，模型只学习"如何回答"，不会学到"如何提问"）
 
     def convert_tokens_to_ids(self, tokens: List[str]):
         """Convert tokens to IDs."""

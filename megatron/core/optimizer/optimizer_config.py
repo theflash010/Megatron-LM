@@ -192,7 +192,7 @@ class OptimizerConfig:
     store_param_remainders: bool = True
     """If true, store the 16-bit FP32 parameter remainders in the optimizer state, excluding the
         16 bits shared with the BF16 parameters. This lowers GPU memory usage. Defaults to True.
-    """
+    """ #不用 remainder：BF16 weight (2B) + FP32 master (4B)，一共6字节；用 remainder (store_param_remainders=True)：BF16 weight (2B) + int16 remainder (2B)，一共4字节。只要使用bf16就可以通过remainder来节省显存，主要就是降低冗余数据。
 
     main_grads_dtype: torch.dtype = torch.float32 #主梯度的 dtype。开启精度感知后，梯度可以降精度存（比如 torch.bfloat16），减少梯度通信和存储开销。
     """dtype of main grads when enabling precision-aware-optimizer"""
@@ -206,28 +206,28 @@ class OptimizerConfig:
     exp_avg_sq_dtype: torch.dtype = torch.float32 #Adam 方差（二阶矩）的 dtype。可降到 BF16。
     """dtype of exp_avg_sq when enabling precision-aware-optimizer"""
 
-    optimizer: str = 'adam'
+    optimizer: str = 'adam' #指定优化器名称
     """Optimizer name (e.g., 'adam', 'sgd', 'muon'). Can be overridden per-parameter group
     via config_overrides to use different optimizers for different parameters."""
 
     ###############
-    # Loss scaling
+    # Loss scaling #一般loss会由于过小而下溢，这里乘一个数（scale）来避免下溢，计算完梯度后需要除回来（unscale），计算结果没影响
     ###############
-    loss_scale: Optional[float] = None
+    loss_scale: Optional[float] = None #静态 loss scale。设为 2 的幂（如 128.0、1024.0），训练中固定不变。None（默认）→ 使用动态 loss scaling（自动调整）
     """Static loss scaling, positive power of 2 values can improve fp16 convergence. If None,
        dynamic loss scaling is used.
     """
 
-    initial_loss_scale: float = 2**32
+    initial_loss_scale: float = 2**32 #动态 loss scaling 的初始值。FP16 在反向传播前把 loss 乘上这个系数，防止梯度变成 0（下溢）。
     """Initial loss-scale for dynamic loss scaling."""
 
-    min_loss_scale: float = 1.0
+    min_loss_scale: float = 1.0 #动态 loss scale 的下界。当梯度频繁出现 inf/nan 时 scale 会逐渐降低，但不会低于这个值。
     """Minimum loss scale for dynamic loss scaling."""
 
-    loss_scale_window: float = 1000
+    loss_scale_window: float = 1000 #动态调整的观察窗口。如果连续 1000 个 iteration 都没有出现 inf/nan，就把 loss scale 翻倍；如果出现多次（次数由下面的hysteresis决定） inf/nan，就砍半并跳过该 iteration。
     """Window over which to raise/lower dynamic scale."""
 
-    hysteresis: int = 2
+    hysteresis: int = 2  #滞后阈值。用于减少 loss scale 因偶发 inf/nan 而剧烈震荡。出现 inf/nan 后，会连续 hysteresis 次都出现才真正降低 scale，偶发一次抖动不会触发降级。
     """Hysteresis for dynamic loss scaling."""
 
     ###################################################################################
@@ -247,7 +247,7 @@ class OptimizerConfig:
     adam_eps: float = 1e-08
     """Term added to the denominator to improve numerical stability in Adam optimizer."""
 
-    decoupled_weight_decay: bool = True
+    decoupled_weight_decay: bool = True #Adam vs AdamW 开关，True（默认）→ AdamW：weight decay 与梯度更新解耦。False → 原始 Adam：weight decay 融入梯度中一起更新，效果差，基本不用
     """If true, decouples weight decay from the gradient update, equivalent to AdamW. If false,
     original Adam update rule will be used. Defaults to True.
     """
@@ -318,23 +318,23 @@ class OptimizerConfig:
     #######################
     # Distributed optimizer
     #######################
-    use_distributed_optimizer: bool = False
+    use_distributed_optimizer: bool = False #是否使用分布式优化器
     """Distribute optimizer state over data-parallel replicas."""
 
-    use_layer_wise_distributed_optimizer: bool = False
+    use_layer_wise_distributed_optimizer: bool = False #是否使用分层分布式优化器
     """Use :class:`LayerWiseDistributedOptimizer` for emerging optimizers (e.g. Muon).
     When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
     arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
     that the standard distributed-optimizer path is not triggered."""
 
-    overlap_param_gather: bool = False
+    overlap_param_gather: bool = False #gather是否会和前传forward重叠，不同于DDP的overlap_param_gather，这里专门控制 fp8 场景下何时做量化拷贝。
     """If true, overlap param all-gather with forward compute. 
         This argument is intended to have the same value as the "overlap_param_gather" argument 
         in the "distributed_data_parallel_config.py" file. In the optimizer, this argument is 
         only used when "reuse_grad_buf_for_mxfp8_param_ag=True & fp8_param_gather=True".
     """
 
-    overlap_param_gather_with_optimizer_step: bool = False
+    overlap_param_gather_with_optimizer_step: bool = False #gather是否会和优化器更新重叠
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
     #######################
@@ -366,15 +366,15 @@ class OptimizerConfig:
     """If True, pin the optimizer parameters to CPU memory."""
 
     ################
-    # Miscellaneous
+    # Miscellaneous #杂项
     ################
-    clip_grad: float = 1.0
+    clip_grad: float = 1.0 #全局 L2 梯度裁剪阈值。每步更新前把所有参数的梯度拼接成一个向量，计算其 L2 范数，如果超过 clip_grad 则等比缩放回去
     """Gradient clipping based on global L2 norm."""
 
-    log_num_zeros_in_grad: bool = False
+    log_num_zeros_in_grad: bool = False #梯度零值统计。如果开启，每个 step 计算梯度中有多少个零值并记录到日志。用于诊断梯度消失/梯度死亡问题（如 ReLU 导致的 dead neurons），但会引入额外计算开销，所以默认关闭。
     """If true, calculate and log the number of zeros in gradient."""
 
-    barrier_with_L1_time: bool = False
+    barrier_with_L1_time: bool = False #时间测量同步屏障。开启后，在 optimizer 内部的时间测量点（如 optimizer-copy-main-to-model-params 等 timer）会插入 torch.cuda.synchronize() barrier，确保计时精确。代价是每步多一次同步，影响吞吐，仅调试性能时开。
     """If true, use barrier with level 1 time measurements."""
 
     timers: Optional[Callable] = None
@@ -383,7 +383,7 @@ class OptimizerConfig:
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
 
-    optimizer_cuda_graph: bool = False
+    optimizer_cuda_graph: bool = False #CUDA Graph 加速。开启后 optimizer step 会用 CUDA Graph 捕获并重放，减少 kernel launch 开销。对参数量大但计算规律固定的场景有效（大模型 LLM 训练），可以节省几个百分点的 step 时间。但要求 step 计算图固定不变（不能有条件分支动态变化）。
     """If true, enables CUDA graph for optimizer step."""
 
     def __post_init__(self):
@@ -470,5 +470,5 @@ class OptimizerConfig:
 
 
 # Backward-compatible aliases (deprecated; use OptimizerConfig directly).
-AdamOptimizerConfig = OptimizerConfig
+AdamOptimizerConfig = OptimizerConfig #别名
 SGDOptimizerConfig = OptimizerConfig

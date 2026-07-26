@@ -463,7 +463,7 @@ class MegatronOptimizer(ABC):
 
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
-    """Base class for both the float-16 and the distributed optimizer.
+    """Base class for both the float-16 and the distributed optimizer. #MixedPrecisionOptimizer 只负责梯度后处理（unscale + check inf/nan），而精度转换的逻辑下沉到了子类。名字取大了，内容没有跟上
 
     Args:
         optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
@@ -486,8 +486,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        super().__init__(optimizer, config, init_state_fn)
-        self.grad_scaler = grad_scaler
+        super().__init__(optimizer, config, init_state_fn) #设置optimizer，config，init_state_fn
+        self.grad_scaler = grad_scaler #设置grad_scaler
 
         # None grad scaler is only supported for bf16.
         if self.grad_scaler is None:
@@ -497,7 +497,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # Any non-zero value indicates inf/nan.
         # Note that we keep this for the cases that grad scaler is none.
         # We still record nan/inf if we have a bfloat16 with a grad scaler.
-        if self.grad_scaler:
+        if self.grad_scaler: #Found-Inf 张量（检测梯度溢出），当使用 grad_scaler（梯度缩放器，通常是 AMP 场景）时，创建一个 found_inf 张量记录是否出现 inf/nan。初始值为 0.0，表示未检测到溢出；如果某个操作发现 inf/nan，会将其设为非零。
             self.found_inf = torch.tensor([0.0], dtype=torch.float, device='cuda')
 
         # Dummy tensor needed for apex multi-apply tensor.
@@ -509,7 +509,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
 
         # In case grad scaler is not passed, define the unity scale.
-        if self.grad_scaler is None:
+        if self.grad_scaler is None: #当没有传入 grad_scaler 时（例如直接使用 bf16 训练，不需要动态缩放），定义一个恒为 1.0 的缩放因子张量。
             self._scale_one = torch.tensor([1.0], dtype=torch.float, device='cuda')
 
     def get_loss_scale(self):
@@ -699,13 +699,13 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                             float16_params_this_group.append(param)
                             # Create a copy
-                            main_param = param.detach().clone().float()
+                            main_param = param.detach().clone().float() #创建fp32主参数
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                             if hasattr(param, 'shared'):
                                 main_param.shared = param.shared
                             # Replace the optimizer params with the new fp32 copy.
-                            param_group['params'][i] = main_param
+                            param_group['params'][i] = main_param #覆盖param_group中的params
 
                             # Store handle to main_param.
                             param.main_param = main_param
@@ -1117,7 +1117,7 @@ class ChainedOptimizer(MegatronOptimizer):
         # has no trainable parameters
         if chained_optimizers:
             self.config = getattr(chained_optimizers[0], 'config', None)
-            for optimizer in chained_optimizers:
+            for optimizer in chained_optimizers:#把每个优化器的model chunk收集到self.model_chunks列表
                 if hasattr(optimizer, 'model_chunks'):
                     for model_chunk in optimizer.model_chunks:
                         if model_chunk not in self.model_chunks:
@@ -1286,7 +1286,7 @@ class ChainedOptimizer(MegatronOptimizer):
         success = True
         for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
             success &= optimizer.step_with_ready_grads()
-            if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
+            if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0: #只有第一个优化器会step完立刻async gather，和后几个optimizer step重叠
                 assert success
                 assert len(optimizer.model_chunks) == 1
                 optimizer.model_chunks[0].start_param_sync(force_dispatch=True)

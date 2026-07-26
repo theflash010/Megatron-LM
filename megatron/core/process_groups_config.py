@@ -370,7 +370,7 @@ class ProcessGroupCollection:
             # 4. Handle intra_dp_cp, intra_expt_dp, and inter_dist_opt based on optimizer instances
             if hasattr(model_chunks[0], 'ddp_config'):
                 ddp_config = model_chunks[0].ddp_config
-                if ddp_config.num_distributed_optimizer_instances == 1:
+                if ddp_config.num_distributed_optimizer_instances == 1: #判断是否有多个优化器实例
                     # With a single optimizer instance:
                     # - intra_dp_cp is same as dp_cp
                     # - intra_expt_dp is same as expt_dp
@@ -439,13 +439,13 @@ class ProcessGroupCollection:
         return {
             'dp_group': dp_group,
             'dp_cp_group': dp_cp_group,
-            'intra_dp_cp_group': intra_dp_cp_group,
+            'intra_dp_cp_group': intra_dp_cp_group, #dense部分的优化器实例内部切分的通信组
             'expt_dp_group': expt_dp_group,
-            'intra_expt_dp_group': intra_expt_dp_group,
+            'intra_expt_dp_group': intra_expt_dp_group, #expert部分的优化器实例内部切分的通信组
             'mp_group': mp_group,
             'expt_tp_pp_group': expt_tp_pp_group,
-            'inter_dist_opt_group': inter_dist_opt_group,
-            'intra_dist_opt_group': intra_dist_opt_group,
+            'inter_dist_opt_group': inter_dist_opt_group, #用于allreduce获取跨优化器实例的梯度
+            'intra_dist_opt_group': intra_dist_opt_group, #这个通信组中所有rank的优化器状态组成一个优化器实例
             'intra_dp_cp_group_gloo': intra_dp_cp_group_gloo,
             'intra_expt_dp_group_gloo': intra_expt_dp_group_gloo,
         }

@@ -1394,7 +1394,7 @@ class _ParamAndGradBuffer:
     def reset(self):
         """
         Zero out the underlying grad_buffer.
-        """
+        """ #只会reset grad_buffer，不会reset param_buffer
         self.grad_data.zero_()
         for grad in self.extra_main_grads:
             grad.zero_()

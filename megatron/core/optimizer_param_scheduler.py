@@ -67,13 +67,13 @@ def param_group_override_to_tuple(
     """
     if param_group_override is None:
         return None
-    return tuple(sorted(param_group_override.items()))
+    return tuple(sorted(param_group_override.items())) #把dict类型的param_group_override转换为tuple类型，可以作为key使用，因为dict是不可哈希的
 
 
 def combine_param_group_overrides(
     param_group_overrides: list[ParamGroupOverride | None],
 ) -> ParamGroupOverride:
-    """Combine a list of param group overrides into a single param group override.
+    """Combine a list of param group overrides into a single param group override. #将多个超参数重覆盖规则合并为一个，如果有冲突就报错
 
     This function ensures that the overrides are not conflicting as well.
 

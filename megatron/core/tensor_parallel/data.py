@@ -66,18 +66,18 @@ def broadcast_data(keys, data, datatype, tp_group=None):
     members of the same model parallel group.
 
     Args:
-        keys: list of keys in the data disctionary to be broadcasted
-        data: data dictionary of string keys and cpu tensor values.
+        keys: list of keys in the data disctionary to be broadcasted #要广播的 key 列表
+        data: data dictionary of string keys and cpu tensor values.  #数据，只有 TP rank 0 持有具体值，键是字符串，值是对应的张量
         datatype: torch data type of all tensors in data associated
                   with keys.
         tp_group: the tensor model parallel group to broadcast to.
     """
     # Build (key, size) and (key, number of elements) dictionaries along
     # with the total number of elements on all ranks.
-    key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(keys, data)
+    key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(keys, data) #key_size代表每个数据的shape，key_numel代表每个数据的numel，total_numel代表所有数据的numel总和
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
     # Pack on rank zero.
-    if tp_group.rank() == 0:
+    if tp_group.rank() == 0: #TP rank 0 打包；其他 rank 开空 buffer
         # Check that all keys have the same data type.
         _check_data_types(keys, data, datatype)
         # Flatten the data associated with the keys
@@ -85,7 +85,7 @@ def broadcast_data(keys, data, datatype, tp_group=None):
     else:
         flatten_data = torch.empty(total_numel, device=torch.cuda.current_device(), dtype=datatype)
 
-    # Broadcast
+    # Broadcast #从 TP group 的 rank 0 广播到整组。
     group_ranks = torch.distributed.get_process_group_ranks(group=tp_group)
     torch.distributed.broadcast(flatten_data, group_ranks[0], group=tp_group)
 
@@ -95,7 +95,7 @@ def broadcast_data(keys, data, datatype, tp_group=None):
     for key in keys:
         size = key_size[key]
         numel = key_numel[key]
-        output[key] = flatten_data.narrow(0, offset, numel).view(size)
+        output[key] = flatten_data.narrow(0, offset, numel).view(size) #tensor.narrow(dim, start, length) 是 PyTorch 的切片操作，在指定维度上取一段连续子 tensor。得到子 tensor之后重塑形状
         offset += numel
 
     return output

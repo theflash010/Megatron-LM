@@ -671,7 +671,7 @@ class GPTModel(LanguageModule):
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
+        ) #通过lm head层，计算logits，没有进行softmax
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
@@ -701,7 +701,7 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        loss = self.compute_language_model_loss(labels, logits) #计算交叉熵，先softmax然后计算交叉熵
 
         return loss
 

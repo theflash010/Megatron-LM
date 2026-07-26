@@ -249,7 +249,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.nccl_ub,
                 pg_collection,
                 param_layout=param_layout,
-            )#按照param_layout构造_ParamAndGradBuffer对象
+            )#按照param_layout构造_ParamAndGradBuffer对象，包含grad和param的buffer
             if buffer_key.is_expert_parallel: #将buffer添加到属性中
                 self.expert_parallel_buffers.append(buffer)
             else:
@@ -575,7 +575,7 @@ class DistributedDataParallel(_BaseDataParallel):
             for param in self.params_with_grad:
                 param.grad_added_to_main_grad = False
         for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.reset()
+            buffer.reset() #只会reset grad_buffer，不会reset param_buffer
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.reset()
 

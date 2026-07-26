@@ -66,18 +66,18 @@ class ImageTransform:
     """Image transformation."""
 
     def __init__(self, input_size, vision_model_type):
-        self._transform = _build_transform(input_size, vision_model_type)
-        self._vision_model_type = vision_model_type
+        self._transform = _build_transform(input_size, vision_model_type) #构建tile图像数据处理管道
+        self._vision_model_type = vision_model_type #保存模型类型
 
     def __call__(self, img, img_h, img_w, use_tiling=False, max_num_tiles=1, use_thumbnail=False, augment=False, find_closest_aspect_ratio_fn=find_closest_aspect_ratio):
         assert not augment, "Image augmentation not implemented."
-        if use_tiling:
+        if use_tiling: #如果使用tile进行处理
             assert img_h == img_w, "dynamic tiling expects equal tile height and width"
             imgs = dynamic_preprocess(
                 img, min_num=1, max_num=max_num_tiles, image_size=img_h, use_thumbnail=use_thumbnail,
-                find_closest_aspect_ratio_fn=find_closest_aspect_ratio_fn)
-            imgs = [self._transform(img) for img in imgs]
-        else:
+                find_closest_aspect_ratio_fn=find_closest_aspect_ratio_fn) #动态切分图像为多个tile
+            imgs = [self._transform(img) for img in imgs] #对每个tile图像进行处理
+        else: #不tile，直接对图像进行处理
             imgs = [self._transform(img)]
 
         return imgs
@@ -89,38 +89,38 @@ def dynamic_preprocess(
     image, min_num=1, max_num=6, image_size=448, use_thumbnail=False,
     find_closest_aspect_ratio_fn=find_closest_aspect_ratio):
     orig_width, orig_height = image.size
-    aspect_ratio = orig_width / orig_height
+    aspect_ratio = orig_width / orig_height #原始分辨率
 
     # calculate the existing image aspect ratio
     target_ratios = set(
         (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
-        i * j <= max_num and i * j >= min_num)
+        i * j <= max_num and i * j >= min_num) #遍历tile数量从min_num到max_num，生成所有可能的 (行tile数量, 列tile数量) 组合，每个tile都是正方形，所以这里的行tile数量，列tile数量就可以代表分辨率
     target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
 
     # find the closest aspect ratio to the target
-    target_aspect_ratio = find_closest_aspect_ratio_fn(
+    target_aspect_ratio = find_closest_aspect_ratio_fn( #计算每个候选的宽高比（行/列），和原图宽高比（1600/600≈2.67）做比较，找到最接近的那一个。
         aspect_ratio, target_ratios, orig_width, orig_height, image_size)
 
-    # calculate the target width and height
-    target_width = image_size * target_aspect_ratio[0]
-    target_height = image_size * target_aspect_ratio[1]
-    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+    # calculate the target width and height #计算目标尺寸
+    target_width = image_size * target_aspect_ratio[0] #行数x每个tile尺寸
+    target_height = image_size * target_aspect_ratio[1] #列数x每个tile尺寸
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1] #需要的tile总数（行数x列数）
 
-    # resize the image
+    # resize the image #resize图像到目标尺寸
     resized_img = image.resize((target_width, target_height))
     processed_images = []
-    for i in range(blocks):
+    for i in range(blocks): #将图像切分成tile
         box = (
             (i % (target_width // image_size)) * image_size,
             (i // (target_width // image_size)) * image_size,
             ((i % (target_width // image_size)) + 1) * image_size,
             ((i // (target_width // image_size)) + 1) * image_size
-        )
+        )#计算当前tile的范围
         # split the image
-        split_img = resized_img.crop(box)
-        processed_images.append(split_img)
+        split_img = resized_img.crop(box) #按照范围crop图像
+        processed_images.append(split_img)#将单个tile图片加入processed_images
     assert len(processed_images) == blocks
-    if use_thumbnail and len(processed_images) != 1:
+    if use_thumbnail and len(processed_images) != 1: #（可选）：加缩略图，如果 use_thumbnail=True，把原图直接 resize 到 (image_size, image_size) 作为第 4 个 tile，作为全局视觉补充。
         thumbnail_img = image.resize((image_size, image_size))
         processed_images.append(thumbnail_img)
     return processed_images
@@ -139,14 +139,14 @@ def _build_transform(input_size, vision_model_type):
             T.Normalize(mean=pixel_mean, std=pixel_std)
         ])
     elif vision_model_type == "clip":
-        pixel_mean, pixel_std = pixel_statistics[vision_model_type]
+        pixel_mean, pixel_std = pixel_statistics[vision_model_type] #确定对图像像素进行normalize的mean和std
 
         transform = Compose([
             T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
             T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
             T.ToTensor(),
             T.Normalize(mean=pixel_mean, std=pixel_std),
-        ])
+        ])#定义数据处理管道，resize，normalize
     elif vision_model_type.startswith("hf://"):
         from megatron.core.models.huggingface.module import get_hf_model_type
 

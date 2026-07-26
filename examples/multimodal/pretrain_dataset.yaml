@@ -2,8 +2,8 @@ __module__: megatron.energon
 __class__: Metadataset
 splits:
   train:
-    datasets:
-      - weight: 1.
+    datasets: # → MetadatasetBlender.datasets: List[DatasetReference]
+      - weight: 1.  #第1个 DatasetReference 对象
         path: /root/paddlejob/pfsl3-intern-public/zhangnan/zn_data/dataset/wds/sharegpt4v
         subflavors:
           augmentation: false

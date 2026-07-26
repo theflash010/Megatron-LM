@@ -203,7 +203,7 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
     if release:
         directory = 'release'
     else:
-        directory = 'iter_{:07d}'.format(iteration)
+        directory = 'iter_{:07d}'.format(iteration) #目录名
     if return_base_dir:
         common_path = os.path.join(checkpoints_path, directory)
         return common_path
@@ -222,7 +222,7 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
 
     # Use both the tensor and pipeline MP rank. If using the distributed
     # optimizer, then the optimizer's path must additionally include the
-    # data parallel rank.
+    # data parallel rank. #确定这个进程需要加载的rank目录
     if not pipeline_parallel:
         common_path = os.path.join(checkpoints_path, directory,
                             f'mp_rank_{tensor_rank:02d}')
@@ -233,7 +233,7 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
     if expert_parallel:
         common_path = common_path + f'_{expert_rank:03d}'
 
-    return os.path.join(common_path, basename)
+    return os.path.join(common_path, basename) #合并，最终需要加载的检查点目录
 
 
 def get_load_checkpoint_path_by_args(args, load_arg="load"):
@@ -1249,7 +1249,7 @@ def _load_global_dist_base_checkpoint(
 
 
 def _get_checkpoint_format(checkpoint_name, args):
-    """Get the format of an existing checkpoint."""
+    """Get the format of an existing checkpoint.""" #通过检查 checkpoint_name 目录下有哪些文件/子目录来判断ckpt_format
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
         checkpoint_dir = msc.Path(checkpoint_name)
@@ -1293,12 +1293,12 @@ def _load_base_checkpoint(
     )
     non_persistent_iteration = _get_non_persistent_iteration(
         non_persistent_global_dir, args, checkpointing_context
-    )
-    iteration, release = -1, False
+    )#获取非持久化的iteration轮数
+    iteration, release = -1, False #iteratio就是第几轮，release 是一种特殊标记，表示这个 checkpoint 是发布版本，不是某个 iteration 的中间检查点，一般是false
     tracker_filename = 'because load directory is not defined'
     if load_dir is not None:
-        tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if isfile(tracker_filename):
+        tracker_filename = get_checkpoint_tracker_filename(load_dir) #如果 load_dir 不为空，构造 tracker 文件路径：{load_dir}/latest_checkpointed_iteration.txt
+        if isfile(tracker_filename): #检查 tracker 文件是否存在于磁盘上，存在则用 read_metadata() 读取内容
             iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
@@ -1307,9 +1307,9 @@ def _load_base_checkpoint(
 
     # Record the iteration loaded (stored separately from args to avoid
     # polluting checkpoints, since args is saved in checkpoints).
-    set_loaded_iteration(iteration)
+    set_loaded_iteration(iteration) #保存一下 iteration
 
-    if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
+    if non_persistent_iteration != -1:  # there is a non-persistent checkpoint #如果是非持久化检查点
         if non_persistent_iteration >= iteration:
             return _load_non_persistent_base_checkpoint(
                 non_persistent_global_dir,
@@ -1338,8 +1338,8 @@ def _load_base_checkpoint(
         return None, "", False, None
 
     # Determine the type of the checkpoint on disk.
-    checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
-    ckpt_format = _get_checkpoint_format(checkpoint_name, args)
+    checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True) #确定该进程对应的最终检查点目录
+    ckpt_format = _get_checkpoint_format(checkpoint_name, args) ##通过检查 checkpoint_name 目录下有哪些文件/子目录来判断ckpt_format
 
     if not rank0:
         dist_infix = "distributed " if ckpt_format == "torch_dist" else ""
@@ -1360,12 +1360,12 @@ def _load_base_checkpoint(
     elif ckpt_format == "torch":
         ckpt_type = CheckpointType.LEGACY
         # Handle global legacy checkpoint
-        if rank0:
-            checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
+        if rank0: #如果rank0=True
+            checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)#尝试找到 rank 0 对应的 checkpoint 文件/目录
         else:
-            checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=False)
+            checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=False) #确定该进程对应的最终检查点目录
         try:
-            state_dict = torch.load(checkpoint_name, map_location='cpu')
+            state_dict = torch.load(checkpoint_name, map_location='cpu')#直接调用torch的load进行加载，无论 checkpoint 原来是在什么设备（GPU）上保存的，都先把参数加载到 CPU 内存中。
         except ModuleNotFoundError:
             from megatron.legacy.fp16_deprecated import loss_scaler
 
@@ -1622,23 +1622,23 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
     """
     args = get_args()
-    load_dir = getattr(args, load_arg)
+    load_dir = getattr(args, load_arg) #load的路径
 
     # Finetuning directories
-    pretrained_dir = getattr(args, 'pretrained_checkpoint', None)
-    if pretrained_dir is not None and not checkpoint_exists(load_dir):
+    pretrained_dir = getattr(args, 'pretrained_checkpoint', None) #pretrained_checkpoint的路径
+    if pretrained_dir is not None and not checkpoint_exists(load_dir): #如果load没有但是pretrained_checkpoint有，则使用pretrained_checkpoint的路径
         print_rank_0(
             f'Checkpoint file not found in load directory {load_dir} attempting to finetune with checkpoint in {pretrained_dir}'
         )
-        load_dir = pretrained_dir
+        load_dir = pretrained_dir #使用pretrained_checkpoint的路径
         if not checkpoint_exists(load_dir):
             raise FileNotFoundError("No checkpoint found in load directory or pretrained directory")
-        args.finetune = True
+        args.finetune = True #设置为finetune模式，这样除了参数之外的检查点数据（如优化器状态）不会被load
 
-    model = unwrap_model(ddp_model)
+    model = unwrap_model(ddp_model) #获取模型本体，去除DDP等包装器
 
     ckpt_format = args.ckpt_format
-    if args.auto_detect_ckpt_format or ckpt_format == "torch_dist":
+    if args.auto_detect_ckpt_format or ckpt_format == "torch_dist": #auto_detect_ckpt_format默认为false
         state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
             load_dir,
             args,
@@ -1846,7 +1846,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
         load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
         **load_kwargs
-    )
+    )#加载这个进程的检查点数据，确定检查点的版本，检查点文件的ckpt_type
 
     # Checkpoint not loaded.
     if state_dict is None:
@@ -1857,14 +1857,14 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
     # Convert to regular torch tensor to DTensor.
-    if ckpt_type == CheckpointType.LEGACY and args.ckpt_format == "torch_dcp":
+    if ckpt_type == CheckpointType.LEGACY and args.ckpt_format == "torch_dcp": #如果磁盘上的 checkpoint 文件是旧的 torch 格式，args.ckpt_format来自用户传的命令行参数表示模型本身已经按 DTensor 分布创建好了，所以这里要转换为 DTensor
         dtensor_state_dict = _to_dtensor(ddp_model, state_dict["model"])
         state_dict["model"] = dtensor_state_dict
 
     # Set iteration.
-    if args.finetune or release:
+    if args.finetune or release: #对于fintune，设定iteration=0
         iteration = 0
-    else:
+    else: #对于继续训练，设定iteration=检查点中的iteration
         try:
             iteration = state_dict['iteration']
         except KeyError:
@@ -1876,7 +1876,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 sys.exit()
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
-    # Check arguments.
+    # Check arguments. #恢复训练的args参数（训练进度相关的计数器）
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
         check_checkpoint_args(checkpoint_args)
@@ -1890,7 +1890,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 
-    def load_model_state_dict(module, state_dict, strict: bool):
+    def load_model_state_dict(module, state_dict, strict: bool): #将state_dict加载到model中
         """Helper function to load state dict with fallback for missing extra states."""
         try:
             module.load_state_dict(state_dict, strict=strict)
@@ -1901,9 +1901,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 print(f"load_return: {load_return}")
     # Model.
     if not skip_load_to_model_and_opt:
-        if len(ddp_model) == 1:
+        if len(ddp_model) == 1: #只有一个模型分片
             load_model_state_dict(ddp_model[0], state_dict['model'], strict)
-        else:
+        else: #如果有多个模型分片
             for i in range(len(ddp_model)):
                 # If there is no corresponding model in the state_dict, it will be ignored.
                 # It means that this is an empty stage.
@@ -1930,7 +1930,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
             is_torch_dist = ckpt_format == "torch_dist"
-            if args.use_distributed_optimizer and not is_torch_dist and ckpt_format not in ["torch_dcp", "fsdp_dtensor"]:
+            if args.use_distributed_optimizer and not is_torch_dist and ckpt_format not in ["torch_dcp", "fsdp_dtensor"]: #DistributedOptimizer 把优化器状态分成两部分存储，所以需要两次加载。上面的第 1 次加载（L1927-1928）：标准优化器状态（包含：学习率、step 计数、beta 值等元数据）。这里第 2 次加载（L1944-1945）：分片的参数状态，加载 DP rank 分片的实际优化器参数状态（fp32 master weights、exp_avg、exp_avg_sq 等）
                 # NOTE: this is a manual read of the tracker file.
                 # This code should not be reached when reading from a non_persistent checkpoint
                 assert not is_torch_dist
@@ -1945,7 +1945,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                                                update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format)
 
             # Load scheduler.
-            if opt_param_scheduler is not None:
+            if opt_param_scheduler is not None: #加载scheduler
                 if 'lr_scheduler' in state_dict: # backward compatbility
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
@@ -1963,7 +1963,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             else:
                 optimizer.reload_model_params()
 
-    # rerun state
+    # rerun state #加载rerun状态
     if not ignore_rerun_state:
         try:
             if 'rerun_state_machine' in state_dict:
@@ -1971,7 +1971,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         except Exception as e:
             print_rank_0(f"Unable to restore RerunMachine from checkpoint: {e}. Skipping.")
 
-    # rng states.
+    # rng states. #加载rng状态
     if not release and not args.finetune and not args.no_load_rng and not ignore_rng_state:
         try:
             cuda_rng_tracker = tensor_parallel.get_cuda_rng_tracker()
@@ -2059,7 +2059,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     print_rank_0(">>> Inserting 'default_config' field into optimizer.param_groups...")
                 log_printed = True
 
-    return iteration, num_floating_point_operations_so_far
+    return iteration, num_floating_point_operations_so_far #返回迭代次数和浮点运算次数（num_floating_point_operations_so_far用于计算训练吞吐量）
 
 
 def _to_dtensor(wrapped_model, model_state_dict):

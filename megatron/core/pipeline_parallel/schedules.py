@@ -47,7 +47,7 @@ Shape = Union[List[int], torch.Size]
 
 def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
     """Retrieves the appropriate forward_backward function given the
-    configuration of parallel_state.
+    configuration of parallel_state. #根据 PP 大小返回不同的PP调度函数
 
     Returns a function that will perform all of the forward and
     backward passes of the model given the pipeline model parallel
@@ -146,11 +146,11 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
 
     if pp_size > 1:
         if vp_size is not None:
-            forward_backward_func = forward_backward_pipelining_with_interleaving
+            forward_backward_func = forward_backward_pipelining_with_interleaving #交错的 1F1B：多个虚拟 stage 轮流执行，进一步减小空泡
         else:
-            forward_backward_func = forward_backward_pipelining_without_interleaving
+            forward_backward_func = forward_backward_pipelining_without_interleaving #1F1B：forward 和 backward 交错，减少空泡
     else:
-        forward_backward_func = forward_backward_no_pipelining
+        forward_backward_func = forward_backward_no_pipelining #顺序：N 个 micro batch 依次 forward，再依次 backward
     return forward_backward_func
 
 
@@ -264,17 +264,17 @@ def forward_step_calc_loss(
         if loss_func is None:
             forward_data_store.append(output_tensor)
         elif not collect_non_loss_data:
-            outputs = loss_func(output_tensor)
-            if len(outputs) == 3:
+            outputs = loss_func(output_tensor) #loss_func 返回的是裸 sum（torch.sum(losses * loss_mask)）
+            if len(outputs) == 3: #loss_func是per-token模式
                 output_tensor, num_tokens, loss_reduced = outputs
                 if not config.calculate_per_token_loss:
                     # Protect against division by zero when all tokens are masked
                     #   in a microbatch.
-                    output_tensor /= torch.clamp(num_tokens, min=1)
-                    output_tensor /= num_microbatches
+                    output_tensor /= torch.clamp(num_tokens, min=1) #得到 per-token 平均 loss（如果开了CP，那只包括自己处理的那部分token的平均loss，后面有地方会聚合loss）
+                    output_tensor /= num_microbatches #/ num_microbatches → 梯度累积平均，每个 microbatch 贡献 1/N 的梯度
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
-                assert len(outputs) == 2
+                assert len(outputs) == 2 #老版本不用管
                 output_tensor, loss_reduced = outputs
                 output_tensor *= cp_group_size
                 output_tensor /= num_microbatches
@@ -327,7 +327,7 @@ def forward_step(
     data_iterator,
     model,
     num_microbatches,
-    input_tensor,
+    input_tensor, #其他stage前传过来的激活值，对于第一个stage是 None
     forward_data_store,
     config,
     cp_group_size,
@@ -337,7 +337,7 @@ def forward_step(
     current_microbatch=None,
     vp_stage=None,
     is_last_stage=True,
-):
+): #完成单个micro batch的前向计算
     """Forward step for passed-in model.
 
     If it is the first stage, the input tensor is obtained from the data_iterator.
@@ -421,25 +421,25 @@ def forward_step(
         set_current_microbatch(model, current_microbatch)
 
     unwrap_output_tensor = False
-    if not isinstance(input_tensor, list):
+    if not isinstance(input_tensor, list): #统一包装为list
         input_tensor = [input_tensor]
         unwrap_output_tensor = True
 
     set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
-    set_input_tensor(input_tensor)
+    set_input_tensor(input_tensor) #set_input_tensor 负责让 PP 中间 stage的进程跳过 data_iterator，直接用上一 stage 传来的激活值。
 
-    if config.enable_autocast:
-        context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
+    if config.enable_autocast: #根据 config 决定是否开启 autocast
+        context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)  #torch.autocast 是一个上下文管理器，进入后 GPU 算子会自动选择 fp16/bf16 执行来加速，同时在需要精度的地方（如 loss、softmax、layernorm）保持 fp32。
     else:
         context_manager = contextlib.nullcontext()
     with context_manager:
-        if checkpoint_activations_microbatch is None:
-            output_tensor, loss_func = forward_step_func(data_iterator, model)
-        else:
+        if checkpoint_activations_microbatch is None: #不使用重计算
+            output_tensor, loss_func = forward_step_func(data_iterator, model) #执行这个micro batch的前传（如果是pp stage0那就会通过data_iterator获取micro batch数据），#返回output_tensor（中间激活值/每个token的loss），还有计算最终loss的 loss_func
+        else: #使用重计算
             output_tensor, loss_func = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
             )
-    output_tensor, num_tokens = forward_step_calc_loss(
+    output_tensor, num_tokens = forward_step_calc_loss( #用 loss_func 计算 loss 并处理 loss 的归一化/缩放。只在最后一个 stage 计算 loss，返回值：output_tensor, num_tokens——计算后的 per-token loss 和 token 计数，供后续 backward 使用。
         model,
         output_tensor,
         loss_func,
@@ -454,7 +454,7 @@ def forward_step(
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
-    return [output_tensor], num_tokens
+    return [output_tensor], num_tokens #返回output_tensor和处理的token数
 
 
 def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
@@ -592,9 +592,9 @@ def check_first_val_step(first_val_step, forward_only, cond):
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
-    data_iterator: Union[Iterator, List[Iterator]],
-    model: Union[torch.nn.Module, List[torch.nn.Module]],
-    num_microbatches: int,
+    data_iterator: Union[Iterator, List[Iterator]], #数据迭代器。非 PP 模式下只取第一个
+    model: Union[torch.nn.Module, List[torch.nn.Module]], #模型。非 PP 模式不允许分块，取第一个
+    num_microbatches: int, #microbatch 数量，每个 step 跑几个 microbatch 再合并梯度
     seq_length: int,  # unused
     micro_batch_size: int,  # unused
     decoder_seq_length: Optional[int] = None,  # unused
@@ -644,15 +644,15 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
-    no_sync_func = config.no_sync_func
+    no_sync_func = config.no_sync_func #sync 指的就是数据并行（Data Parallel）的梯度同步。no_sync是一个上下文管理器（context manager），它可以在其管理的代码块执行期间禁用梯度同步，而在代码块执行完毕后恢复梯度同步。使用DDP的话默认是DDP的 no_sync 方法
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
 
     model_type = get_model_type(model)
 
-    forward_data_store = []
-    input_tensor, output_tensor_grad = None, None
-    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+    forward_data_store = [] #收集训练信息用的（如(output_tensor, num_tokens, loss_reduced)）
+    input_tensor, output_tensor_grad = None, None #input_tensor是上一个pp stage前传输入给这个stage的激活值，output_tensor_grad是下一个stage反传过来的grad
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda") #total_num_tokens 是一个0 维标量 tensor，放在 GPU 上，初始值为 0，用于跨所有 microbatch 累加 token 总数。当开启 calculate_per_token_loss 时，loss 是按 per-token 平均的，梯度缩放需要知道整个 global batch 里一共多少 token，而不是简单按 microbatch 数量平均。所以需要把所有 microbatch 的 token 数累加起来。
 
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
@@ -690,20 +690,20 @@ def forward_backward_no_pipelining(
             model_type,
         )
     else:
-        with no_sync_func():
+        with no_sync_func(): #前n-1个microbatch不进行梯度同步（因为还没有反传，在梯度累积），只在最后1个microbatch进行梯度同步
             for i in range(num_microbatches - 1):
-                output_tensor, num_tokens = forward_step(
+                output_tensor, num_tokens = forward_step( #执行单个micro batch的前传
                     forward_step_func,
                     data_iterator,
                     model,
                     num_microbatches,
-                    input_tensor,
+                    input_tensor, #其他stage前传过来的激活值，对于第一个stage是 None
                     forward_data_store,
                     config,
                     pg_collection.cp.size(),
                     collect_non_loss_data,
-                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
-                    current_microbatch=i,
+                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0), #判断当前是否是第一个 microbatch
+                    current_microbatch=i, #当前是第几个 microbatch
                 )
                 total_num_tokens += num_tokens
                 if not forward_only:
@@ -724,11 +724,11 @@ def forward_backward_no_pipelining(
                 first_val_step, forward_only, num_microbatches == 1
             ),
             current_microbatch=num_microbatches - 1,
-        )
+        ) #返回output_tensor（输出中间激活值/加权平均后的loss）, num_tokens（处理的token数量）
 
-        total_num_tokens += num_tokens
+        total_num_tokens += num_tokens #累加处理的token数量
 
-        if not forward_only:
+        if not forward_only: #反传
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
     if config.finalize_model_grads_func is not None and not forward_only:

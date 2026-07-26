@@ -50,26 +50,26 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     args = get_args()
 
     # Dataloader doesn't run on the middle stages in a pipeline parallel model.
-    pp_size = get_pipeline_model_parallel_world_size()
-    if not is_first_or_last_stage(pp_size):
+    pp_size = get_pipeline_model_parallel_world_size() #获取PP并行度
+    if not is_first_or_last_stage(pp_size): #如果不是第一个或最后一个stage，直接返回None，因为不需要数据
         # Note these are all set to None above.
         return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles, packed_seq_params
 
     # Broadcast data.
     nvtx_range_push("get_data")
-    if data_iterator is not None and get_tensor_model_parallel_rank() == 0:
+    if data_iterator is not None and get_tensor_model_parallel_rank() == 0: #TP rank = 0的进程从data_iterator中取出新的micro batch数据
         data = next(data_iterator)
     else:
         data = None
 
-    data_text = tensor_parallel.broadcast_data(["tokens"], data, torch.int64)["tokens"]
-    labels = tensor_parallel.broadcast_data(["labels"], data, torch.int64)["labels"]
+    data_text = tensor_parallel.broadcast_data(["tokens"], data, torch.int64)["tokens"] #发送token数据，文本token经过tokenizer分词
+    labels = tensor_parallel.broadcast_data(["labels"], data, torch.int64)["labels"] #发送label数据，还没有进行偏移（已经mask了系统提示+<image>+用户prompt）
 
-    imgs = tensor_parallel.broadcast_data(["imgs"], data, torch.float32)["imgs"]
-    num_tiles = tensor_parallel.broadcast_data(["num_tiles"], data, torch.int32)["num_tiles"]
+    imgs = tensor_parallel.broadcast_data(["imgs"], data, torch.float32)["imgs"] #发送image数据，torch数据
+    num_tiles = tensor_parallel.broadcast_data(["num_tiles"], data, torch.int32)["num_tiles"] #发送image分块数量
 
-    cu_lengths = tensor_parallel.broadcast_data(["cu_lengths"], data, torch.int32)["cu_lengths"]
-    max_lengths = tensor_parallel.broadcast_data(["max_lengths"], data, torch.int32)["max_lengths"]
+    cu_lengths = tensor_parallel.broadcast_data(["cu_lengths"], data, torch.int32)["cu_lengths"] #发送cu_lengths数据（pack 在一个序列里的所有子样本中，最长那个的长度。）
+    max_lengths = tensor_parallel.broadcast_data(["max_lengths"], data, torch.int32)["max_lengths"] #发送max_lengths数据（每个子样本的累加长度（cumulative sum）。）
 
     # No image input (text-only sample) if the dataloader returned a size 1 image.
     if imgs.shape == torch.Size([1, 1]):
@@ -107,19 +107,19 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
 
     nvtx_range_pop("get_data")
 
-    tokens_ = data_text.long()
+    tokens_ = data_text.long() #把 data_text 强转成 PyTorch 的 torch.long 类型。
 
     nvtx_range_push("index tokens")
     tokenizer = get_tokenizer()
     text_length = tokens_.shape[1]
-    tokens = tokens_[:, :text_length].contiguous()
-    labels = labels[:, 1 : text_length + 1].contiguous()
+    tokens = tokens_[:, :text_length].contiguous() # 取 columns [0, 1, ..., text_length-1]
+    labels = labels[:, 1 : text_length + 1].contiguous() # 取 columns [1, 2, ..., text_length]，这里对label进行了偏移（左移一位），真正的label
 
     assert tokens.shape == labels.shape, f"tokens: {tokens.shape} != labels: {labels.shape}"
     nvtx_range_pop("index tokens")
 
     nvtx_range_push("get_ltor_masks_and_position_ids")
-    loss_mask, position_ids = get_ltor_masks_and_position_ids(tokens, labels, tokenizer.pad)
+    loss_mask, position_ids = get_ltor_masks_and_position_ids(tokens, labels, tokenizer.pad) #获取loss掩码和位置编码
     nvtx_range_pop("get_ltor_masks_and_position_ids")
 
     # If context parallel is enabled, must shard inputs to CP ranks.
@@ -157,13 +157,13 @@ def get_ltor_masks_and_position_ids(input_ids, target, pad_token):
     seq_length = input_ids.shape[1]
 
     # Position ids.
-    position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
-    position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+    position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device) #生成一个简单的 从 0 到 seq_len-1 的递增序列 [0, 1, 2, ..., seq_len-1]
+    position_ids = position_ids.unsqueeze(0).expand_as(input_ids) #将其复制到 batch 维度上，每个样本得到完全相同的位置编码 [0, 1, 2, ..., seq_len-1]
 
     # Loss mask.
-    loss_mask = torch.ones(target.size(), dtype=torch.float, device=input_ids.device)
-    loss_mask[target == pad_token] = 0.0  # mask paddings
-    loss_mask[target == IGNORE_INDEX] = 0.0  # mask prompts
+    loss_mask = torch.ones(target.size(), dtype=torch.float, device=input_ids.device) # 初始全部为 1（计算 loss）
+    loss_mask[target == pad_token] = 0.0  # mask paddings # padding 位置 → 不计算 loss
+    loss_mask[target == IGNORE_INDEX] = 0.0  # mask prompts  # prompt 位置 → 不计算 loss ，IGNORE_INDEX就代表系统提示和用户prompt
 
     return loss_mask, position_ids
 
@@ -269,16 +269,16 @@ def forward_step(data_iterator, model: LLaVAModel):
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    (
-        tokens,
-        labels,
-        loss_mask,
-        attention_mask,
-        position_ids,
-        images,
-        num_image_tiles,
+    ( #获取micro batch数据
+        tokens, #系统提示 + <image> + 用户prompt + 回答
+        labels, #回答labels，对于系统提示 + <image> + 用户prompt进行了mask，只🈶回答数据，而且左移了一个token
+        loss_mask, #loss mask，系统提示 + <image> + 用户prompt这些token的loss_mask是0.0，只有回答部分是1.0可以计算loss
+        attention_mask, #none，modulespec指定
+        position_ids, #位置编码
+        images, #图像tensor数据
+        num_image_tiles, #每个样本的图像tile数量
         packed_seq_params,
-    ) = get_batch(data_iterator, model.module.module.image_token_index, model.module.module.img_seq_len)
+    ) = get_batch(data_iterator, model.module.module.image_token_index, model.module.module.img_seq_len) #两层 .module 是 DDP 和 Float16Module 的包装。实际拿到的是 LLaVAModel
     timers('batch-generator').stop()
 
     output_tensor, loss_mask = model(
@@ -290,14 +290,14 @@ def forward_step(data_iterator, model: LLaVAModel):
         loss_mask,
         num_image_tiles=num_image_tiles,
         packed_seq_params=packed_seq_params,
-    )
+    ) #执行model的forward。如果不是最后一个pp stage，那output_tensor就是中间activation，如果是最后一个stage，output_tensor就是最终的loss
     args = get_args()
     if args.use_loss_scaling:
         loss_function = partial(scaled_loss_func, loss_mask)
     else:
-        loss_function = partial(loss_func, loss_mask)
+        loss_function = partial(loss_func, loss_mask) #拿 loss_mask 做加权平均算最终 loss 值——模型已经帮你把每个token的交叉熵loss算完了，loss_func 只需要做 sum(loss * mask) / sum(mask) 的加权平均（不计算被mask的那些token）。
 
-    return output_tensor, loss_function
+    return output_tensor, loss_function #返回output_tensor（中间激活值/token loss），还有计算最终loss的func
 
 
 def llava_embedding_ranks(pp_ranks):

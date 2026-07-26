@@ -30,7 +30,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     else:
         split = None
 
-    if args.dataloader_type == "external":
+    if args.dataloader_type == "external": #多模态是external，dataset就是dataloader（外部直接确定好了），其余类型的dataloder需要包装
         # External dataloaders are passed through. User is expected to provide a
         # torch-compatible dataloader and define samplers, if needed.
         return dataset
