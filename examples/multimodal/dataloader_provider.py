@@ -37,7 +37,7 @@ def datasets_provider(task_encoder,worker_config=None):
         max_samples_per_sequence=100, #每个 sample-sequence 最多包含多少个样本。用于数据打包（packing），把多个短序列拼成一个长序列以提高训练效率。
         shuffle_buffer_size=100, #蓄水池打乱算法使用的buffer大小
         worker_config=worker_config,
-        packing_buffer_size=args.packing_ƒbuffer_size, #打包需要"等"。你不能来一个样本就打包一个——你得攒一批样本，看看哪些短的能拼到一起，以减少 padding。这里的buffer就是用来攒样本的，buffer_size就是累积样本数量（样本为单位）
+        packing_buffer_size=args.packing_buffer_size, #打包需要"等"。你不能来一个样本就打包一个——你得攒一批样本，看看哪些短的能拼到一起，以减少 padding。这里的buffer就是用来攒样本的，buffer_size就是累积样本数量（样本为单位）
         handler=print_error_handler,
         image_decode="pil",
     )#创建Megatron Energon训练数据集

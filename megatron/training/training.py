@@ -1368,19 +1368,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         else: #没有vpp就只构造一个模型
             pre_process = is_pp_first_stage(pg_collection.pp) #判断是不是位于pp的第一个stage
             post_process = is_pp_last_stage(pg_collection.pp) #判断是不是位于pp的最后一个stage
-            import debugpy, os
-            local_rank = int(os.environ.get("LOCAL_RANK", "0")) #从环境变量中读取 `LOCAL_RANK`。如果没读到，则默认为 `"0"`。将其转换为整数赋值给 `local_rank`。
-            try:#使用异常处理适配多进程代码，这样只有一个进程会监听5678端口
-                # 仅主进程开启调试监听
-                if local_rank == 0:
-                    debugpy.listen(("localhost", 5678))
-                    print("Waiting for debugger attach")
-                    debugpy.wait_for_client()
-                else:
-                    # 非0号进程：永久阻塞，卡死在这里，不执行任何后续代码
-                    while True: pass
-            except Exception as e:
-                pass
+            # import debugpy, os
+            # local_rank = int(os.environ.get("LOCAL_RANK", "0")) #从环境变量中读取 `LOCAL_RANK`。如果没读到，则默认为 `"0"`。将其转换为整数赋值给 `local_rank`。
+            # try:#使用异常处理适配多进程代码，这样只有一个进程会监听5678端口
+            #     # 仅主进程开启调试监听
+            #     if local_rank == 0:
+            #         debugpy.listen(("localhost", 5678))
+            #         print("Waiting for debugger attach")
+            #         debugpy.wait_for_client()
+            #     else:
+            #         # 非0号进程：永久阻塞，卡死在这里，不执行任何后续代码
+            #         while True: pass
+            # except Exception as e:
+            #     pass
             model = model_provider_func(
                 pre_process=pre_process,
                 post_process=post_process,
@@ -1899,7 +1899,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
-        losses_reduced = forward_backward_func( #根据是否使用的PP调度器来执行n个micro batch的前向后向
+        losses_reduced = forward_backward_func( #根据使用的PP调度器来执行n个micro batch的前向后向
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,

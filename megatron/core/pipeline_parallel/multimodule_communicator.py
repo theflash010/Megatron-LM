@@ -18,7 +18,7 @@ Shape = Union[List[int], torch.Size]
 
 @dataclass
 class RankModuleInfo:
-    """Information about a rank in a module.
+    """Information about a rank in a module. #记录当前rank在某个模块中的信息
 
     Attributes:
         pp_rank: The stage index of the current rank within the module's pipeline.
@@ -38,9 +38,9 @@ class RankModuleInfo:
 
     pp_rank: int
     pp_size: int
-    p2p_communicator: Optional[P2PCommunicator]
-    bridge_comms_as_src_module: Optional[List[BridgeCommunicator]]
-    bridge_comms_as_dest_module: Optional[List[BridgeCommunicator]]
+    p2p_communicator: Optional[P2PCommunicator] #该模块内的p2p communicator
+    bridge_comms_as_src_module: Optional[List[BridgeCommunicator]] #该模块内作为src边界通信rank的bridge communicators
+    bridge_comms_as_dest_module: Optional[List[BridgeCommunicator]] #该模块内作为dest边界通信rank的bridge communicators
     is_source_stage: Optional[bool] = True
     is_terminal_stage: Optional[bool] = True
 
@@ -84,7 +84,7 @@ def _prepare_tensor_for_comm(
 def _restore_tensor_from_comm(
     tensor: Union[torch.Tensor, List[torch.Tensor], None]
 ) -> Union[torch.Tensor, List[torch.Tensor], None]:
-    """Restore tensor shape after P2P communication by squeezing singleton dim.
+    """Restore tensor shape after P2P communication by squeezing singleton dim. #_prepare_tensor_for_comm / _restore_tensor_from_comm 是模块内 P2P 路径的 2D↔3D 形状适配器：发送前 unsqueeze 补成 3D 以满足 P2P 的 3D 约定，接收后 squeeze 还原；并显式禁止真正的 3D 单例末维张量以避免歧义。
 
     Only used for intra-module P2P paths. Bridge communicators handle 2D/3D
     tensors natively via tensor_ndim and do not need this adapter.
@@ -108,7 +108,7 @@ def _restore_tensor_from_comm(
 
 
 class MultiModulePipelineCommunicator:
-    """Communicator for a multi-module pipeline."""
+    """Communicator for a multi-module pipeline.""" #这里的假设是每个rank负责多个模块，但是每个rank会做完所有模块的一个micro batch的前传才会统一进行每个模块需要做的通信（也就是每个 rank 每步把自己拥有的所有模块前向（和反向）整体算完再统一收发）
 
     def __init__(
         self,
@@ -122,7 +122,7 @@ class MultiModulePipelineCommunicator:
         Initialize the MultiModulePipelineCommunicator.
 
         Args:
-            module_to_grid_map (dict): A dictionary mapping module names to HyperCommGrids.
+            module_to_grid_map (dict): A dictionary mapping module names to HyperCommGrids. #模块名到该模块专属 HyperCommGrid（通信网格） 的映射
                 Example:
                     module_to_grid_map = {
                         'image_encoder': image_encoder_grid,
@@ -130,7 +130,7 @@ class MultiModulePipelineCommunicator:
                         'llm': llm_grid,
                         'generator': generator_grid
                     }
-            topology (dict): A dictionary mapping module names to lists of outgoing modules.
+            topology (dict): A dictionary mapping module names to lists of outgoing modules. #topology 描述模块间的数据流，代表每个模块输出给哪个模块
                 Example:
                     topology = {
                         'image_encoder': ['llm'],
@@ -143,7 +143,7 @@ class MultiModulePipelineCommunicator:
                 Example:
                     dim_mapping = {'s': 0, 'h': 2, 'b': 1}
                 Default: None
-            module_output_ndim (Dict[str, int]): Number of dimensions for each module's
+            module_output_ndim (Dict[str, int]): Number of dimensions for each module's #描述每个模块输出给下游模块的 Tensor 有几个维度
                 output tensor. Used by bridge communicators for cross-module fan-in/fan-out.
                 Modules producing 2D tensors [B*S, H] (e.g. vision encoders) should be 2.
                 Modules not listed default to 3.
@@ -156,23 +156,23 @@ class MultiModulePipelineCommunicator:
         self.config = config
         self.dim_mapping = dim_mapping
         self.module_output_ndim = module_output_ndim or {}
-        self.current_rank = dist.get_rank()
+        self.current_rank = dist.get_rank() #自身的rank
 
         # Build bridge communicators for all modules
         self.bridge_comms = []
-        self._build_bridge_comms()
+        self._build_bridge_comms() #构建所有跨模块的P2P通信器对象 BridgeCommunicator
 
-        self.rank_module_map = {}
+        self.rank_module_map = {} #当前rank和所在模块作为key，映射到对应的RankModuleInfo对象
         self._build_rank_module_info_map()
 
     def _build_bridge_comms(self):
         """Construct and store BridgeCommunicator objects that describe the outgoing
         communication relationships for all of the modules.
         """
-        for src_module_name, src_grid in self.module_to_grid_map.items():
-            for dest_module_name in self.topology[src_module_name]:
-                dest_grid = self.module_to_grid_map[dest_module_name]
-                bridge_comm = BridgeCommunicator(
+        for src_module_name, src_grid in self.module_to_grid_map.items(): #遍历每个模块，模块名称+模块的通信网格·
+            for dest_module_name in self.topology[src_module_name]: #遍历当前模块的下游模块
+                dest_grid = self.module_to_grid_map[dest_module_name] #下游模块的通信网格
+                bridge_comm = BridgeCommunicator( #构建跨模块的P2P通信器对象BridgeCommunicator
                     src_grid=src_grid,
                     dest_grid=dest_grid,
                     dim_mapping=self.dim_mapping,
@@ -181,7 +181,7 @@ class MultiModulePipelineCommunicator:
                     dest_module_name=dest_module_name,
                     tensor_ndim=self.module_output_ndim.get(src_module_name, 3),
                 )
-                self.bridge_comms.append(bridge_comm)
+                self.bridge_comms.append(bridge_comm) #将构建好的 BridgeCommunicator 添加到列表中
 
     @property
     def is_pp_first_stage(self):
@@ -277,48 +277,48 @@ class MultiModulePipelineCommunicator:
         return stage
 
     def _build_rank_module_info_map(self):
-        """For each module in the current rank, initialize the P2P communicator
+        """For each module in the current rank, initialize the P2P communicator #每个rank可能负责多个模块，在不同的模块里扮演不同的角色
         and build the bridge communicator info for the module.
         Each rank may hold multiple modules when colocated.
         """
-        for module_name, module_grid in self.module_to_grid_map.items():
+        for module_name, module_grid in self.module_to_grid_map.items(): #遍历每个模块及其对应的HyperCommGrid对象
             if self.is_current_rank_in_grid(module_grid):
                 # Initialize P2P communicator
                 pp_group = module_grid.get_pg('pp')
-                p2p_comm = P2PCommunicator(pp_group, self.config)
+                p2p_comm = P2PCommunicator(pp_group, self.config) #创建模块内部的P2PCommunicator对象
                 pp_size = dist.get_world_size(pp_group)
-                rank_in_pp_group = dist.get_group_rank(pp_group, self.current_rank)
-                pp_rank = rank_in_pp_group % pp_size
+                rank_in_pp_group = dist.get_group_rank(pp_group, self.current_rank) #获取当前rank在该模块内部P2P通信组中的相对rank
+                pp_rank = rank_in_pp_group % pp_size #计算当前 rank 在该模块 PP 流水线中的位置 pp_rank
 
                 bridge_comms_as_dest_module = []
                 bridge_comms_as_src_module = []
                 # If first stage, check if the module has any incoming modules
                 # If so, initialize bridge communicator
-                if pp_rank == 0:
-                    for bridge_comm in self.bridge_comms:
+                if pp_rank == 0: #如果是该模块的首stage rank
+                    for bridge_comm in self.bridge_comms: #遍历每个BridgeCommunicator对象
                         if (
-                            bridge_comm.is_current_rank_in_grid(bridge_comm.dest_grid)
-                            and bridge_comm.dest_module_name == module_name
+                            bridge_comm.is_current_rank_in_grid(bridge_comm.dest_grid) #这个BridgeCommunicator的dest模块里面有没有当前rank
+                            and bridge_comm.dest_module_name == module_name #判断该模块是否是这个BridgeCommunicator的dest模块
                         ):
-                            bridge_comms_as_dest_module.append(bridge_comm)
+                            bridge_comms_as_dest_module.append(bridge_comm) #将这个BridgeCommunicator添加到当前rank在该模块的的as_dest列表中
                 # If last stage, check if the module has any outgoing modules
                 # If so, initialize bridge communicator
-                if pp_rank == pp_size - 1:
-                    for bridge_comm in self.bridge_comms:
+                if pp_rank == pp_size - 1: #如果是该模块的尾stage rank
+                    for bridge_comm in self.bridge_comms: #遍历每个BridgeCommunicator对象
                         if (
-                            bridge_comm.is_current_rank_in_grid(bridge_comm.src_grid)
-                            and bridge_comm.src_module_name == module_name
+                            bridge_comm.is_current_rank_in_grid(bridge_comm.src_grid) #这个BridgeCommunicator的src模块里面有没有当前rank
+                            and bridge_comm.src_module_name == module_name #判断该模块是否是这个BridgeCommunicator的src模块
                         ):
-                            bridge_comms_as_src_module.append(bridge_comm)
+                            bridge_comms_as_src_module.append(bridge_comm) #将这个BridgeCommunicator添加到当前rank在该模块的as_src列表中
                 # Build RankModuleInfo for the module
-                rank_module_info = RankModuleInfo(
+                rank_module_info = RankModuleInfo( #构建该rank在该模块的信息
                     pp_rank=pp_rank,
                     pp_size=pp_size,
                     p2p_communicator=p2p_comm,
                     bridge_comms_as_dest_module=bridge_comms_as_dest_module,
                     bridge_comms_as_src_module=bridge_comms_as_src_module,
                 )
-                self.rank_module_map[module_name] = rank_module_info
+                self.rank_module_map[module_name] = rank_module_info #按照模块名存储该rank在该模块的信息
 
     def recv_forward(
         self, tensor_shape: Optional[Shape] = None, is_first_stage: bool = False
@@ -336,22 +336,22 @@ class MultiModulePipelineCommunicator:
             f"[receive_forward] tensors_shape: {tensor_shape}, is_first_stage: {is_first_stage}"
         )
         input_dict = {}
-        for module_name, rank_module_info in self.rank_module_map.items():
+        for module_name, rank_module_info in self.rank_module_map.items(): #遍历当前rank负责的各个模块
 
-            if rank_module_info.pp_rank == 0:
+            if rank_module_info.pp_rank == 0: #如果是该模块的首stage rank
                 # If first stage, and has incoming modules, receive forward activation
                 # from incoming modules.
-                for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
-                    received_tensor = bridge_comm.recv_forward()
-                    input_dict[bridge_comm.src_module_name] = received_tensor
-            else:
+                for bridge_comm in rank_module_info.bridge_comms_as_dest_module: #在这个模块中rank作为dest rank，遍历作为dest rank需要参与的BridgeCommunicator
+                    received_tensor = bridge_comm.recv_forward() #调用BridgeCommunicator的recv_forward方法接收前传激活值数据
+                    input_dict[bridge_comm.src_module_name] = received_tensor #将接收到的前传激活值数据存储到字典中，key是发送这个激活值数据的模块名
+            else: #如果是该模块的非首stage rank，那只需要进行模块内的通信
                 # If not first stage, receive forward activation tensor from P2P communicator.
                 # P2P hardcodes 3D shape buffers, so use adapter for 2D tensors.
                 received_tensor = rank_module_info.p2p_communicator.recv_forward(
                     tensor_shapes=tensor_shape, is_first_stage=False
-                )
-                input_dict[module_name] = _restore_tensor_from_comm(received_tensor)
-        return input_dict
+                )#调用P2PCommunicator的recv_forward方法接收前传激活值数据
+                input_dict[module_name] = _restore_tensor_from_comm(received_tensor) #将数据进行还原并存储到字典中，key是当前模块名（因为是模块内部通信）
+        return input_dict #返回一个字典，key是生产者模块名，value是该rank从生产者模块接收的前传激活值数据
 
     def send_forward(self, output_dict: Dict[str, torch.Tensor], is_last_stage: bool = False):
         """Send forward activation tensor.
@@ -359,16 +359,16 @@ class MultiModulePipelineCommunicator:
         Args:
             output_dict: A dictionary mapping module names to tensors.
         """
-        for module_name, rank_module_info in self.rank_module_map.items():
-            if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
+        for module_name, rank_module_info in self.rank_module_map.items(): #遍历当前rank负责的各个模块
+            if rank_module_info.pp_rank == rank_module_info.pp_size - 1: #如果是该模块的尾stage rank
                 # If last stage, and has outgoing modules, send forward activation
                 # by using bridge communicator.
-                for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    bridge_comm.send_forward(output_dict[module_name])
-            else:
+                for bridge_comm in rank_module_info.bridge_comms_as_src_module: #在这个模块中rank作为src rank，遍历作为src rank需要参与的BridgeCommunicator
+                    bridge_comm.send_forward(output_dict[module_name]) #调用BridgeCommunicator的send_forward方法发送前传激活值数据
+            else: #如果是该模块的非尾stage rank，那只需要进行模块内的通信
                 # If not last stage, send forward activation by using P2P communicator.
-                tensor_to_send = _prepare_tensor_for_comm(output_dict[module_name])
-                rank_module_info.p2p_communicator.send_forward(tensor_to_send, is_last_stage=False)
+                tensor_to_send = _prepare_tensor_for_comm(output_dict[module_name]) #将数据适配到P2P通信可以接受的形状
+                rank_module_info.p2p_communicator.send_forward(tensor_to_send, is_last_stage=False) #调用P2PCommunicator的send_forward方法发送前传激活值数据
 
     def send_forward_recv_backward(
         self,
@@ -376,7 +376,7 @@ class MultiModulePipelineCommunicator:
         tensor_shape: Optional[Shape] = None,
         is_last_stage: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """Send forward activation tensor and receive backward activation tensor.
+        """Send forward activation tensor and receive backward activation tensor. #send前传激活值+recv反传梯度
 
         Args:
             output_dict: A dictionary mapping module names to tensors.
@@ -386,21 +386,21 @@ class MultiModulePipelineCommunicator:
             A dictionary mapping module names to tensors.
         """
         grad_dict = {}
-        for module_name, rank_module_info in self.rank_module_map.items():
-            if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
+        for module_name, rank_module_info in self.rank_module_map.items(): #遍历当前rank负责的各个模块
+            if rank_module_info.pp_rank == rank_module_info.pp_size - 1: #如果是该模块的尾stage rank
                 # If last stage, and has outgoing modules, send forward activation and
                 # receive backward gradient by using bridge communicator.
-                for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    grad = bridge_comm.send_forward_recv_backward(output_dict[module_name])
-                    grad_dict[bridge_comm.src_module_name] = grad
-            else:
+                for bridge_comm in rank_module_info.bridge_comms_as_src_module: #在这个模块中rank作为src rank，遍历作为src rank需要参与的BridgeCommunicator
+                    grad = bridge_comm.send_forward_recv_backward(output_dict[module_name]) #调用BridgeCommunicator的send_forward_recv_backward方法发送前传激活值数据+接收后传梯度数据
+                    grad_dict[bridge_comm.src_module_name] = grad #将接收的后传梯度数据存储到字典中，key是接收这个梯度数据的模块名
+            else: #如果是该模块的非尾stage rank，那只需要进行模块内的通信
                 # If not last stage, send forward activation and receive backward gradient
                 # by using P2P communicator.
-                tensor_to_send = _prepare_tensor_for_comm(output_dict[module_name])
-                grad = rank_module_info.p2p_communicator.send_forward_recv_backward(
+                tensor_to_send = _prepare_tensor_for_comm(output_dict[module_name]) #将数据适配到P2P通信可以接受的形状
+                grad = rank_module_info.p2p_communicator.send_forward_recv_backward( #调用P2PCommunicator的send_forward_recv_backward方法发送前传激活值数据+接收后传梯度数据
                     tensor_to_send, tensor_shapes=tensor_shape, is_last_stage=False
                 )
-                grad_dict[module_name] = _restore_tensor_from_comm(grad)
+                grad_dict[module_name] = _restore_tensor_from_comm(grad) #将后传梯度数据还原并存储到字典中，key是当前模块名（因为是模块内部通信）
         return grad_dict
 
     def send_backward_recv_forward(
@@ -409,7 +409,7 @@ class MultiModulePipelineCommunicator:
         tensor_shape: Optional[Shape] = None,
         is_first_stage: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """Send backward activation tensor and receive forward activation tensor.
+        """Send backward activation tensor and receive forward activation tensor. #send反传梯度+recv前传激活
 
         Args:
             grad_dict: A dictionary mapping module names to tensors.
@@ -419,29 +419,29 @@ class MultiModulePipelineCommunicator:
             A dictionary mapping module names to tensors.
         """
         input_dict = {}
-        for module_name, rank_module_info in self.rank_module_map.items():
-            if rank_module_info.pp_rank == 0:
-                for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
+        for module_name, rank_module_info in self.rank_module_map.items(): #遍历当前rank负责的各个模块
+            if rank_module_info.pp_rank == 0: #如果是该模块的首stage rank
+                for bridge_comm in rank_module_info.bridge_comms_as_dest_module: #在这个模块中rank作为dest rank，遍历作为dest rank需要参与的BridgeCommunicator
                     # If first stage, and has incoming modules, send backward gradient and
                     # receive forward activation by using bridge communicator.
-                    received_tensor = bridge_comm.send_backward_recv_forward(
+                    received_tensor = bridge_comm.send_backward_recv_forward( #调用BridgeCommunicator的send_backward_recv_forward方法发送后传梯度数据+接收前传激活值数据
                         grad_dict[bridge_comm.src_module_name]
                     )
-                    input_dict[bridge_comm.src_module_name] = received_tensor
-            else:
+                    input_dict[bridge_comm.src_module_name] = received_tensor #将接收的前传激活值数据存储到字典中，key是发送这个激活值数据的模块名
+            else: #如果是该模块的非首stage rank，那只需要进行模块内的通信
                 # If not first stage, send backward gradient and receive forward activation
                 # by using P2P communicator.
-                grad_to_send = _prepare_tensor_for_comm(grad_dict[module_name])
-                received_tensor = rank_module_info.p2p_communicator.send_backward_recv_forward(
+                grad_to_send = _prepare_tensor_for_comm(grad_dict[module_name]) #将数据适配到P2P通信可以接受的形状
+                received_tensor = rank_module_info.p2p_communicator.send_backward_recv_forward( #调用P2PCommunicator的send_backward_recv_forward方法发送后传梯度数据+接收前传激活值数据
                     grad_to_send, tensor_shapes=tensor_shape, is_first_stage=False
                 )
-                input_dict[module_name] = _restore_tensor_from_comm(received_tensor)
+                input_dict[module_name] = _restore_tensor_from_comm(received_tensor) #将前传激活值数据还原并存储到字典中，key是当前模块名（因为是模块内部通信）
         return input_dict
 
     def recv_backward(
         self, tensor_shape: Optional[Shape] = None, is_last_stage: bool = False
     ) -> Dict[str, torch.Tensor]:
-        """Receive backward activation tensor.
+        """Receive backward activation tensor. #接收后传梯度
 
         Args:
             tensor_shape: Expected gradient tensor shape
@@ -454,37 +454,37 @@ class MultiModulePipelineCommunicator:
             f"[recv_backward] tensor_shape: {tensor_shape}, is_last_stage: {is_last_stage}"
         )
         grad_dict = {}
-        for module_name, rank_module_info in self.rank_module_map.items():
-            if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
+        for module_name, rank_module_info in self.rank_module_map.items(): #遍历当前rank负责的各个模块
+            if rank_module_info.pp_rank == rank_module_info.pp_size - 1: #如果是该模块的尾stage rank
                 # If last stage, and has incoming modules, receive backward gradient
                 # by using bridge communicator.
-                for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    grad = bridge_comm.recv_backward()
-                    grad_dict[bridge_comm.src_module_name] = grad
-            else:
+                for bridge_comm in rank_module_info.bridge_comms_as_src_module: #在这个模块中rank作为src rank，遍历作为src rank需要参与的BridgeCommunicator
+                    grad = bridge_comm.recv_backward() #调用BridgeCommunicator的recv_backward方法接收后传梯度数据
+                    grad_dict[bridge_comm.src_module_name] = grad #将接收的后传梯度数据存储到字典中，key是发送这个梯度数据的模块名
+            else: #如果是该模块的非尾stage rank，那只需要进行模块内的通信
                 # If not last stage, receive backward gradient by using P2P communicator.
-                grad = rank_module_info.p2p_communicator.recv_backward(
+                grad = rank_module_info.p2p_communicator.recv_backward( #调用P2PCommunicator的recv_backward方法接收后传梯度数据
                     tensor_shapes=tensor_shape, is_last_stage=False
                 )
-                grad_dict[module_name] = _restore_tensor_from_comm(grad)
+                grad_dict[module_name] = _restore_tensor_from_comm(grad) #将后传梯度数据还原并存储到字典中，key是当前模块名（因为是模块内部通信）
         return grad_dict
 
     def send_backward(self, grad_dict: Dict[str, torch.Tensor], is_first_stage: bool = False):
-        """Send backward activation tensor.
+        """Send backward activation tensor. #发送后传梯度
 
         Args:
             grad_dict: A dictionary mapping module names to tensors.
         """
-        for module_name, rank_module_info in self.rank_module_map.items():
-            if rank_module_info.pp_rank == 0:
+        for module_name, rank_module_info in self.rank_module_map.items(): #遍历当前rank负责的各个模块
+            if rank_module_info.pp_rank == 0: #如果是该模块的首stage rank
                 # If first stage, and has incoming modules, send backward activation
                 # by using bridge communicator.
-                for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
-                    bridge_comm.send_backward(grad_dict[bridge_comm.src_module_name])
-            else:
+                for bridge_comm in rank_module_info.bridge_comms_as_dest_module: #在这个模块中rank作为dest rank，遍历作为dest rank需要参与的BridgeCommunicator
+                    bridge_comm.send_backward(grad_dict[bridge_comm.src_module_name]) #调用BridgeCommunicator的send_backward方法发送后传梯度数据
+            else: #如果是该模块的非首stage rank，那只需要进行模块内的通信
                 # If not first stage, send backward activation by using P2P communicator.
-                grad_to_send = _prepare_tensor_for_comm(grad_dict[module_name])
-                rank_module_info.p2p_communicator.send_backward(grad_to_send, is_first_stage=False)
+                grad_to_send = _prepare_tensor_for_comm(grad_dict[module_name]) #将数据适配到P2P通信可以接受的形状
+                rank_module_info.p2p_communicator.send_backward(grad_to_send, is_first_stage=False) #调用P2PCommunicator的send_backward方法发送后传梯度数据
 
     @staticmethod
     def compute_total_pipeline_stages(
@@ -493,7 +493,7 @@ class MultiModulePipelineCommunicator:
         rank: Optional[int] = None,
         module_name: Optional[str] = None,
     ) -> int:
-        """Compute the total number of pipeline stages across a multi-module chain.
+        """Compute the total number of pipeline stages across a multi-module chain. #计算多模块流水线「总共有多少个 pipeline stage」，以及某个 rank 处在整个多模块流水线的第几个 stage。
 
         Interprets ``topology`` as a directed acyclic graph (DAG) where nodes are modules
         and edges indicate forward data flow from source to destination modules. Each node
@@ -563,7 +563,7 @@ class MultiModulePipelineCommunicator:
 
         def longest_path_to(target: str) -> int:
             visiting = set()
-            partial = partial_weight_for_target(target)
+            partial = partial_weight_for_target(target) #获取rank所在模块内的stage序号
 
             def weight(name: str) -> int:
                 if partial is not None and name == target:
@@ -582,7 +582,7 @@ class MultiModulePipelineCommunicator:
                 visiting.remove(node)
                 return weight(node) + best
 
-            return dfs(target)
+            return dfs(target) #dfs获得该模块到第一个模块的stage数量，中间会加上之前的partial
 
         if rank is None:
             return max(longest_path_to(sink) for sink in sinks)

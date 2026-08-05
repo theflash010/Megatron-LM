@@ -142,10 +142,10 @@ def _get_shared_word_embedding_weight(
     Returns:
         The shared embedding or output weight if available; otherwise ``None``.
     """
-    # Only reduce if weights are duplicated across stages.
-    if model_module.share_embeddings_and_output_weights or getattr(config, 'mtp_num_layers', 0):
+    # Only reduce if weights are duplicated across stages. #判断：权重是否真的跨 stage 共享？
+    if model_module.share_embeddings_and_output_weights or getattr(config, 'mtp_num_layers', 0): #是 → 返回那个共享的参数矩阵
         return model_module.shared_embedding_or_output_weight()
-    return None
+    return None #否 → 返回 None
 
 
 def _get_position_embedding_weight(model_module: torch.nn.Module) -> torch.nn.Parameter:
@@ -186,17 +186,17 @@ def _allreduce_word_embedding_grads(
             parallel process group used to identify first/last stages. If
             ``None``, it will be looked up.
     """
-    if embd_group is None:
+    if embd_group is None: #确定embedding组，即所有有共享嵌入参数的pp stage
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         if get_pg_size(embd_group) > 1:
             assert pp_group is None
             pp_group = parallel_state.get_pipeline_model_parallel_group()
 
-    _allreduce_embedding_grad(
+    _allreduce_embedding_grad( #进行通信
         model,
         embd_group,
         pp_group,
-        partial(_get_shared_word_embedding_weight, config=config),
+        partial(_get_shared_word_embedding_weight, config=config), #指定word embedding的参数权重的获取函数
         config=config,
     )
 
@@ -319,75 +319,75 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         expert_bias.copy_(updated_expert_bias)
 
 
-def _allreduce_non_tensor_model_parallel_grads(
-    model: List[torch.nn.Module],
-    config: TransformerConfig,
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+def _allreduce_non_tensor_model_parallel_grads(  # 跨 tp_group 归约「非 TP 模块」的梯度
+    model: List[torch.nn.Module],  # 模型 chunk 列表（VPP 下多个）
+    config: TransformerConfig,  # Transformer 配置
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,  # TP 进程组（不传则用默认）
 ):
     """
     All-reduce both layernorm grads (for sequence parallelism) and
     gradients from modules with average_gradients_across_tp_domain=True
     across tensor-model-parallel ranks.
     """
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group)
-    if tp_group.size() <= 1:
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group)  # 未传 tp_group 时取默认 TP 组
+    if tp_group.size() <= 1:  # TP 规模为 1（无 TP 并行）时无需归约
         return
 
-    params_sum = []
-    grads_sum = []
-    params_avg = []
-    grads_avg = []
+    params_sum = []  # SUM 类参数列表（SP / qk_layernorm，梯度是部分和）
+    grads_sum = []  # SUM 类梯度列表
+    params_avg = []  # AVG 类参数列表（average_gradients_across_tp_domain，冗余梯度取平均）
+    grads_avg = []  # AVG 类梯度列表
 
-    for model_chunk in model:
-        ddp_config = model_chunk.ddp_config
-        for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
-            if param.requires_grad:
+    for model_chunk in model:  # 遍历每个模型 chunk
+        ddp_config = model_chunk.ddp_config  # 该 chunk 的 DDP 配置
+        for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():  # 穿透模型包装遍历所有参数
+            if param.requires_grad:  # 只处理需要梯度的参数
                 # Check if this param needs average reduction (average_gradients_across_tp_domain)
-                if getattr(param, "average_gradients_across_tp_domain", False):
-                    grad_attr = _get_main_grad_attr(param)
-                    grad = getattr(param, grad_attr)
-                    if grad is None:
+                if getattr(param, "average_gradients_across_tp_domain", False):  # AVG 类：HF 包装模型打的标记
+                    grad_attr = _get_main_grad_attr(param)  # 获取该参数存梯度的属性名（通常是 main_grad）
+                    grad = getattr(param, grad_attr)  # 取出该参数的梯度
+                    if grad is None:  # 本 step 无梯度（如冻结/未参与计算）则跳过
                         continue
-                    params_avg.append(param)
-                    if ddp_config.use_megatron_fsdp:
-                        grads_avg.append(grad._local_tensor.data)
-                    else:
-                        grad = _unshard_if_dtensor(grad)
-                        grads_avg.append(grad.data)
+                    params_avg.append(param)  # 记录参数到 AVG 列表
+                    if ddp_config.use_megatron_fsdp:  # FSDP 模式下
+                        grads_avg.append(grad._local_tensor.data)  # 取本地分片数据参与归约
+                    else:  # 非 FSDP 模式
+                        grad = _unshard_if_dtensor(grad)  # DTensor 先展开成完整张量（否则归约只覆盖本地分片）
+                        grads_avg.append(grad.data)  # 收集梯度数据
                 # Check if this param needs sum reduction (sequence parallel or qk_layernorm)
-                elif (config.sequence_parallel and getattr(param, "sequence_parallel", False)) or (
-                    config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name)
+                elif (config.sequence_parallel and getattr(param, "sequence_parallel", False)) or (  # SUM 类：SP 下复制层（序列被切分）
+                    config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name)  # 或 qk_layernorm（head 被 TP 切分）
                 ):
-                    grad_attr = _get_main_grad_attr(param)
-                    grad = getattr(param, grad_attr)
-                    if grad is None:
+                    grad_attr = _get_main_grad_attr(param)  # 获取该参数存梯度的属性名
+                    grad = getattr(param, grad_attr)  # 取出该参数的梯度
+                    if grad is None:  # 本 step 无梯度则跳过
                         continue
-                    params_sum.append(param)
-                    if ddp_config.use_megatron_fsdp:
-                        grads_sum.append(grad._local_tensor.data)
-                    else:
-                        grad = _unshard_if_dtensor(grad)
-                        grads_sum.append(grad.data)
+                    params_sum.append(param)  # 记录参数到 SUM 列表
+                    if ddp_config.use_megatron_fsdp:  # FSDP 模式下
+                        grads_sum.append(grad._local_tensor.data)  # 取本地分片数据参与归约
+                    else:  # 非 FSDP 模式
+                        grad = _unshard_if_dtensor(grad)  # DTensor 先展开成完整张量
+                        grads_sum.append(grad.data)  # 收集梯度数据
 
     # Loop grads and perform correct all-reduce
-    for params, grads, all_reduce_op in zip(
-        [params_sum, params_avg],
-        [grads_sum, grads_avg],
-        [torch.distributed.ReduceOp.SUM, torch.distributed.ReduceOp.AVG],
+    for params, grads, all_reduce_op in zip(  # 依次处理 SUM 组与 AVG 组
+        [params_sum, params_avg],  # 两组参数列表
+        [grads_sum, grads_avg],  # 两组梯度列表
+        [torch.distributed.ReduceOp.SUM, torch.distributed.ReduceOp.AVG],  # SUM（部分和求和）/ AVG（冗余取平均）
     ):
-        if grads:
-            coalesced = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(coalesced, op=all_reduce_op, group=tp_group)
-            for param, buf, synced in zip(
-                params, grads, _unflatten_dense_tensors(coalesced, grads)
+        if grads:  # 该组收集到梯度才通信
+            coalesced = _flatten_dense_tensors(grads)  # 多个小梯度拼成一个连续大张量（一次通信替代 N 次小通信）
+            torch.distributed.all_reduce(coalesced, op=all_reduce_op, group=tp_group)  # 跨 TP rank 做一次 SUM/AVG all-reduce
+            for param, buf, synced in zip(  # 逐个参数写回归约结果
+                params, grads, _unflatten_dense_tensors(coalesced, grads)  # 按原梯度形状把大张量拆回
             ):
-                buf.copy_(synced)
-                grad_attr = _get_main_grad_attr(param)
-                orig_grad = getattr(param, grad_attr)
-                if ddp_config.use_megatron_fsdp:
-                    setattr(param, grad_attr, orig_grad)
-                else:
-                    setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
+                buf.copy_(synced)  # 归约结果写回该参数的梯度 buffer（buf 即 main_grad 的引用）
+                grad_attr = _get_main_grad_attr(param)  # 获取 main_grad 属性名
+                orig_grad = getattr(param, grad_attr)  # 取回原梯度对象
+                if ddp_config.use_megatron_fsdp:  # FSDP 模式下
+                    setattr(param, grad_attr, orig_grad)  # 原样放回（copy_ 已生效，无需换对象）
+                else:  # 非 FSDP 模式
+                    setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))  # 完整张量按原 DTensor 布局重新 shard 放回
 
 
 """
@@ -443,12 +443,12 @@ def finalize_model_grads(
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
-    for model_chunk in model:
+    for model_chunk in model: #DDP 通信，overlap 模式下这是「等待最后一次 backward 异步发起的 reduce」；非 overlap 模式下这是「同步发起并完成唯一一次 reduce」。
         model_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
 
-    # All-reduce t_embedder grads (for pp & vpp of DiT).
+    # All-reduce t_embedder grads (for pp & vpp of DiT). #DiT相关
     if config.timers is not None:
         config.timers('conditional-embedder-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
@@ -462,7 +462,7 @@ def finalize_model_grads(
         config.timers('non-tensor-parallel-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
-    _allreduce_non_tensor_model_parallel_grads(model, config, tp_group)
+    _allreduce_non_tensor_model_parallel_grads(model, config, tp_group) #进行非TP部分的all-reduce（使用SP的layernrom，qk_layrernorm这些）
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()
 
@@ -471,8 +471,8 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
-    _allreduce_word_embedding_grads(model, config, embd_group, pp_group)
-    _allreduce_position_embedding_grads(model, config, pos_emb_group, pp_group)
+    _allreduce_word_embedding_grads(model, config, embd_group, pp_group) #完成word embedding部分的all-reduce，如果有pp，首尾stage都只有一半的grad，需要allreduce
+    _allreduce_position_embedding_grads(model, config, pos_emb_group, pp_group) #完成position embedding部分的all-reduce，只有T5老模型会这样做，现在基本都不用绝对位置编码
 
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
@@ -480,22 +480,22 @@ def finalize_model_grads(
     if config.moe_router_enable_expert_bias:
         _update_router_expert_bias(model, config)
 
-    reset_model_temporary_tensors(config, model)
+    reset_model_temporary_tensors(config, model) #重置模型临时张量
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number
     # will be the total number of non-padded tokens in the global batch.
-    if num_tokens is not None:
+    if num_tokens is not None: #per-token loss模式的梯度归一化操作
 
         # the number of tokens is only present on the last stage, so broadcast it
         # to the other ranks in the pipeline parallel group.
         assert not isinstance(pp_group, list)
         last_rank = get_pp_last_rank(pp_group)
-        torch.distributed.broadcast(num_tokens, src=last_rank, group=pp_group)
+        torch.distributed.broadcast(num_tokens, src=last_rank, group=pp_group) #num_tokens 只在末 stage 算出来（loss 在末 stage），但每个 pp stage 的 rank 都要对自己的本地梯度做除法，所以先从末 rank 广播给整个 pp 组。
 
         # all-reduce across DP ranks.
-        torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
-        for model_chunk in model:
+        torch.distributed.all_reduce(num_tokens, group=dp_cp_group) #dp_cp 求和：per-token 的分母必须是全局所有 replica（含 CP 分片）的 token 总和，跨 dp_cp_group 求和得到
+        for model_chunk in model: #先纯 SUM 累加、最后统一除法
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens
                 model_chunk.scale_gradients(scaling)

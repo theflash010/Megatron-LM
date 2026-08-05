@@ -155,7 +155,7 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
 
 
 def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
-    '''Pseudo-deallocate (i.e., set to scalar) the output tensor's '.data' field.
+    '''Pseudo-deallocate (i.e., set to scalar) the output tensor's '.data' field. #deallocate_output_tensor 释放的是当前 pipeline stage 发送给下一个 stage 的那个输出张量，而不是 stage 内部各层计算中的中间激活。
 
     This method should be called right after the output tensor has been
     sent to the next pipeline stage. At this point, the output tensor is
@@ -184,7 +184,7 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     # Base case: deallocate tensor
     assert isinstance(out, torch.Tensor), "expected Tensor, found %s." % type(out).__name__
     assert out._base is None, "counter-productive to free a view of another tensor."
-    out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
+    out.data = torch.empty((1,), device=out.device, dtype=out.dtype) #把原张量的数据空间释放，只保留一个空壳
 
 
 def custom_backward(output, grad_output):
@@ -203,7 +203,7 @@ def custom_backward(output, grad_output):
     )
 
     # Handle scalar output
-    if grad_output is None:
+    if grad_output is None: #对于最后一个stage，由于grad_output不存在，所以这里构造一个grad_output，对loss的grad就是 1
         assert output.numel() == 1, "implicit grad requires scalar output."
         grad_output = torch.ones_like(output, memory_format=torch.preserve_format)
 
@@ -264,14 +264,14 @@ def forward_step_calc_loss(
         if loss_func is None:
             forward_data_store.append(output_tensor)
         elif not collect_non_loss_data:
-            outputs = loss_func(output_tensor) #loss_func 返回的是裸 sum（torch.sum(losses * loss_mask)）
-            if len(outputs) == 3: #loss_func是per-token模式
+            outputs = loss_func(output_tensor) #loss_func 返回裸 sum（torch.sum(losses * loss_mask)）；可能返回 2 元组（legacy 样本粒度）或 3 元组（per-token 型：loss, num_tokens, loss_reduced）
+            if len(outputs) == 3: #3 元组 = per-token 型 loss_func（用户自定义），框架按返回长度识别
                 output_tensor, num_tokens, loss_reduced = outputs
-                if not config.calculate_per_token_loss:
+                if not config.calculate_per_token_loss: #默认（样本粒度）模式才本地归一化；真正的 per-token 模式（calculate_per_token_loss=True）跳过这里，loss 保持裸 sum，最后在 finalize_model_grads 统一除以全局 token 数
                     # Protect against division by zero when all tokens are masked
                     #   in a microbatch.
-                    output_tensor /= torch.clamp(num_tokens, min=1) #得到 per-token 平均 loss（如果开了CP，那只包括自己处理的那部分token的平均loss，后面有地方会聚合loss）
-                    output_tensor /= num_microbatches #/ num_microbatches → 梯度累积平均，每个 microbatch 贡献 1/N 的梯度
+                    output_tensor /= torch.clamp(num_tokens, min=1) #默认模式：本地 per-token 平均（÷本 rank 自己的 token 数）——这是样本粒度归一化，不是真正的 per-token 模式（如果开了CP，只覆盖自己处理的那部分 token，后面有地方会聚合 loss）
+                    output_tensor /= num_microbatches #再 ÷ microbatch 数 → 梯度累积平均，每个 microbatch 贡献 1/N 的梯度
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
                 assert len(outputs) == 2 #老版本不用管
@@ -474,12 +474,12 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
 
     # Retain the grad on the input_tensor.
     unwrap_input_tensor_grad = False
-    if not isinstance(input_tensor, list):
+    if not isinstance(input_tensor, list): #统一将input_tensor打包成list，通过设置unwrap_input_tensor_grad来标识后续是否需要解包
         input_tensor = [input_tensor]
         unwrap_input_tensor_grad = True
     for x in input_tensor:
         if x is not None:
-            x.retain_grad()
+            x.retain_grad() #设置输入张量的梯度需要保留（输入张量不是叶子张量，默认不保留梯度）
 
     if not isinstance(output_tensor, list):
         output_tensor = [output_tensor]
@@ -487,7 +487,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
         output_tensor_grad = [output_tensor_grad]
 
     # Backward pass.
-    if output_tensor_grad[0] is None and config.grad_scale_func is not None:
+    if output_tensor_grad[0] is None and config.grad_scale_func is not None: #output_tensor_grad[0] is None代表是last stage 且 配置了 grad_scale_func
         output_tensor[0] = config.grad_scale_func(output_tensor[0])
 
     # In multi-modal models like VLM, some batches may not have images.
@@ -495,14 +495,14 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     # will not participate in the computation.
     # This results in a tensor that does not require gradients.
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
-    if output_tensor[0].requires_grad:
-        if config.deallocate_pipeline_outputs:
-            custom_backward(output_tensor[0], output_tensor_grad[0])
+    if output_tensor[0].requires_grad: #如果某个 pipeline stage 在这一次 microbatch 中没有做任何前向计算，它的输出 tensor 就不会关联到计算图上，requires_grad 为 False，对它执行 backward 会出错。
+        if config.deallocate_pipeline_outputs: #deallocate_pipeline_outputs 是一个显存优化选项，核心思想：output tensor 在发给下一个 stage 后，它的 .data 就没用了，唯一还有用的是 .grad_fn（用于反向传播），所以可以把 output tensor 的 .data 替换成一个标量空张量（前传的时候已经做了）。
+            custom_backward(output_tensor[0], output_tensor_grad[0]) #这是配套的 backward 实现，直接调用 C++ autograd 引擎，绕过 PyTorch 的 shape 检查。因为 .data 已经被替换成了 (1,) 的标量，如果用标准的 torch.autograd.backward 会报 shape 不匹配的错。
         else:
-            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0]) #标准的 torch.autograd.backward
 
     # Collect the grad of the input_tensor.
-    input_tensor_grad = [None]
+    input_tensor_grad = [None] #收集输入tensor（从上一个stage获得）的梯度
     if input_tensor is not None:
         input_tensor_grad = []
         for x in input_tensor:
@@ -511,7 +511,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
             else:
                 input_tensor_grad.append(x.grad)
 
-    if unwrap_input_tensor_grad:
+    if unwrap_input_tensor_grad: #解包
         input_tensor_grad = input_tensor_grad[0]
 
     if config.timers is not None:
@@ -606,7 +606,7 @@ def forward_backward_no_pipelining(
     pg_collection: Optional[ProcessGroupCollection] = None,
     force_all_reduce: Optional[bool] = False,
 ):
-    """Run forward and backward passes with no pipeline parallelism"""
+    """Run forward and backward passes with no pipeline parallelism""" #处理一个step的n个micro batch
 
     if pg_collection is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -706,10 +706,10 @@ def forward_backward_no_pipelining(
                     current_microbatch=i, #当前是第几个 microbatch
                 )
                 total_num_tokens += num_tokens
-                if not forward_only:
+                if not forward_only: #进行反传
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
         # Run computation for last microbatch out of context handler (want to
-        # synchronize gradients).
+        # synchronize gradients). #最后一个micro batch同步梯度（DDP逻辑）
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -731,10 +731,10 @@ def forward_backward_no_pipelining(
         if not forward_only: #反传
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
-    if config.finalize_model_grads_func is not None and not forward_only:
+    if config.finalize_model_grads_func is not None and not forward_only: #如果有需要，确保所有梯度同步完成了
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism and layernorm all-reduce for sequence parallelism).
-        config.finalize_model_grads_func(
+        config.finalize_model_grads_func( #梯度收尾，完成模型特定组件的额外的all-reduce操作
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
@@ -760,7 +760,7 @@ def forward_backward_no_pipelining(
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
-    ):
+    ): #当使用 CUDA Graph 加速（cuda_graph_impl == "local"）且首次迭代时，创建一组 CUDA Graph。CUDA Graph 可以在后续迭代中直接回放，省去 kernel launch 的开销。这里的条件意味着：只在首个step创建 Graph，后续回放不复创建。
         create_cudagraphs()
 
     return forward_data_store
@@ -2044,17 +2044,17 @@ def forward_backward_pipelining_without_interleaving(
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
-    adjust_tensor_shapes_fn: Optional[Callable] = None,
-    p2p_communicator: Optional[P2PCommunicator] = None,
+    adjust_tensor_shapes_fn: Optional[Callable] = None, #调整 p2p 通信的 tensor shape
+    p2p_communicator: Optional[P2PCommunicator] = None, #负责 stage 间 P2P 通信
     pg_collection: Optional[
         Union[ProcessGroupCollection, MultiModuleProcessGroupCollection]
-    ] = None,
+    ] = None, #还可以是 MultiModuleProcessGroupCollection（多模块 VLM）
     force_all_reduce: Optional[bool] = False,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
 
-    if isinstance(model, list):
+    if isinstance(model, list): #非交错1F1B不会有多个模型切分
         assert (
             len(model) == 1
         ), "non-interleaved pipeline-parallel schedule does not support model chunking"
@@ -2066,7 +2066,7 @@ def forward_backward_pipelining_without_interleaving(
         data_iterator = data_iterator[0]
 
     config = get_model_config(model)
-    if config.overlap_p2p_comm:
+    if config.overlap_p2p_comm: #P2P 通信重叠，就是让P2P Communicator的通信结果返回通信handle，后面必要同步时再用handle进行wait，只在 interleaved 1F1B 中用。非交错调度中，P2P 通信是同步的。
         raise ValueError(
             "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
         )
@@ -2077,11 +2077,11 @@ def forward_backward_pipelining_without_interleaving(
     # (used for validation and backward function selection)
     is_multimodule = isinstance(pg_collection, MultiModuleProcessGroupCollection) or isinstance(
         p2p_communicator, MultiModulePipelineCommunicator
-    )
+    ) #判断是不是多模态模型
 
-    if p2p_communicator is None and pg_collection is None:
+    if p2p_communicator is None and pg_collection is None: #如果两个都没有提供，那就创建默认的
         # Default: single-module with parallel_state groups
-        p2p_communicator = P2PCommunicator(
+        p2p_communicator = P2PCommunicator( #用pp组构建p2p_communicator
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
         )
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -2091,7 +2091,7 @@ def forward_backward_pipelining_without_interleaving(
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         pp_group = parallel_state.get_pipeline_model_parallel_group()
 
-        pg_collection = ProcessGroupCollection()
+        pg_collection = ProcessGroupCollection() #创建默认的pg_collection
         pg_collection.tp = tp_group
         pg_collection.pp = pp_group
         pg_collection.embd = embd_group

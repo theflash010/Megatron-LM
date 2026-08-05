@@ -25,7 +25,7 @@ def _batched_p2p_ops(
     next_pipeline_rank: int,
 ):
     ops = []
-    if tensor_send_prev is not None:
+    if tensor_send_prev is not None: #逐个生成P2POp对象
         send_prev_op = torch.distributed.P2POp(
             torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
         )
@@ -45,7 +45,7 @@ def _batched_p2p_ops(
             torch.distributed.irecv, tensor_recv_next, next_pipeline_rank, group
         )
         ops.append(recv_next_op)
-    if len(ops) > 0:
+    if len(ops) > 0: #打包执行
         reqs = torch.distributed.batch_isend_irecv(ops)
     else:
         reqs = []
@@ -61,7 +61,7 @@ def _p2p_ops(
     group: torch.distributed.ProcessGroup,
     prev_pipeline_rank: int,
     next_pipeline_rank: int,
-):
+): #逐个执行
     reqs = {}
     even_send_odd_recv_group = group
     if group.size() == 2 and torch.distributed.get_backend(group) != 'ucc':
@@ -76,7 +76,7 @@ def _p2p_ops(
     else:
         even_recv_odd_send_group = group
 
-    if group.rank() % 2 == 0:
+    if group.rank() % 2 == 0: #需要分奇偶rank来匹配NCCL的send和recv，否则会死锁。因为isend/irecv最终是ProcessGroupNCCL的点对点通信，对每对rank会创建一个ncclComm并使用一个cuda stream来完成NCCL kernel执行，而且不区分方向，进程不管是send还是recv都加入这个CUDA Stream，假如rank0，1进行p2p通信，都先启动send kernel再启动recv kernel，那rank0和rank1的CUDA Stream都在堵塞，相互死锁，不管是不是异步send/recv。这里通过调换顺序可以避免死锁
         if tensor_send_next is not None:
             send_next_req = torch.distributed.isend(
                 tensor=tensor_send_next, dst=next_pipeline_rank, group=even_send_odd_recv_group
@@ -149,14 +149,14 @@ class P2PCommunicator:
         self.pp_group = pp_group
         self.config = config
 
-        world_size = self.pp_group.size()
-        curr_rank_in_pg = self.pp_group.rank()
+        world_size = self.pp_group.size() #pp并行度
+        curr_rank_in_pg = self.pp_group.rank() #当前进程在pp组中的rank
 
-        next_rank_pg = (curr_rank_in_pg + 1) % world_size
-        prev_rank_pg = (curr_rank_in_pg - 1) % world_size
+        next_rank_pg = (curr_rank_in_pg + 1) % world_size #在pp组中，当前进程的下一个进程的rank
+        prev_rank_pg = (curr_rank_in_pg - 1) % world_size #在pp组中，当前进程的前一个进程的rank
 
-        self.next_rank: int | None = dist.get_global_rank(self.pp_group, next_rank_pg)
-        self.prev_rank: int | None = dist.get_global_rank(self.pp_group, prev_rank_pg)
+        self.next_rank: int | None = dist.get_global_rank(self.pp_group, next_rank_pg) #获取下一个进程的全局rank
+        self.prev_rank: int | None = dist.get_global_rank(self.pp_group, prev_rank_pg) #获取前一个进程的全局rank
         self.virtual_pipeline_model_parallel_size = (
             config.virtual_pipeline_model_parallel_size
             if config.virtual_pipeline_model_parallel_size is not None
@@ -184,7 +184,7 @@ class P2PCommunicator:
         return self.pp_group.rank()
 
     def _communicate_shapes(self, tensor_send_next, tensor_send_prev, recv_prev, recv_next):
-        """Communicate tensor shapes between stages. Used to communicate
+        """Communicate tensor shapes between stages. Used to communicate #用于在不同micro batch的序列长度变化场景下，在传输实际 tensor 数据之前先交换 shape 信息
         tensor shapes before the actual tensor communication happens.
         This is required when the sequence lengths across micro batches
         are not uniform.
@@ -206,24 +206,24 @@ class P2PCommunicator:
         recv_next_shape_tensor = None
         send_prev_shape_tensor = None
         send_next_shape_tensor = None
-        if recv_prev:
+        if recv_prev: # 接收方的 buffer：空的 (3,) tensor，等着被填充。(seq, batch, hidden)
             recv_prev_shape_tensor = torch.empty(
                 (3,), device=torch.cuda.current_device(), dtype=torch.int64
             )
-        if recv_next:
+        if recv_next: # 接收方的 buffer：空的 (3,) tensor，等着被填充。(seq, batch, hidden)
             recv_next_shape_tensor = torch.empty(
                 (3,), device=torch.cuda.current_device(), dtype=torch.int64
             )
-        if tensor_send_prev is not None:
+        if tensor_send_prev is not None: # 发送方：把实际 tensor 的 shape 转成 tensor
             send_prev_shape_tensor = torch.tensor(
                 tensor_send_prev.size(), device=torch.cuda.current_device(), dtype=torch.int64
             )
-        if tensor_send_next is not None:
+        if tensor_send_next is not None: # 发送方：把实际 tensor 的 shape 转成 tensor
             send_next_shape_tensor = torch.tensor(
                 tensor_send_next.size(), device=torch.cuda.current_device(), dtype=torch.int64
             )
 
-        if config.use_ring_exchange_p2p:
+        if config.use_ring_exchange_p2p: #默认False，PyTorch已弃用torch.distributed.ring_exchange
             torch.distributed.ring_exchange(
                 tensor_send_prev=send_prev_shape_tensor,
                 tensor_recv_prev=recv_prev_shape_tensor,
@@ -263,11 +263,11 @@ class P2PCommunicator:
             torch.cuda.synchronize()
 
         recv_prev_shape = [0, 0, 0]
-        if recv_prev_shape_tensor is not None:
+        if recv_prev_shape_tensor is not None: # 如果recv_prev_shape_tensor不是None，说明它被填充值了。(3,) tensor，等着被填充。(seq, batch, hidden)
             recv_prev_shape = recv_prev_shape_tensor.tolist()
 
         recv_next_shape = [0, 0, 0]
-        if recv_next_shape_tensor is not None:
+        if recv_next_shape_tensor is not None: # 如果recv_next_shape_tensor不是None，说明它被填充值了。(3,) tensor，等着被填充。(seq, batch, hidden)
             recv_next_shape = recv_next_shape_tensor.tolist()
 
         return recv_prev_shape, recv_next_shape
@@ -298,12 +298,12 @@ class P2PCommunicator:
             recv_next (boolean, required):
                 whether tensor should be received from next rank.
 
-            tensor_shape (List[int] or torch.Size, required):
+            tensor_shape (List[int] or torch.Size, required): #指定要接收的张量的形状
                 shape of tensor to receive (this method assumes that all
                 tensors sent and received in a single function call are
                 the same shape).
 
-            wait_on_reqs (boolean, optional, default=False):
+            wait_on_reqs (boolean, optional, default=False): #控制 _communicate 内部是否等通信完成再返回，只能用于非批量提交 p2p 通信，因为批量提交的请求无法单独管理等待时机。
                 For non-batched p2p communication, wait on each request
                 before returning.
 
@@ -320,14 +320,14 @@ class P2PCommunicator:
         tensor_recv_next_func = None
 
         if config.variable_seq_lengths or config.mtp_standalone:
-            recv_prev_shape, recv_next_shape = self._communicate_shapes(
+            recv_prev_shape, recv_next_shape = self._communicate_shapes( #变长序列（variable_seq_lengths）或 MTP 模式：先交换 shape，再分配 buffer
                 tensor_send_next, tensor_send_prev, recv_prev, recv_next
             )
-        else:
+        else: #固定序列长度：shape 由调用方通过参数传入，不需要额外的 shape 交换
             recv_prev_shape = tensor_shape
             recv_next_shape = tensor_shape
 
-        def create_tensor_recv_prev():
+        def create_tensor_recv_prev(): #创建接收 buffer
             return torch.empty(
                 recv_prev_shape,
                 requires_grad=True,
@@ -335,7 +335,7 @@ class P2PCommunicator:
                 dtype=config.pipeline_dtype,
             )
 
-        def create_tensor_recv_next():
+        def create_tensor_recv_next(): #创建接收 buffer
             return torch.empty(
                 recv_next_shape,
                 requires_grad=True,
@@ -363,18 +363,18 @@ class P2PCommunicator:
                 )
             tensor_recv_next_func = create_tensor_recv_next
 
-        # Send tensors in both the forward and backward directions as appropriate.
-        if config.use_ring_exchange_p2p:
+        # Send tensors in both the forward and backward directions as appropriate. #确定使用哪种p2p通信方式
+        if config.use_ring_exchange_p2p: #已弃用，理论上从不执行
 
             def _ring_exchange_wrapper(**kwargs):
                 torch.distributed.ring_exchange(**kwargs)
                 return []
 
             p2p_func = _ring_exchange_wrapper
-        elif config.batch_p2p_comm:
+        elif config.batch_p2p_comm: # 批量提交（batch_isend_irecv）
             assert wait_on_reqs
             p2p_func = _batched_p2p_ops
-        else:
+        else: # 逐个 isend/irecv
             p2p_func = _p2p_ops
 
         pp_group = self.pp_group
@@ -389,10 +389,10 @@ class P2PCommunicator:
         tensor_recv_prev = None
         tensor_recv_next = None
         if tensor_recv_prev_func is not None:
-            tensor_recv_prev = tensor_recv_prev_func()
+            tensor_recv_prev = tensor_recv_prev_func() #创建接收buffer
 
         if tensor_recv_next_func is not None:
-            tensor_recv_next = tensor_recv_next_func()
+            tensor_recv_next = tensor_recv_next_func() #创建接收buffer
 
         p2p_reqs = p2p_func(
             tensor_send_prev=tensor_send_prev,
@@ -402,7 +402,7 @@ class P2PCommunicator:
             group=pp_group,
             prev_pipeline_rank=prev_rank,
             next_pipeline_rank=next_rank,
-        )
+        ) #执行p2p通信，包括4个点对点通信
         if isinstance(p2p_reqs, list):
             reqs.extend(p2p_reqs)
         else:
@@ -410,15 +410,15 @@ class P2PCommunicator:
 
         if wait_on_reqs and len(reqs) > 0:
             for req in reqs if isinstance(reqs, list) else reqs.values():
-                req.wait()
+                req.wait() #在返回给上层之前，把四个方向的通信完成事件都挂到当前 compute stream 上。这样上层拿到 tensor_recv_prev 直接送进下一层网络计算就是安全的，不需要关心通信是否真的结束——GPU 会自己在正确的位置等。
             reqs = None
 
-        if config.batch_p2p_comm and config.batch_p2p_sync:
+        if config.batch_p2p_comm and config.batch_p2p_sync: #强制同步完成batch p2p通信
             # To protect against race condition when using batch_isend_irecv().
             # User should assert that we have a modern enough PyTorch to not need this
             torch.cuda.synchronize()
 
-        return tensor_recv_prev, tensor_recv_next, reqs
+        return tensor_recv_prev, tensor_recv_next, reqs #返回接受的张量和通信handle
 
     @nvtx_decorator()
     def recv_forward(
@@ -432,7 +432,7 @@ class P2PCommunicator:
         input_tensors = []
         config = self.config
         for tensor_shape in tensor_shapes:
-            if is_first_stage:
+            if is_first_stage: #第一个stage没有前序rank，所以不需要从前序rank接收数据
                 input_tensor = None
             else:
                 if config.timers is not None:
@@ -463,7 +463,7 @@ class P2PCommunicator:
         config = self.config
         output_tensor_grads = []
         for tensor_shape in tensor_shapes:
-            if is_last_stage:
+            if is_last_stage: #最后一个stage没有后序rank，所以不需要从后序rank接收数据
                 output_tensor_grad = None
             else:
                 if config.timers is not None:
@@ -484,7 +484,7 @@ class P2PCommunicator:
 
     @nvtx_decorator()
     def send_forward(self, output_tensors, is_last_stage: bool) -> None:
-        """Send tensor to next rank in pipeline (forward send)."""
+        """Send tensor to next rank in pipeline (forward send).""" #前向把激活值送出去
         config = self.config
         if not isinstance(output_tensors, list):
             output_tensors = [output_tensors]
@@ -505,7 +505,7 @@ class P2PCommunicator:
 
     @nvtx_decorator()
     def send_backward(self, input_tensor_grads, is_first_stage: bool) -> None:
-        """Send tensor to previous rank in pipeline (backward send)."""
+        """Send tensor to previous rank in pipeline (backward send).""" #后向把梯度传出去
         if not isinstance(input_tensor_grads, list):
             input_tensor_grads = [input_tensor_grads]
         config = self.config
@@ -527,7 +527,7 @@ class P2PCommunicator:
     def send_forward_recv_backward(
         self, output_tensors, tensor_shapes, is_last_stage: bool
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
-        """Batched send and recv with next rank in pipeline."""
+        """Batched send and recv with next rank in pipeline.""" #一次性做好前传的send和反传的recv，都是和下一级stage的通信
         config = self.config
         unwrap_output_tensors = False
         if not isinstance(output_tensors, list):
@@ -560,7 +560,7 @@ class P2PCommunicator:
     def send_backward_recv_forward(
         self, input_tensor_grads, tensor_shapes, is_first_stage: bool
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
-        """Batched send and recv with previous rank in pipeline."""
+        """Batched send and recv with previous rank in pipeline.""" #一次性做好后传的send和前传的recv，都是和上一级stage的通信
         config = self.config
         unwrap_input_tensor_grads = False
         if not isinstance(input_tensor_grads, list):
@@ -595,9 +595,9 @@ class P2PCommunicator:
         output_tensor: torch.Tensor,
         recv_prev: bool,
         tensor_shape: Shape,
-        overlap_p2p_comm: bool = False,
+        overlap_p2p_comm: bool = False, #可选，控制这次 P2P 通信是同步等完还是异步返回 handle，从而让通信和计算重叠，PrcessGroupNCCL的P2P肯定是使用非compute stream，所以可以重叠
     ) -> torch.Tensor:
-        """Batched recv from previous rank and send to next rank in pipeline."""
+        """Batched recv from previous rank and send to next rank in pipeline.""" #一次性做好前传的send和前传的recv，分别和下一级stage和上一级stage通信，recv可选
         config = self.config
         if config.timers is not None:
             config.timers('forward-send-forward-recv', log_level=2).start()
@@ -621,9 +621,9 @@ class P2PCommunicator:
         input_tensor_grad: torch.Tensor,
         recv_next: bool,
         tensor_shape: Shape,
-        overlap_p2p_comm: bool = False,
+        overlap_p2p_comm: bool = False, #可选，控制这次 P2P 通信是同步等完还是异步返回 handle，从而让通信和计算重叠，PrcessGroupNCCL的P2P肯定是使用非compute stream，所以可以重叠
     ) -> torch.Tensor:
-        """Batched recv from next rank and send to previous rank in pipeline."""
+        """Batched recv from next rank and send to previous rank in pipeline.""" #一次性做好后传的send和后传的recv，分别和上一级stage和下一级stage通信，recv可选
         config = self.config
         if config.timers is not None:
             config.timers('backward-send-backward-recv', log_level=2).start()
@@ -650,7 +650,7 @@ class P2PCommunicator:
         recv_next: bool,
         tensor_shape: Shape,
     ) -> torch.Tensor:
-        """Batched send and recv with previous and next ranks in pipeline."""
+        """Batched send and recv with previous and next ranks in pipeline.""" #一次性做好前传反传的send和recv，recv可选
         config = self.config
         if config.timers is not None:
             config.timers('forward-backward-send-forward-backward-recv', log_level=2).start()

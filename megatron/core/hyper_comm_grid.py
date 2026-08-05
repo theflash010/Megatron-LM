@@ -31,7 +31,7 @@ except ImportError:
 
 
 class HyperCommGrid:
-    r"""N-dimensional communication grid.
+    r"""N-dimensional communication grid. #包含各种并行方法（tp, cp, pp, dp）的通信网格
 
     Manages an arbitrary number of parallelisms as a hyperrectangle. Each dimension is given a name
     at initialization time. The order of ``dim_names`` implies the mapping order equivalent to
@@ -81,10 +81,10 @@ class HyperCommGrid:
 
     def __init__(
         self,
-        shape: list[int],
-        dim_names: list[str],
-        rank_offset: int = 0,
-        backend: Optional[str] = None,
+        shape: list[int], #shape 描述每个并行方法的尺寸，并行度
+        dim_names: list[str], #dim_names 描述每个维度的名称，这里每个并行方法名称的顺序决定 global rank 的排布方式，就是原来的order="tp-pp-dp"配置
+        rank_offset: int = 0, #表示这个模块从哪个 global rank 开始
+        backend: Optional[str] = None, #通信后端
     ) -> None:
         if len(shape) != len(dim_names):
             raise ValueError(f"len(shape) {shape} != len(dim_names) {dim_names}")
@@ -102,7 +102,7 @@ class HyperCommGrid:
                 "initialize torch.distributed before creating HyperCommGrid."
             )
         self.rank_offset = rank_offset
-        self.size = np.prod(shape)
+        self.size = np.prod(shape) #计算形状的总尺寸，代表通信网格中rank的总数量
         if rank_offset < 0:
             raise ValueError(f"rank_offset must be non-negative, got {rank_offset}")
         if self.size > world_size - rank_offset:
@@ -146,7 +146,7 @@ class HyperCommGrid:
             KeyError: If attempting to recreate a process group with an existing key.
         """
         # ordered_dims and unique_group_key will follow the reversed order of self.dim_names
-        ordered_dims, unique_group_key = self._order_dims(dims)
+        ordered_dims, unique_group_key = self._order_dims(dims) #将输入dim按照HyperCommGrid初始化时指定的dim顺序重新排列，unique_group_key由参与的并行维度+连字符拼接成的字符串唯一标识该通信组配置
 
         if unique_group_key in self._pgs:
             raise KeyError(
@@ -155,14 +155,14 @@ class HyperCommGrid:
                 f"of returning the process group that has already been created before."
             )
 
-        rank_enum = self._gen_rank_enum(ordered_dims)
-        pg, _ = dist.new_subgroups_by_enumeration(rank_enum, backend=self.backend, **kwargs)
+        rank_enum = self._gen_rank_enum(ordered_dims) #生成该通信组的所有rank组合
+        pg, _ = dist.new_subgroups_by_enumeration(rank_enum, backend=self.backend, **kwargs) #一次给出多个互不重叠的 rank 列表，按顺序为每个列表创建一个 ProcessGroup，并返回当前 rank 所属的那个 subgroup。
 
         if dist.get_rank() == 0:
             logging.info(
                 f"Generated process group for {unique_group_key} with enumeration {rank_enum}"
             )
-        self._pgs[unique_group_key] = pg
+        self._pgs[unique_group_key] = pg #把新创建的通信组加入到HyperCommGrid内部维护的通信组字典中
         return pg
 
     def destroy(self) -> None:
@@ -178,21 +178,21 @@ class HyperCommGrid:
         Args:
             dims: Name of leading dimensions to create process group
         """
-        _, unique_group_key = self._order_dims(dims)
+        _, unique_group_key = self._order_dims(dims) #获取 dims 对应的 unique_group_key标识
 
         if unique_group_key not in self._pgs:
             raise KeyError(
                 f"Process group for {unique_group_key} hasn't been created. Call create_pg first."
             )
 
-        return self._pgs[unique_group_key]
+        return self._pgs[unique_group_key] #在HyperCommGrid内部维护的通信组字典中，查找并返回对应通信组
 
     def get_rank_enum(self, dims: Union[str, list[str]]) -> list[list[int]]:
-        r"""Get the rank enumeration for the requested dimension(s).
+        r"""Get the rank enumeration for the requested dimension(s). #基本用法：获取指定并行维度的通信组（rank集合）的列表
 
         This is the exact enumeration that would be used by create_pg for the same
         dims. It is useful for creating additional groups whose membership is derived from
-        the grid (e.g., embedding/position-embedding groups derived from PP groups).
+        the grid (e.g., embedding/position-embedding groups derived from PP groups). #衍生用法：让调用方获取指定并行维度的通信组（rank集合）的列表，从中挑选、组合 rank，创建不规则的派生通信组，比如获取pp维度的通信组，但是只选择首尾stage的rank来创建embedding通信组列表。
 
         Args:
             dims: Dimension name or list of dimension names.
@@ -200,10 +200,10 @@ class HyperCommGrid:
         Returns:
             List of rank lists (one per subgroup).
         """
-        ordered_dims, _ = self._order_dims(dims)
+        ordered_dims, _ = self._order_dims(dims) #把调用方传入的维度名称，按照 HyperCommGrid 内部统一的顺序重新排列
         return self._gen_rank_enum(ordered_dims)
 
-    def _gen_rank_enum(self, dims: list[str]) -> list[list[int]]:
+    def _gen_rank_enum(self, dims: list[str]) -> list[list[int]]: #把一段连续的 global rank 按 N 维网格展开，然后指定哪些维度在组内变化，最终生成所有通信组的 rank 列表。
         r"""Generate rank enumeration before calling new_subgroups_by_enumeration
 
         This function returns ranks grouped by the specified dimensions, but in REVERSE order
@@ -231,25 +231,25 @@ class HyperCommGrid:
             )
 
         # Need to reverse order of dim_names to match MCore convention
-        dim_names_reverse = self.dim_names[::-1]
+        dim_names_reverse = self.dim_names[::-1] #反转维度，适配numpy的多维排列函数
 
-        remaining_dims = []
+        remaining_dims = [] # 找出没有参与通信的维度
         for v in dim_names_reverse:
             if v not in dims:
                 remaining_dims.append(v)
 
         rearrange_str = (
             f"({' '.join(dim_names_reverse)}) -> ({' '.join(remaining_dims)}) ({' '.join(dims)})"
-        )
+        )#构造 einops 排列表达式，如对于 dims=["pp"]，得到：(dp pp tp) -> (dp tp) (pp)。意味着：输入：把一维 rank 数组解释为 [DP, PP, TP] 三维数组。 输出：第一维折叠 DP 和 TP，用来枚举不同通信组，第二维保留 PP，用来枚举一个通信组内的 rank
         logging.debug(rearrange_str)
 
         shape_dict = {d: s for d, s in zip(self.dim_names, self.shape)}
-        return einops.rearrange(
+        return einops.rearrange( #执行 rearrange，转为list
             np.arange(self.rank_offset, self.rank_offset + self.size), rearrange_str, **shape_dict
         ).tolist()
 
     def _order_dims(self, dims: Union[str, list[str]]) -> Tuple[list[str], str]:
-        r"""Reorder dims based on the order of self.dim_names"""
+        r"""Reorder dims based on the order of self.dim_names""" #把调用方传入的维度名称，按照 HyperCommGrid 内部统一的顺序重新排列，并生成一个稳定的字符串 key。
         if not isinstance(dims, list):
             ordered_dims = [dims]
         else:
@@ -263,7 +263,7 @@ class HyperCommGrid:
         unique_group_key = "-".join(ordered_dims)
         return ordered_dims, unique_group_key
 
-    def is_current_rank_in_grid(self) -> bool:
+    def is_current_rank_in_grid(self) -> bool: #判断当前 rank 是否在当前通信网格范围内
         """Check if the current rank belongs to this grid.
 
         Returns:

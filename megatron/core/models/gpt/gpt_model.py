@@ -228,7 +228,7 @@ class GPTModel(LanguageModule):
         # Output
         if self.post_process:
 
-            if self.config.defer_embedding_wgrad_compute:
+            if self.config.defer_embedding_wgrad_compute:  #开启 defer_embedding_wgrad_compute 后，反传时不立即算 wgrad，而是把 embedding 输入激活值暂存到 embedding_activation_buffer（tensor_parallel/layers.py:1034 附近），等step内所有 micro-batch 攒齐后再一次性批量算（drain_embedding_wgrad_compute）。
                 # The embedding activation buffer preserves a reference to the input activations
                 # of the final embedding projection layer GEMM. It will hold the activations for
                 # all the micro-batches of a global batch for the last pipeline stage. Once we are
