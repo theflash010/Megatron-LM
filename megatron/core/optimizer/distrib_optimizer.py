@@ -2609,15 +2609,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Utility method for copying group grads.
         def copy_group_grads(model_groups, shard_main_groups):
-            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
-                for model_param, shard_main_param in zip(model_group, shard_main_group):
+            for model_group, shard_main_group in zip(model_groups, shard_main_groups): #模型参数组和对应的主分片组
+                for model_param, shard_main_param in zip(model_group, shard_main_group): #模型参数和对应的主分片参数
 
-                    param_range_map = self._get_model_param_range_map(model_param)
+                    param_range_map = self._get_model_param_range_map(model_param) #确定主分片参数在模型参数中的范围
                     param_range = param_range_map["param"]
                     assert param_range.size == shard_main_param.nelement()
 
-                    model_grad = model_param.main_grad
-                    shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
+                    model_grad = model_param.main_grad ## 完整 grad buffer 视图（大部分是不完整的本地梯度，只有主分片对应的梯度是DDP通信过的完整的）
+                    shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end] #提取对应主分片的梯度
                     if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                         # Pytorch requires a param and its' grad to be the same dtype, but we want
                         # their types to be different in precision-aware optimizer. So we use
@@ -2626,15 +2626,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # the optimizer read gradients from ".decoupled_grad" instead of ".grad").
                         shard_main_param.decoupled_grad = shard_model_grad
                     else:
-                        shard_main_param.grad = shard_model_grad.float()
+                        shard_main_param.grad = shard_model_grad.float() #将grad转换为fp32位，赋值给shard_main_param的grad属性
 
         # Copy model groups to shard groups.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             copy_group_grads(self.model_float16_groups, self.shard_float16_groups)
             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
-        else:
-            copy_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
-            copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
+        else: #一般走这里
+            copy_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups) #对应param.data本身是bf16/fp16的情况，和下面那个是互斥的
+            copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups) #对应param.data本身是fp32的情况
 
     def _copy_main_params_to_model_params(self):
         """
@@ -2677,14 +2677,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for shard_main_param, model_param in zip(shard_main_group, model_group):
 
                     param_range_map = self._get_model_param_range_map(model_param)
-                    world_range = param_range_map["gbuf_world_in_bucket"]
+                    world_range = param_range_map["gbuf_world_in_bucket"] #确定参数在bucket中的范围
 
                     assert world_range.size == shard_main_param.nelement()
 
                     gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
-                    model_param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
+                    model_param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data #得到bucket的param数据
 
-                    shard_model_param = model_param_buffer.view(-1)[
+                    shard_model_param = model_param_buffer.view(-1)[ #按照param在bucket中对应的范围进行赋值
                         world_range.start : world_range.end
                     ]
 
@@ -2699,7 +2699,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         shard_model_param.data.copy_(shard_main_param)
 
         # Copy shard groups to model groups.
-        copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
+        copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups) #fp32主参数和模型本身的fp16param
         copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
 
     def _copy_main_params_to_param_buffer(self):
@@ -2830,7 +2830,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
-        update_successful = super().step_with_ready_grads()
+        update_successful = super().step_with_ready_grads() #执行父类MixedPrecisionOptimizer的step_with_ready_grads方法，完成分片参数的优化器更新，其余参数还没更新（需要从其他DP rank allgather得到）
 
         timers = self.config.timers
         if timers is not None:
@@ -2845,10 +2845,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # If not overlapping all-gather for parameters, launch synchronous all-gather
             # communication calls here. If overlapping all-gather for parameters, the following
             # the first all-gather is launched asynchronously in the next optimizer.zero_grad()
-            # call and subsequent all-gathers are launched in the forward pre-hook.
-            if not self.ddp_config.overlap_param_gather:
+            # call and subsequent all-gathers are launched in the forward pre-hook. #对于异步，这里不进行allgather，直接进入下一轮训练，在下一轮的module 进行forward的时候触发pre-hook来进行bucket group的allgather，并且链式触发后续bucket group的allgather
+            if not self.ddp_config.overlap_param_gather: #同步路径（默认）：start_param_sync() 在这里发起 all-gather，step() 返回前通信已完成——简单但 step 要等通信
                 for model_chunk in self.model_chunks:
-                    model_chunk.start_param_sync()
+                    model_chunk.start_param_sync() #发起all-gather，是同步通信（start_param_sync中的async_op=False），会阻塞直到all-gather完成
         if timers is not None:
             timers('params-all-gather').stop()
 

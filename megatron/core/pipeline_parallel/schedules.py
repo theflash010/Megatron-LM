@@ -786,7 +786,7 @@ def clear_embedding_activation_buffer(config, model, is_last_stage):
 
 
 def finish_embedding_wgrad_compute(config, embedding_module, is_last_stage, tp_group):
-    """Finish embedding wgrad compute."""
+    """Finish embedding wgrad compute.""" #补齐LM Head的梯度计算
     if is_last_stage and config.defer_embedding_wgrad_compute:
         embedding_activation_buffer = embedding_module.embedding_activation_buffer
         grad_output_buffer = embedding_module.grad_output_buffer
@@ -2009,26 +2009,26 @@ def get_tensor_shapes(
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    """Determine tensor shapes for pipeline communication.
+    """Determine tensor shapes for pipeline communication. #确定P2P通信张量shape（单个micro batch通信）
 
     Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
     or computed shapes for fixed sequence length mode.
     """
     tensor_shapes = []
 
-    if config.variable_seq_lengths:
+    if config.variable_seq_lengths: #如果变长序列，返回空list，意思是张量shape通过P2P通信获取
         # Shapes exchanged dynamically during P2P communication
         tensor_shapes.append(())
         return tensor_shapes
 
-    # Fixed sequence lengths - compute shape
+    # Fixed sequence lengths - compute shape #如果固定序列长度，返回计算好的shape
     effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
-    effective_seq_length = effective_seq_length // cp_group.size()
+    effective_seq_length = effective_seq_length // cp_group.size() #首先CP切分
 
     if config.sequence_parallel:
-        effective_seq_length = effective_seq_length // tp_group.size()
+        effective_seq_length = effective_seq_length // tp_group.size() #然后SP切分
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size)) #添加张量shape
     return tensor_shapes
 
 
@@ -2133,7 +2133,7 @@ def forward_backward_pipelining_without_interleaving(
         raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
 
     # Needed only when gradients are finalized in M-Core
-    if config.finalize_model_grads_func is not None and not forward_only:
+    if config.finalize_model_grads_func is not None and not forward_only: #对于延迟LM Head的wgrad计算，这里把用于保存激活值的buffer清空
         embedding_module = clear_embedding_activation_buffer(
             config, model, p2p_communicator.is_pp_last_stage
         )
@@ -2142,31 +2142,31 @@ def forward_backward_pipelining_without_interleaving(
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
     # Disable async grad reductions
-    no_sync_func = config.no_sync_func
+    no_sync_func = config.no_sync_func #指定no_sync_func，用于控制DDP梯度通信的触发时机（overlap场景，overlap_grad_reduce=True）
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
     no_sync_context = None
 
     def disable_grad_sync():
-        """Disable asynchronous grad reductions"""
+        """Disable asynchronous grad reductions""" #禁止异步DDP梯度通信
         nonlocal no_sync_context
         if no_sync_context is None:
             no_sync_context = no_sync_func()
             no_sync_context.__enter__()
 
     def enable_grad_sync():
-        """Enable asynchronous grad reductions"""
+        """Enable asynchronous grad reductions""" #启用异步DDP梯度通信
         nonlocal no_sync_context
         if no_sync_context is not None:
             no_sync_context.__exit__(None, None, None)
             no_sync_context = None
 
-    disable_grad_sync()
+    disable_grad_sync() #先禁止异步DDP梯度通信
 
     # Compute number of warmup microbatches.
-    num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1
-    num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
-    num_microbatches_remaining = num_microbatches - num_warmup_microbatches
+    num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1  #warmup阶段的microbatch数量，p2p_communicator.current_stage从0开始编号
+    num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches) #确保warmup阶段的microbatch数量不超过总microbatch数量
+    num_microbatches_remaining = num_microbatches - num_warmup_microbatches #剩余的microbatch数量（非warmup阶段）
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
@@ -2175,13 +2175,13 @@ def forward_backward_pipelining_without_interleaving(
     # the rest of micro-batches within a window of micro-batches checkpoint
     # all Transformer layers. The window of micro-batches is set by the maximum
     # outstanding backpropagations and becomes smaller at later pipeline stages.
-    # Please refer the appendix C in https://arxiv.org/pdf/2205.05198.pdf
-    max_outstanding_backprops = None
-    if config.num_microbatches_with_partial_activation_checkpoints is not None:
+    # Please refer the appendix C in https://arxiv.org/pdf/2205.05198.pdf #出自论文 Reducing Activation Recomputation 附录 C
+    max_outstanding_backprops = None #每个stage为指定一些micro batch进行部分重计算所使用的窗口，窗口大小等于warmup阶段的microbatch数量+1（就是in-flight micro batch数量+1），越靠后的stage窗口越小
+    if config.num_microbatches_with_partial_activation_checkpoints is not None: #num_microbatches_with_partial_activation_checkpoints确定使用哪些micro batch进行部分重计算，i%W < T的micro batch进行部分重计算（T就是num_microbatches_with_partial_activation_checkpoints，W就是max_outstanding_backprops），其余的micro batch全部重计算。越靠前的stage有更多的micro batch进行完全重计算来压显存占用
         max_outstanding_backprops = num_warmup_microbatches + 1
 
     # Select backward function based on whether multi-module or single-module
-    if is_multimodule:
+    if is_multimodule: #确定使用哪种后向传播流程
         backward_func = partial(
             backward_step_multimodule,
             language_model_module_name=pg_collection.language_model_module_name,
@@ -2189,7 +2189,7 @@ def forward_backward_pipelining_without_interleaving(
     else:
         backward_func = backward_step
 
-    recv_tensor_shapes = get_tensor_shapes(
+    recv_tensor_shapes = get_tensor_shapes( #确定recv张量shape
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
         decoder_seq_length=decoder_seq_length,
@@ -2197,7 +2197,7 @@ def forward_backward_pipelining_without_interleaving(
         tp_group=tp_group,
         cp_group=cp_group,
     )
-    send_tensor_shapes = get_tensor_shapes(
+    send_tensor_shapes = get_tensor_shapes( #确定send张量shape
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
         decoder_seq_length=decoder_seq_length,
@@ -2215,26 +2215,26 @@ def forward_backward_pipelining_without_interleaving(
     output_tensors = None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
-    if not forward_only:
+    if not forward_only: #input_tensors用于保存输入该stage的激活值，output_tensors用于保存该stage输出的激活值
         input_tensors = []
         output_tensors = []
     forward_data_store = []
 
     # Run warmup forward passes.
-    for i in range(num_warmup_microbatches):
+    for i in range(num_warmup_microbatches): #开始执行warmup阶段的forward passes
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
-            checkpoint_activations_microbatch = (
+            checkpoint_activations_microbatch = ( #判断是否进行完全重计算
                 i % max_outstanding_backprops
                 >= config.num_microbatches_with_partial_activation_checkpoints
             )
         else:
             checkpoint_activations_microbatch = None
 
-        input_tensor = p2p_communicator.recv_forward(
+        input_tensor = p2p_communicator.recv_forward( #接受前序stage发送过来的张量
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
-        output_tensor, num_tokens = forward_step(
+        output_tensor, num_tokens = forward_step( #执行单个micro batch的前传
             forward_step_func,
             data_iterator,
             model,
@@ -2249,40 +2249,40 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i,
             is_last_stage=p2p_communicator.is_pp_last_stage,
         )
-        p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
-        total_num_tokens += num_tokens
+        p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage) #发送前向结果张量到后序stage
+        total_num_tokens += num_tokens #累加tokens数量
 
         if not forward_only:
-            input_tensors.append(input_tensor)
-            output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
-
+            input_tensors.append(input_tensor) #保存该stage接受到的输入张量
+            output_tensors.append(output_tensor) #保存该stage输出的激活值
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs) #把output tensor的.data换为(1,)，相当于清空output tensor激活值的显存空间（反正反传也不需要这个激活值，只要保留空壳在后面反传能挂上grad_fn就行）
+    
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
     # receive this tensor here.
-    if num_microbatches_remaining > 0:
+    if num_microbatches_remaining > 0: #准备进入steady阶段，这里先接收steady阶段第一个micro batch的输入张量
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
 
     # Run 1F1B in steady state.
-    for i in range(num_microbatches_remaining):
-        last_iteration = i == (num_microbatches_remaining - 1)
+    for i in range(num_microbatches_remaining): #开始执行steady阶段，遵循1F1B
+        last_iteration = i == (num_microbatches_remaining - 1) #判断是否是steady阶段的最后一个micro batch
 
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
-            checkpoint_activations_microbatch = (
+            checkpoint_activations_microbatch = ( #判断是否进行完全重计算
                 (i + num_warmup_microbatches) % max_outstanding_backprops
             ) >= config.num_microbatches_with_partial_activation_checkpoints
         else:
             checkpoint_activations_microbatch = None
 
-        output_tensor, num_tokens = forward_step(
+        output_tensor, num_tokens = forward_step( #完成单个micro batch的前传，并得到该stage的输出张量和该micro batch处理的tokens数量
             forward_step_func,
             data_iterator,
             model,
             num_microbatches,
-            input_tensor,
+            input_tensor, #提前接收好了上游stage传递的输入激活值
             forward_data_store,
             config,
             cp_group_size=cp_size,
@@ -2294,7 +2294,7 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i + num_warmup_microbatches,
             is_last_stage=p2p_communicator.is_pp_last_stage,
         )
-        total_num_tokens += num_tokens
+        total_num_tokens += num_tokens #累加tokens数量
 
         if forward_only:
             p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
@@ -2302,85 +2302,85 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor = p2p_communicator.recv_forward(
                     recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
-        else:
-            output_tensor_grad = p2p_communicator.send_forward_recv_backward(
+        else: #训练走这里，反传走这里
+            output_tensor_grad = p2p_communicator.send_forward_recv_backward( #和下一个stage的通信，把计算出的激活值发给下一个stage，并从下一个stage获取反传梯度
                 output_tensor, send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
 
             # Add input_tensor and output_tensor to end of list.
-            input_tensors.append(input_tensor)
-            output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            input_tensors.append(input_tensor) #保存该stage接受到的输入张量
+            output_tensors.append(output_tensor) #保存该stage输出的激活值
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs) #把output tensor的.data换为(1,)，相当于清空output tensor激活值的显存空间（反正反传也不需要这个激活值，只要保留空壳在后面反传能挂上grad_fn就行）
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.
-            input_tensor = input_tensors.pop(0)
-            output_tensor = output_tensors.pop(0)
+            input_tensor = input_tensors.pop(0) #弹出该stage接受到的输入张量，因为处理micro batch的顺序是固定的，最早进行前传的micro batch，也是最早进行反传的micro batch，所以直接出队列
+            output_tensor = output_tensors.pop(0) #弹出该stage输出的激活值
 
             # Enable grad sync for the last microbatch in the batch if the full
             # backward pass completes in the 1F1B stage.
-            if num_warmup_microbatches == 0 and last_iteration:
-                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
-                    enable_grad_sync()
+            if num_warmup_microbatches == 0 and last_iteration: #如果是最后一个stage且已经处理完除最后一个micro batch外的所有micro batch的反传，那就开启DDP的梯度通信。其他stage不在这里开启，在cool down阶段开启。
+                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage: #grad_sync_func在align_grad_reduce才会被设置（align_grad_reduce控制的是多个 PP stage 的梯度归约通信要不要"对齐时刻"一起发起），一般不用。
+                    enable_grad_sync() #开启DDP梯度通信就绪跟踪
 
-            input_tensor_grad = backward_func(
+            input_tensor_grad = backward_func( #完成单个micro batch的反传，并得到输入激活值梯度
                 input_tensor, output_tensor, output_tensor_grad, config
             )
 
-            if last_iteration:
+            if last_iteration: #如果是steady阶段的最后一个micro batch，那就把input_tensor_grad发给前序stage，完成反传
                 input_tensor = None
                 p2p_communicator.send_backward(
                     input_tensor_grad, p2p_communicator.is_pp_first_stage
                 )
-            else:
+            else:#如果不是最后一个micro batch，那就和前序stage两个通信操作，把input_tensor_grad发给前序stage，并接收前序stage发过来的输入激活值，为后续前传做准备
                 input_tensor = p2p_communicator.send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
 
     # Run cooldown backward passes.
-    if not forward_only:
-        for i in range(num_warmup_microbatches):
+    if not forward_only: #训练走这里，就执行cool down阶段的反传
+        for i in range(num_warmup_microbatches): #cool down阶段需要反传的micro batch数量是和warmup阶段对应的（因为warmup阶段没做的反传在这里做）
 
             # Enable async grad reduction in the last backward pass
             # Note: If grad sync function is provided, only enable
             # async grad reduction in first pipeline stage. Other
             # pipeline stages do grad reduction during pipeline
             # bubble.
-            if i == num_warmup_microbatches - 1:
-                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
+            if i == num_warmup_microbatches - 1: #如果是cool down阶段的最后一个micro batch，就开启DDP的梯度通信就绪跟踪
+                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage: #grad_sync_func在align_grad_reduce才会被设置（align_grad_reduce控制的是多个 PP stage 的梯度归约通信要不要"对齐时刻"一起发起），一般不用。如果使用align，这里对first stage也会提前开启DDP梯度通信就绪跟踪，因为first stage的DDP梯度通信是关键路径。
                     enable_grad_sync()
 
-            input_tensor = input_tensors.pop(0)
-            output_tensor = output_tensors.pop(0)
+            input_tensor = input_tensors.pop(0) #弹出该stage接受到的输入张量
+            output_tensor = output_tensors.pop(0) #弹出该stage输出的激活值
 
-            output_tensor_grad = p2p_communicator.recv_backward(
+            output_tensor_grad = p2p_communicator.recv_backward( #从后序stage接收输出激活值梯度
                 send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
 
-            input_tensor_grad = backward_func(
+            input_tensor_grad = backward_func( #完成单个micro batch的反传，并得到输入激活值梯度
                 input_tensor, output_tensor, output_tensor_grad, config
             )
 
-            p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
+            p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage) #把input_tensor_grad发给前序stage，为前序stage的反传做准备
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:
-            enable_grad_sync()
-            if config.grad_sync_func is not None:
-                config.grad_sync_func(model.parameters())
+            enable_grad_sync() #开启DDP梯度通信就绪跟踪（不过这里不会再进行反传了）
+            if config.grad_sync_func is not None: #如果align_grad_reduce被设置为True，此时每个stage会一起发起DDP梯度归约通信
+                config.grad_sync_func(model.parameters()) #手动调用梯度归约通信
 
-    if config.finalize_model_grads_func is not None and not forward_only:
+    if config.finalize_model_grads_func is not None and not forward_only: #如果需要梯度收尾
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
-        finish_embedding_wgrad_compute(
+        finish_embedding_wgrad_compute( #先补齐LM Head梯度计算（如果defer_embedding_wgrad_compute被设置为True的话，否则不需要）
             config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
         )
 
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
         # embedding all-reduce for pipeline parallelism).
-        config.finalize_model_grads_func(
+        config.finalize_model_grads_func( #最后进行梯度收尾
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,

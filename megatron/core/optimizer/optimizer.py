@@ -128,7 +128,7 @@ class MegatronOptimizer(ABC):
 
     def get_parameters(self) -> List[torch.nn.Parameter]:
         """
-        Get list of parameters wrapped in optimizer.
+        Get list of parameters wrapped in optimizer. #获取优化器所有参数组的参数
         """
         params = []
         if hasattr(self.optimizer, 'param_groups'):
@@ -144,7 +144,7 @@ class MegatronOptimizer(ABC):
         the parameter is not shared (to avoid double-counting gradients), and
         the parameter is not a replica due to tensor model parallelism.
 
-        Returns:
+        Returns: #筛选用于梯度范数计算的梯度张量（对于shared张量（比如embedding）直接跳过；对于TP张量需要考虑是分片的还是复制的（对于Linear这种张量是分片的，不会被过滤；对于LayerNorm这种张量是复制的，只有rank0的张量不会被过滤，其他rank的张量被过滤））
             List[torch.Tensor]: A list of gradient tensors filtered for norm calculation.
         """
         params = self.get_parameters()
@@ -169,11 +169,11 @@ class MegatronOptimizer(ABC):
             else:
                 grad = param.grad
             grad_not_none = grad is not None
-            is_not_shared = param_is_not_shared(param)
-            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
+            is_not_shared = param_is_not_shared(param) #判断当前参数是否是shared的
+            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate( #判断当前参数是否是TP的复制张量（例如Linear这种张量是分片的，不会被过滤；对于LayerNorm这种张量是复制的，只有rank0的张量不会被过滤，其他rank的张量被过滤）
                 param, getattr(self, 'tp_group', None)
             )
-            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+            if grad_not_none and is_not_shared and is_not_tp_duplicate: #将满足剩下的条件的参数的梯度张量保留在grads_for_norm中
                 grads_for_norm.append(grad)
 
         return grads_for_norm
@@ -221,15 +221,15 @@ class MegatronOptimizer(ABC):
         """Compute and return grad norm, also clip grads."""
         params = self.get_parameters()
         if params:
-            grads_for_norm = self.get_main_grads_for_grad_norm()
+            grads_for_norm = self.get_main_grads_for_grad_norm() #获取用于梯度范数计算的梯度张量
         else:
             grads_for_norm = []
-        grad_norm = get_grad_norm_fp32(
+        grad_norm = get_grad_norm_fp32( #计算得到全局最终的梯度范数
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
-        )
+        ) #grad_stats_parallel_group是用于梯度统计的process group（针对不同的优化器有不同的范围，非分布式优化器就是model_parallel_group，分布式优化器就是是intra_dist_opt_group）
 
         if params:
-            clip_grad_by_total_norm_fp32(
+            clip_grad_by_total_norm_fp32( #执行梯度clip缩放
                 params,
                 clip_grad,
                 grad_norm,
@@ -241,7 +241,7 @@ class MegatronOptimizer(ABC):
                     and getattr(params[0], "__fsdp_param__", False)
                 ),
             )
-        return grad_norm
+        return grad_norm  #返回裁剪前的全局范数
 
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients."""
@@ -463,7 +463,7 @@ class MegatronOptimizer(ABC):
 
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
-    """Base class for both the float-16 and the distributed optimizer. #MixedPrecisionOptimizer 只负责梯度后处理（unscale + check inf/nan），而精度转换的逻辑下沉到了子类。名字取大了，内容没有跟上
+    """Base class for both the float-16 and the distributed optimizer. #MixedPrecisionOptimizer 负责梯度后处理（unscale + check inf/nan + clip），而精度转换的逻辑下沉到了子类（名字取大了，内容没有跟上）
 
     Args:
         optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
@@ -530,14 +530,14 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # Reset found inf.
         self.found_inf.fill_(0.0)
 
-        if not self.is_stub_optimizer:
+        if not self.is_stub_optimizer: #在主参数的grad上进行unscale操作
             # Unscale and set found inf/nan
             torch._amp_foreach_non_finite_check_and_unscale_(
                 main_grads, self.found_inf, self.grad_scaler.inv_scale
             )
 
         # Update across all model parallel instances.
-        torch.distributed.all_reduce(
+        torch.distributed.all_reduce( #all-reduce操作，跨所有模型并行实例更新found_inf张量。使用MAX操作（取最大值），意味着任何实例检测到inf/nan，所有实例都会最终检测到。
             self.found_inf,
             op=torch.distributed.ReduceOp.MAX,
             group=self.get_grad_stats_parallel_group(),
@@ -559,26 +559,26 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            self._copy_model_grads_to_main_grads()
+            self._copy_model_grads_to_main_grads() #搬运梯度（把模型梯度搬运到main_param的grad）
         if timers is not None:
             timers('optimizer-copy-to-main-grad').stop()
 
         # Do unscale, check for inf, and update grad scaler only for
         # the case that grad scaler is provided.
-        if self.grad_scaler:
+        if self.grad_scaler: #如果使用了 grad_scaler，则前传做了scale来放大loss，这里需要进行unscale来保证梯度复原，进行以下操作：
 
             # Unscale and check for inf/nan.
             if timers is not None:
                 timers('optimizer-unscale-and-check-inf', log_level=1).start(
                     barrier=self.config.barrier_with_L1_time
                 )
-            found_inf_flag = self._unscale_main_grads_and_check_for_nan()
+            found_inf_flag = self._unscale_main_grads_and_check_for_nan() #进行unscale操作，检查是否有inf/nan
             if timers is not None:
                 timers('optimizer-unscale-and-check-inf').stop()
 
             # We are done with scaling gradients
             # so we can update the loss scale.
-            self.grad_scaler.update(found_inf_flag)
+            self.grad_scaler.update(found_inf_flag) #根据检测到的inf/nan情况，更新grad_scaler的scale（动态缩放）
 
             return found_inf_flag
 
@@ -593,7 +593,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-inner-step', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        if not self.is_stub_optimizer:
+        if not self.is_stub_optimizer: #进行优化器更新step
             self.optimizer.step()
         if timers is not None:
             timers('optimizer-inner-step').stop()
@@ -603,7 +603,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-copy-main-to-model-params', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        if not self.is_stub_optimizer:
+        if not self.is_stub_optimizer: #把main_param的更新结果搬运到param
             if self.config.reuse_grad_buf_for_mxfp8_param_ag:
                 # In the case of overlap_param_gather,
                 # copy is manually called in the training loop
@@ -621,7 +621,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     def step(self):
         timers = self.config.timers
 
-        found_inf_flag = self.prepare_grads()
+        found_inf_flag = self.prepare_grads() #准备optimizer所需的梯度，包括把梯度从param.main_grad搬到main_param.grad 和 grad_scaler的unscale复原梯度操作
         if found_inf_flag:
             return False, None, None
 
@@ -631,7 +631,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         grad_norm = 0.0
-        if self.config.clip_grad > 0.0:
+        if self.config.clip_grad > 0.0: #如果裁剪阈值存在，则执行grad clip
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
@@ -641,14 +641,14 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-count-zeros', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else 0
+        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else 0 #统计梯度中 0 的个数的诊断包装
         if timers is not None:
             timers('optimizer-count-zeros').stop()
 
-        success = self.step_with_ready_grads()
+        success = self.step_with_ready_grads() #梯度已经经过了unscale和clip操作，准备就绪了，可以进行step了
 
         # Successful update.
-        return success, grad_norm, num_zeros_in_grad
+        return success, grad_norm, num_zeros_in_grad #返回更新是否成功，grad_norm, num_zeros_in_grad
 
 
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):

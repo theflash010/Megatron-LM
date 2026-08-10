@@ -382,14 +382,14 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         assert self.use_forward_hook
         # De-register forward pre-hook for all sub-modules.
-        for module in self.module.modules():
+        for module in self.module.modules(): #逐个反注册所有子模块的 pre-hook
             assert self.remove_forward_pre_hook_handles[module] is not None
             self.remove_forward_pre_hook_handles[module].remove()
             del self.remove_forward_pre_hook_handles[module]
         assert len(self.remove_forward_pre_hook_handles) == 0
 
         # Force synchronize parameters.
-        if param_sync:
+        if param_sync: #param_sync=True 是默认：禁用后做一次同步参数 all-gather；False 则跳过。
             self.start_param_sync(force_sync=True)
 
     def _make_forward_pre_hook(self):

@@ -1032,11 +1032,11 @@ def pretrain(
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context
-    ) #获取模型，优化器，学习率调度器
+    ) #获取模型，优化器，学习率调度器，按需加载checkpoint
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
-    model_cfg = get_model_config(model[0])
+    model_cfg = get_model_config(model[0]) #获取模型配置
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -1175,16 +1175,16 @@ def pretrain(
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
-    if not cfg_container.validation.skip_train or args.perform_rl_step:
+    if not cfg_container.validation.skip_train or args.perform_rl_step: #进入训练块
         if cfg_container.validation.skip_train:
             print_rank_0('RL inference-only mode (--skip-train --perform-rl-step) ...')
         else:
             print_rank_0('training ...')
 
-        iteration = 0
-        args.curr_iteration = iteration
+        iteration = 0 #迭代号初始化
+        args.curr_iteration = iteration #赋值args.curr_iteration
         if args.do_train and (args.train_iters or 0) > 0: #进行训练
-            iteration, num_floating_point_operations_so_far = train(
+            iteration, num_floating_point_operations_so_far = train( #完成所有训练迭代
                 forward_step_func,  #前向传播函数。训练循环中每步调用它做 forward + backward，返回 loss。不同模型定义不同的 forward_step_func
                 model, #模型对象列表（通常 [model]）
                 optimizer, #优化器
@@ -1196,11 +1196,11 @@ def pretrain(
                 checkpointing_context,
                 non_loss_data_func,
                 inference_model,
-            )
+            ) #返回值：训练结束后的 iteration 与 num_floating_point_operations_so_far（FLOPs 累计）
 
         print_datetime('after training is done')
 
-        if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
+        if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0: #训练后收尾
             save_checkpoint_and_time(
                 iteration,
                 model,
@@ -1215,12 +1215,12 @@ def pretrain(
             {'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()}
         )
 
-    else:
+    else: #跳过训练分支
         print_rank_0('skipping training (--skip-train is on) ...')
 
-        iteration = args.iteration
+        iteration = args.iteration #纯 skip-train（非 RL）：不调用 train()，直接取恢复的迭代号。
 
-    if args.do_valid:
+    if args.do_valid: #训练结束后的最终验证块
         prefix = f'iteration {iteration} on validation set'
         if args.perform_rl_step:
             rl_eval_model = model
@@ -1241,7 +1241,7 @@ def pretrain(
                 write_to_tensorboard=not cfg_container.validation.skip_train,
                 training_model=rl_training_model,
             )
-        else:
+        else: #普通（预训练/SFT）最终验证
             evaluate_and_print_results(
                 prefix, forward_step_func,
                 valid_data_iterator, model,
@@ -1250,7 +1250,7 @@ def pretrain(
                 non_loss_data_func=non_loss_data_func
             )
 
-    if args.do_test:
+    if args.do_test: #训练结束后的最终测试评估块
         prefix = f'iteration {iteration} on test set'
         evaluate_and_print_results(
             prefix,
@@ -1266,11 +1266,11 @@ def pretrain(
         )
 
     wandb_writer = get_wandb_writer()
-    if wandb_writer:
+    if wandb_writer: #关闭 wandb
         wandb_writer.finish()
 
     ft_integration.on_checkpointing_start()
-    maybe_finalize_async_save(blocking=True, terminate=True)
+    maybe_finalize_async_save(blocking=True, terminate=True) #阻塞等待所有未完成的异步 checkpoint 保存收尾
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
     one_logger and one_logger.log_metrics(
@@ -1899,7 +1899,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
-        losses_reduced = forward_backward_func( #根据使用的PP调度器来执行n个micro batch的前向后向
+        losses_reduced = forward_backward_func( #根据使用的PP调度器来执行n个micro batch的前向后向（梯度计算完成，没有进行参数更新）
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
@@ -1911,13 +1911,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             force_all_reduce=save_wgrads_in_this_iteration,
         )
-        if save_activations_in_this_iteration:
+        if save_activations_in_this_iteration: #调试/诊断的记录
             save_activations(iteration + 1)
             disable_activation_logging()
-        if save_tpe_in_this_iteration:
+        if save_tpe_in_this_iteration: #调试/诊断的记录
             save_tokens_per_expert(iteration + 1)
             disable_tokens_per_expert_logging()
-        if save_dgrads_in_this_iteration:
+        if save_dgrads_in_this_iteration: #调试/诊断的记录
             save_dgrads(iteration + 1)
             disable_dgrad_logging()
 
@@ -1959,7 +1959,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step() #进行优化器参数更新，返回更新是否成功，grad_norm, num_zeros_in_grad，后两者用于统计
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -1989,9 +1989,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update learning rate.
     if update_successful:
-        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
-        opt_param_scheduler.step(increment=increment)
-        skipped_iter = 0
+        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size #一个global batch参与的样本数量
+        opt_param_scheduler.step(increment=increment) #输入完成的样本数量进行学习率/权重衰减等训练超参数的更新
+        skipped_iter = 0 #这个batch没有被跳过
     else:
         skipped_iter = 1
 
@@ -1999,7 +1999,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+    if mpu.is_pipeline_last_stage(ignore_virtual=True): #最后一个stage记录loss
         # Average loss across microbatches.
         loss_reduced = {}
 
@@ -2021,16 +2021,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             else:
                 raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
         return (
-            loss_reduced,
-            skipped_iter,
-            should_checkpoint,
-            should_exit,
-            exit_code,
-            grad_norm,
-            num_zeros_in_grad,
-            log_max_attention_logit,
+            loss_reduced,             # 规约后的 loss dict（仅 PP 末级非空，其余 rank 为 {}）
+            skipped_iter,             # 是否跳过本次迭代（更新失败时=1）
+            should_checkpoint,        # 是否保存 checkpoint
+            should_exit,              # 是否退出训练
+            exit_code,                # 退出码
+            grad_norm,                # 梯度范数（已跨 MP 组规约）
+            num_zeros_in_grad,        # 梯度中 0 的个数（仅开启 log_num_zeros_in_grad 时有效）
+            log_max_attention_logit,  # 最大 attention logit（qk_clip / MuonClip 相关）
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
+    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit  # 非 PP 末级：loss_reduced 为空，其余字段同上
 
 
 def training_log(
@@ -2808,25 +2808,25 @@ def train(
     write_args_to_tensorboard()
 
     # Turn on training mode which enables dropout.
-    for model_module in model:
+    for model_module in model: #把每个模型分片设置为训练模式
         model_module.train()
 
-    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection") #获取模型的通信组信息
 
     # Tracking loss.
-    total_loss_dict = {}
+    total_loss_dict = {} #累计 loss 容器
 
     # Iterations.
-    iteration = args.iteration
+    iteration = args.iteration #从 checkpoint 恢复（resume）时是断点迭代号，否则是 0——断点续训的关键
     # Make sure rerun_state_machine has the right iteration loaded from checkpoint.
-    rerun_state_machine = get_rerun_state_machine()
+    rerun_state_machine = get_rerun_state_machine() #构造Rerun状态机
     if rerun_state_machine.current_iteration != iteration:
         print_rank_0(f"Overwriting rerun_state_machine.current_iteration from "
                      f"{rerun_state_machine.current_iteration} to {iteration}...")
         rerun_state_machine.current_iteration = iteration
 
     # Track E2E metrics at the start of training.
-    one_logger_utils.on_train_start(
+    one_logger_utils.on_train_start( #训练开始时把当前状态（迭代号、已消费样本数、目标样本数、FLOPs 累计等）上报给 one_logger，用于端到端（E2E）指标跟踪（如吞吐、能耗）。
         iteration=iteration,
         consumed_train_samples=args.consumed_train_samples,
         train_samples=args.train_samples,
@@ -2838,28 +2838,28 @@ def train(
         num_floating_point_operations_so_far=args.num_floating_point_operations_so_far,
     )
 
-    num_floating_point_operations_so_far = args.num_floating_point_operations_so_far
+    num_floating_point_operations_so_far = args.num_floating_point_operations_so_far #FLOPs 计数器
 
     # Setup some training config params.
-    config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
+    config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None #将config的梯度缩放函数（混合精度的 loss scale 相关）设置为optimizer.scale_loss
     config.timers = timers
-    if isinstance(model[0], (megatron_FSDP, DDP)) and args.overlap_grad_reduce:
+    if isinstance(model[0], (megatron_FSDP, DDP)) and args.overlap_grad_reduce: #overlap_grad_reduce（梯度规约与反向重叠）
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'
         )
-        config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
+        config.no_sync_func = [model_chunk.no_sync for model_chunk in model] #把每个 model chunk 的 no_sync 上下文管理器收集成 list 挂到 config.no_sync_func
         if len(model) == 1:
-            config.no_sync_func = config.no_sync_func[0]
+            config.no_sync_func = config.no_sync_func[0] #如果只有一个 model chunk，就直接挂到 config.no_sync_func 上
         if args.align_grad_reduce:
-            config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
+            config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model] #把每个 chunk 的 start_grad_sync（主动发起所有 bucket 的梯度规约，param_and_grad_buffer.py:517）挂为 config.grad_sync_func
             if len(model) == 1:
-                config.grad_sync_func = config.grad_sync_func[0]
-    if args.overlap_param_gather and args.align_param_gather:
-        config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
+                config.grad_sync_func = config.grad_sync_func[0] #如果只有一个 model chunk，就直接挂到 config.grad_sync_func 上
+    if args.overlap_param_gather and args.align_param_gather: #overlap_param_gather（参数聚合与前向重叠），align_param_gather只在interleave里使用
+        config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model] #把每个 chunk 的 start_param_sync（主动发起所有 bucket 的参数聚合）挂为 config.param_sync_func
         if len(model) == 1:
-            config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+            config.param_sync_func = config.param_sync_func[0] #如果只有一个 model chunk，就直接挂到 config.param_sync_func 上
+    config.finalize_model_grads_func = finalize_model_grads #设置梯度收尾函数
 
     if args.log_energy:
         energy_monitor.setup()
@@ -2867,13 +2867,13 @@ def train(
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
-    report_memory_flag = True
-    pre_hook_enabled = False
-    should_exit = False
+    report_memory_flag = True #显存占用报告
+    pre_hook_enabled = False #跟踪参数重叠收集（overlap_param_gather）的 forward pre-hook 是否启用，这里设置为False，在第一轮step成功跑通后按需设置为True
+    should_exit = False #循环退出控制
     exit_code = 0
-    is_first_iteration = True
+    is_first_iteration = True #首迭代标志
 
-    if args.manual_gc:
+    if args.manual_gc: #手动垃圾回收
         # Disable the default garbage collector and perform the collection manually.
         # This is to align the timing of garbage collection across ranks.
         assert (
@@ -2895,11 +2895,11 @@ def train(
             enabled=not args.disable_straggler_on_startup,
             port=args.straggler_ctrlr_port,
         )
-    num_floating_point_operations_since_last_log_event = 0.0
+    num_floating_point_operations_since_last_log_event = 0.0 #自上次日志事件以来的 FLOPs 累计值——每个迭代按实际计算量累加，到 log_interval 时除以耗时得到吞吐（MFLOPS/TFLOPs）。
 
-    num_microbatches = get_num_microbatches()
-    eval_duration = 0.0
-    eval_iterations = 0
+    num_microbatches = get_num_microbatches() #micro batch 数
+    eval_duration = 0.0 #评估耗时
+    eval_iterations = 0 #评估迭代次数
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func() #返回的是PP 调度器——控制 N 个 micro batch 如何在各 PP stage 间流动（1F1B、interleaved 等）
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
@@ -2936,7 +2936,7 @@ def train(
         and (len(args.profile_ranks) == 0 or
              torch.distributed.get_rank() in args.profile_ranks)
         and args.use_pytorch_profiler
-    ):
+    ): #PyTorch Profiler 的初始化
         if args.pytorch_profiler_collect_chakra:
             et_dir = Path(f"{args.tensorboard_dir}/../chakra")
             et_dir.mkdir(parents=True, exist_ok=True)
@@ -2961,19 +2961,19 @@ def train(
         )
         prof.start()
 
-    start_iteration = iteration
+    start_iteration = iteration #记录起始迭代号
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
-    if should_disable_forward_pre_hook(args):
-        disable_forward_pre_hook(model, param_sync=False)
+    if should_disable_forward_pre_hook(args): #返回 True 的场景是：非 FSDP + 分布式优化器 + overlap_param_gather。函数名是 should_disable_forward_pre_hook，但返回 True 的含义其实是"这个配置下有 pre-hook 需要被管理"——因为这些配置下 hook 才存在，代码才需要在启动时禁用、首轮成功后启用、eval 前后切换、结束时清理。其他配置（FSDP、非分布式优化器、不开 overlap）下根本没有 hook，返回 False，上述管理逻辑全部跳过。
+        disable_forward_pre_hook(model, param_sync=False) #移除模型上的 forward pre-hook
         # Also remove param_sync_func temporarily so that sync calls made in
         # `forward_backward_func` are no-ops.
-        param_sync_func = config.param_sync_func
+        param_sync_func = config.param_sync_func #把原回调存到局部变量，再置 None
         config.param_sync_func = None
-        pre_hook_enabled = False
+        pre_hook_enabled = False #更新追踪标志
     # Also, check weight hash across DP replicas to be very pedantic.
-    if args.check_weight_hash_across_dp_replicas_interval is not None:
+    if args.check_weight_hash_across_dp_replicas_interval is not None: #DP 副本间权重哈希校验（防御性检查）
         assert check_param_hashes_across_dp_replicas(
             model, cross_check=True
         ), "Parameter hashes not matching across DP replicas"
@@ -2992,7 +2992,7 @@ def train(
 
     # Run training iterations till done.
     buffered_rollouts = None
-    while iteration < args.train_iters:
+    while iteration < args.train_iters: #循环迭代
         if (args.profile 
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
@@ -3024,21 +3024,21 @@ def train(
         # from the previous iteration, save a checkpoint. Then run consistency check
         # to make sure training configuration is still valid.
         # Standard microbatch update (sequence packing overrides this in rl_utils.py)
-        update_num_microbatches(args.consumed_train_samples, consistency_check=False, verbose=True)
+        update_num_microbatches(args.consumed_train_samples, consistency_check=False, verbose=True) #更新micro batch数量，不校验
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
         # as it intentionally reconfigures microbatches
-        if get_num_microbatches() != num_microbatches and iteration != 0:
+        if get_num_microbatches() != num_microbatches and iteration != 0: #如果micro batch 数变化 → 处理
             if args.rl_use_sequence_packing:
                 print_rank_0(
                     f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
                     f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
                 )
-            else:
-                assert get_num_microbatches() > num_microbatches, (
+            else: #普通训练
+                assert get_num_microbatches() > num_microbatches, ( #断言 micro batch 数只能增加不能减少
                     f"Number of microbatches should not decrease; "
                     f"going from {num_microbatches} to {get_num_microbatches()}"
                 )
-                if args.save is not None:
+                if args.save is not None: #配了 args.save 时调 save_checkpoint_and_time 保存 checkpoint（记录耗时，含异步保存）。
                     save_checkpoint_and_time(
                         iteration,
                         model,
@@ -3048,8 +3048,8 @@ def train(
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
                     )
-        num_microbatches = get_num_microbatches()
-        update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
+        num_microbatches = get_num_microbatches() #把"当前值"记为下次比较的基准。
+        update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True) #正式一致性校验——确认训练配置仍合法（如 global batch = mb × micro_batch_size × dp 的整除关系、批大小调度约束等），不合法直接报错。update() 内部是**"查表 → 覆盖成员变量"**，没有任何自增/累加/推进逻辑。调用两次不会"更新两次效果"——第二次只是把同样的值再写一遍。
 
         # Capture CUDA Graphs.
         if (
@@ -3065,12 +3065,12 @@ def train(
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         # Completely skip iteration if needed.
-        if (iteration + 1) in args.iterations_to_skip:
+        if (iteration + 1) in args.iterations_to_skip: #完全跳过指定迭代（iterations_to_skip）
             # Dummy train_step to fast forward train_data_iterator.
-            dummy_train_step(train_data_iterator)
-            if iteration == start_iteration:
+            dummy_train_step(train_data_iterator) #只从数据迭代器消费掉一个 global batch（快进），不执行前向/反向——否则后续迭代的数据错位
+            if iteration == start_iteration: #若跳过的是起始迭代，把起点往后挪——保证后续"首轮成功后才启用 pre-hook"（L3146）的判断不受被跳过轮影响。
                 start_iteration = iteration + 1
-            iteration += 1
+            iteration += 1 #计数处理：consumed_train_samples 照常 +batch_size（数据确实被消费了）；skipped_train_samples 累计跳过量（统计用，可区别于正常训练的样本）。
             batch_size = (
                 mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
             )
@@ -3078,7 +3078,7 @@ def train(
             args.skipped_train_samples += batch_size
             continue
 
-        args.curr_iteration = iteration
+        args.curr_iteration = iteration #当前迭代=轮次
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
@@ -3102,7 +3102,7 @@ def train(
                 # we use previously-generated data for an update.
                 buffered_rollouts = train_data_iterator
 
-        if args.skip_train:
+        if args.skip_train: #跳过训练，仅做推理
             # RL inference-only mode: skip gradient updates, just collect rollouts.
             loss_dict = {}
             skipped_iter = 0
@@ -3115,19 +3115,19 @@ def train(
         else:
             ft_integration.on_training_step_start()
             (
-                loss_dict,
-                skipped_iter,
-                should_checkpoint,
-                should_exit,
-                exit_code,
-                grad_norm,
-                num_zeros_in_grad,
-                max_attention_logit,
+                loss_dict, # ← loss_reduced：规约后的 loss dict（仅 PP 末级非空）
+                skipped_iter,  #     是否跳过本次迭代（更新失败=1）
+                should_checkpoint, #     是否保存 checkpoint
+                should_exit, #     是否退出训练
+                exit_code, #     退出码
+                grad_norm, #     梯度范数
+                num_zeros_in_grad, #     梯度零值数量
+                max_attention_logit, #     最大 attention logit（qk_clip 相关）
             ) = train_step(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
-            ) #进行训练。forward_backward_func是get_forward_backward_func() 返回的 PP 调度器
+            ) #进行一个step训练。forward_backward_func是get_forward_backward_func() 返回的 PP 调度器
             ft_integration.on_training_step_end()
-        if should_checkpoint:
+        if should_checkpoint: #按需保存 checkpoint
             save_checkpoint_and_time(
                 iteration,
                 model,
@@ -3143,20 +3143,20 @@ def train(
         # Enable forward pre-hooks after first set of forward and backward passes.
         # When running in fp16, skip all NaN iterations until steady-state loss scaling value
         # is reached.
-        if iteration == start_iteration:
-            if skipped_iter:
+        if iteration == start_iteration: #首轮训练成功后重新启用参数同步链路
+            if skipped_iter: #本轮被跳过 → 推迟
                 # Only enable forward pre-hook after a training step has successfully run. Relevant
                 # for fp16 codepath where first XX iterations are skipped until steady-state loss
                 # scale value is reached.
                 start_iteration = iteration + 1
-            else:
+            else: #首轮成功 → 启用参数同步链路
                 # Enable forward pre-hook after training step has successfully run. All subsequent
                 # forward passes will use the forward pre-hook / `param_sync_func` in
                 # `forward_backward_func`.
                 if should_disable_forward_pre_hook(args):
-                    enable_forward_pre_hook(model)
-                    config.param_sync_func = param_sync_func
-                    pre_hook_enabled = True
+                    enable_forward_pre_hook(model) #注册 forward pre-hook
+                    config.param_sync_func = param_sync_func #恢复 L2972 暂存的 param_sync_func
+                    pre_hook_enabled = True #更新追踪标志
                     # Set the manual hooks here since it's not set right after the capturing.
                     if (
                         args.cuda_graph_impl == "transformer_engine"
@@ -3167,7 +3167,7 @@ def train(
                         ), "CUDA Graph capture should have been finished."
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
-        iteration += 1
+        iteration += 1 #iteration计数+1
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
@@ -3192,43 +3192,43 @@ def train(
             )
             args.consumed_train_bins += bin_count
         else:
-            batch_size = (
+            batch_size = ( #计算global batch size
                 mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
             )
-            iteration_sequences = batch_size
+            iteration_sequences = batch_size #iteration_sequences 的本义：本轮真实处理的序列数。普通（非 packing）训练下：1 样本 = 1 序列。sequence packing（打包）下两者不同：packing 把多条变长序列拼进一个槽位，所以"槽位数（样本数）≠ 序列数"。
 
         # Update consumed samples (always means sequences now)
-        args.consumed_train_samples += iteration_sequences
+        args.consumed_train_samples += iteration_sequences #Megatron 的语义中 sequence 才是"真正的样本"（数据单元），sample（槽位）只是打包容器，因为进行前传反传的时候 sequence 是最小单元。所以累积完成的样本计数：使用 sequence 数
 
         # Use iteration_sequences as batch_size for floating point operations
-        batch_size = iteration_sequences
+        batch_size = iteration_sequences #将sequence的数量赋值给batch size
 
-        num_skipped_samples_in_batch = (
-            get_current_global_batch_size() - get_current_running_global_batch_size()
-        )
-        if args.decrease_batch_size_if_needed:
-            assert num_skipped_samples_in_batch >= 0
+        num_skipped_samples_in_batch = ( #current_global_batch_size：用户配置/调度的目标 global batch size。
+            get_current_global_batch_size() - get_current_running_global_batch_size() #current_running_global_batch_size：实际生效的 batch size——num_micro_batches = global // (mbs×dp) 必须整除
+        ) #num_skipped_samples_in_batch = 目标 batch − 实际 batch = 因整除取整被砍掉的样本数。不代表样本数据会被抛弃，这里只是计算和用户预期的样本数量的差距。
+        if args.decrease_batch_size_if_needed: #如果开启了取整global batch size（必要时减少让gbs能被mbs×dp整除）
+            assert num_skipped_samples_in_batch >= 0 #被砍掉的样本数应≥0（不可能为负）
         else:
-            assert num_skipped_samples_in_batch == 0
-        args.skipped_train_samples += num_skipped_samples_in_batch
-        num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
-        num_floating_point_operations_so_far += num_floating_point_operations_in_batch
-        num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
+            assert num_skipped_samples_in_batch == 0 #如果没开启取整global batch size，被砍掉的样本数应=0（不可能为正）
+        args.skipped_train_samples += num_skipped_samples_in_batch #累加和用户配置的样本数量的差距
+        num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size) #按模型结构（层数、hidden、seq、vocab 等）计算本 batch 的浮点运算量
+        num_floating_point_operations_so_far += num_floating_point_operations_in_batch #全量累计 FLOPs
+        num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch #自上次日志事件以来的累计
 
         # Logging.
-        if optimizer is not None and not optimizer.is_stub_optimizer:
+        if optimizer is not None and not optimizer.is_stub_optimizer: #从混合精度优化器取当前 loss scale
             loss_scale = optimizer.get_loss_scale().item()
         else:
             loss_scale = 1.0
         params_norm = None
 
-        if args.log_params_norm:
+        if args.log_params_norm: #params_norm 默认 None（不额外开销）；开启 log_params_norm 时计算模型参数的 L2 范数（跨 rank 归约后的全局值），用于监控参数规模/更新幅度。
             params_norm = calc_params_l2_norm(model)
-        if optimizer is not None:
+        if optimizer is not None: #从优化器参数组取规范化的当前学习率（多 param group 时取代表性值）
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
             learning_rate = None
-        report_memory_flag = training_log(
+        report_memory_flag = training_log( #记录日志
             loss_dict,
             total_loss_dict,
             learning_rate,
@@ -3243,9 +3243,9 @@ def train(
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
         )
-        is_first_iteration = False
+        is_first_iteration = False #首轮过后置 False，从下一轮起 training_log 正常重置区间累加器。
 
-        # Evaluation.
+        # Evaluation. #主循环的评估（validation）块
         if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid \
                 and (args.start_eval_at_iter is None or iteration >= args.start_eval_at_iter):
             if args.log_energy:
@@ -3317,7 +3317,7 @@ def train(
             nsys_nvtx_context,
         )
 
-        # Checkpoint and decide whether to exit.
+        # Checkpoint and decide whether to exit. #统一处理"是否保存 checkpoint、是否退出"
         should_exit = checkpoint_and_decide_exit(
             model,
             optimizer,
@@ -3346,23 +3346,23 @@ def train(
         writer.flush()
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
-    if pre_hook_enabled:
+    if pre_hook_enabled: #训练结束时若 pre-hook 仍启用，先强制同步参数（保证最终参数一致、无 pending 收集）再移除 hook。
         disable_forward_pre_hook(model)
 
-    ft_integration.on_checkpointing_start()
+    ft_integration.on_checkpointing_start() #异步checkpoint保存最终化
     # This will finalize all unfinalized async request and terminate
     # a persistent async worker if persistent ckpt worker is enabled
     maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
-    if args.log_energy:
+    if args.log_energy: #能耗汇总
         energy_monitor.lap()
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
-    if should_exit:
+    if should_exit: #按需退出
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
@@ -3372,7 +3372,7 @@ def train(
             rl_utils.rl_inference_interface_shutdown()
         sys.exit(exit_code)
 
-    return iteration, num_floating_point_operations_so_far
+    return iteration, num_floating_point_operations_so_far #未触发显式退出时，返回更新后的迭代号与 FLOPs 累计值
 
 
 def evaluate(
@@ -3744,7 +3744,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
         else:
             # Build datasets.
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)#获取dataset，但是多模态使用Megatron Energon这里就是dataloader
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)#获取dataset，但是多模态使用Megatron Energon这里是EnergonDataloader（内部包含dataloader属性，还有next函数，直接一步到位是data_iterator）
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
             if args.skip_train:
                 train_dataloader = None

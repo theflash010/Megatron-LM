@@ -91,27 +91,27 @@ def get_grad_norm_fp32(
     total_norm = 0.0
 
     # Calculate norm.
-    if norm_type == inf:
-        total_norm = max(grad.abs().max() for grad in grads_for_norm)
+    if norm_type == inf: #inf 范数分支（所有梯度绝对值的最大值）
+        total_norm = max(grad.abs().max() for grad in grads_for_norm) ## 本地最大值
         total_norm_cuda = torch.tensor([float(total_norm)], dtype=torch.float, device='cuda')
         # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
-        if data_parallel_group:
+        if data_parallel_group: # FSDP：先 DP 组
             torch.distributed.all_reduce(
                 total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
             )
-        torch.distributed.all_reduce(
+        torch.distributed.all_reduce( # 再统计组
             total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=grad_stats_parallel_group
         )
         total_norm = total_norm_cuda[0].item()
 
     else:
-        if norm_type == 2.0:
+        if norm_type == 2.0: #L2范数分支
             dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
             if grads_for_norm:
-                grad_norm, _ = multi_tensor_applier(
+                grad_norm, _ = multi_tensor_applier( #用 multi_tensor_applier + l2_norm_impl：一个 kernel 处理所有梯度张量（省去逐个张量循环的 kernel launch 开销），输出结果是所有输入张量合并后的总 L2 范数
                     l2_norm_impl,
                     dummy_overflow_buf,
                     [grads_for_norm],
@@ -121,7 +121,7 @@ def get_grad_norm_fp32(
                 grad_norm = torch.zeros(1, dtype=torch.float, device='cuda')
             # Since we will be summing across data parallel groups,
             # we need the pow(norm-type).
-            total_norm = grad_norm**norm_type
+            total_norm = grad_norm**norm_type #对本地所有张量的 L2 范数进行 norm_type 次方，得到总范数的 norm_type 次方，后续还需要和其他rank的进行 reduce 操作
 
         else:
             for grad in grads_for_norm:
@@ -129,19 +129,19 @@ def get_grad_norm_fp32(
                 total_norm += grad_norm**norm_type
 
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
-        if data_parallel_group:
+        if data_parallel_group: ## FSDP：DP 组先 SUM
             torch.distributed.all_reduce(
                 total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
             )
-        torch.distributed.all_reduce(
+        torch.distributed.all_reduce( # 再跨统计组 SUM
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
-        if multi_tensor_scale_tensor_impl is not None:
+        if multi_tensor_scale_tensor_impl is not None: #把"平方和"还原成 p-范数（L2 即开根号）
             total_norm = total_norm.pow(1.0 / norm_type)
         else:
             total_norm = total_norm.item() ** (1.0 / norm_type)
 
-    return total_norm
+    return total_norm #返回最终的全局范数结果
 
 
 def clip_grad_by_total_norm_fp32(
@@ -177,13 +177,13 @@ def clip_grad_by_total_norm_fp32(
             if param.grad is not None:
                 assert param.grad.type() == 'torch.cuda.FloatTensor'
                 params.append(param)
-                grads.append(to_local_if_dtensor(param.grad).detach())
+                grads.append(to_local_if_dtensor(param.grad).detach()) #返回与原始梯度共享存储的视图（requires_grad=False）——后续就地缩放它，等于直接改 main_param.grad 的底层数据
 
     # Scale.
-    clip_coeff = max_norm / (total_norm + 1.0e-6)
+    clip_coeff = max_norm / (total_norm + 1.0e-6) #计算缩放系数，total_norm ≤ max_norm → coeff ≥ 1（不裁剪）；total_norm > max_norm → coeff < 1（等比缩小到 max_norm）
     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
-    if isinstance(clip_coeff, torch.Tensor):
-        clip_coeff.clamp_max_(1.0)
+    if isinstance(clip_coeff, torch.Tensor): #进行缩放
+        clip_coeff.clamp_max_(1.0) #把缩放系数就地钳制到不超过 1.0（最大缩放倍数为 1）
         assert (
             multi_tensor_scale_tensor_impl is not None
         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
