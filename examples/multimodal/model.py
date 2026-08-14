@@ -8,6 +8,10 @@ from config import get_language_model_config, get_vision_model_config, get_visio
 from layer_specs import (get_layer_spec, get_layer_spec_te, get_mlp_module_spec, get_norm_mlp_module_spec_te,
                          get_hybrid_layer_spec_te)
 
+from megatron.core.models.multimodal.colocated_llava_model import (
+    ColocatedGPTBackbone,
+    ColocatedViTEncoder,
+)
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN, LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.training import get_args, get_tokenizer, print_rank_0
@@ -187,10 +191,61 @@ def model_provider(
     vision_projection_config.tp_comm_overlap = False 
 
     tokenizer = get_tokenizer() #获取tokenizer
-    image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN) #获取图像token <image>的索引32768
+    image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN) #获取图像token <image>在tokenizer的索引32768
     assert image_token_index is not None, f"IMAGE_TOKEN={IMAGE_TOKEN} needs to be added using the --special-tokens arg."
 
     tile_tags = _get_tile_tags(args, tokenizer) #没有使用tile tags
+
+    if args.use_colocated_encoder:
+        # Colocated training: every rank builds the full encoder chunk and its
+        # 1/P backbone chunk. Both are always constructed regardless of
+        # add_encoder/add_decoder, because the encoder is replicated on all ranks
+        # and the backbone is pipeline-parallel split across all ranks.
+        # 共置训练：每个 rank 都构建完整 encoder chunk 与 1/P 的 backbone chunk。
+        # 恒构建两者（encoder 在所有 rank 上复制、backbone 在所有 rank 上做 PP 切分），
+        # 忽略 add_encoder/add_decoder 参数。
+        encoder_model = ColocatedViTEncoder(
+            vision_transformer_config=vision_config,
+            vision_transformer_layer_spec=vision_transformer_layer_spec,
+            drop_vision_class_token=args.disable_vision_class_token,
+            vision_projection_config=vision_projection_config,
+            vision_projection_layer_spec=vision_projection_layer_spec,
+            vision_projection_type="mlp",
+            img_h=args.img_h,
+            img_w=args.img_w,
+            patch_dim=args.patch_dim,
+            pixel_shuffle=args.pixel_shuffle,
+        )
+        backbone_model = ColocatedGPTBackbone(
+            language_transformer_config=language_config,
+            language_transformer_layer_spec=language_transformer_layer_spec,
+            language_vocab_size=args.padded_vocab_size,
+            language_max_sequence_length=args.decoder_seq_length,
+            parallel_output=parallel_output,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            language_position_embedding_type=args.position_embedding_type,
+            language_rotary_percent=args.rotary_percent,
+            pre_process=pre_process,
+            post_process=post_process,
+            language_rotary_base=args.rotary_base,
+            language_rope_scaling=args.use_rope_scaling,
+            language_rope_scaling_factor=args.rope_scaling_factor,
+            image_token_index=image_token_index,
+            img_seq_len=num_image_embeddings,
+            tile_tags=tile_tags,
+            tokenizer_type=args.tokenizer_prompt_format,
+        )
+
+        # Freeze the requested sub-models (simple traversal over chunk params).
+        # 按需冻结子模型（简单遍历 chunk 参数）。
+        if args.freeze_ViT:
+            for param in encoder_model.parameters():
+                param.requires_grad = False
+        if args.freeze_LM:
+            for param in backbone_model.parameters():
+                param.requires_grad = False
+
+        return [encoder_model, backbone_model]
 
     model = LLaVAModel(#构建llava模型，占用空间
         language_transformer_config=language_config,
@@ -219,7 +274,7 @@ def model_provider(
         language_rope_scaling=args.use_rope_scaling,
         hybrid_layer_pattern=args.hybrid_layer_pattern,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-        image_token_index=image_token_index,
+        image_token_index=image_token_index, #将<image>在tokenizer的索引32768传递给LLaVA模型构建
         pixel_shuffle=args.pixel_shuffle,
         tile_tags=tile_tags,
         max_num_tiles=args.max_num_tiles,

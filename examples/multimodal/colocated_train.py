@@ -1,0 +1,288 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Colocated training entry helpers: data, forward step, loss (business layer).
+
+共置训练的业务层（对应 ``examples/multimodal/train.py`` 的职责）：数据获取、模型
+forward 的分支函数、loss。schedule（``colocated_schedule.py``）只做编排：
+- phase ① 循环调 ``colocated_forward_step`` 的 encoder 分支拿回包存 buffer；
+- phase ② 调其 backbone 分支（输入已由 schedule 设置好：consumer 的包 / 非首 stage
+  的 ``set_input_tensor`` 激活）。
+
+``colocated_forward_step`` 是按注入给 train_step 的唯一 forward_step_func，按
+``model[0]`` 的 chunk 类型分支：encoder（phase ①，schedule 传 ``model=[encoder_chunk]``）
+/ backbone（phase ②，1F1B 传 ``model=[backbone_chunk]``）。
+
+职责边界（2026-08-12 用户确认）：
+- forward step **只做纯前传**：encoder 分支取数 + ``encoder_chunk(images)`` 返回包；
+  backbone 分支读模型已设输入调 ``backbone_chunk(...)`` 返回 ``(output, loss_func)``；
+- 数据/模型细节（``image_token_index`` / ``img_seq_len`` 等）全在本文件内部读取，
+  **不经过 schedule**；schedule 不接收 ``get_batch_fn`` 之类参数。
+
+``colocated_get_batch`` / ``get_ltor_masks_and_position_ids`` / ``loss_func`` 复制自
+``train.py``（L36-152 / L155-168 / L244-254），差异：去掉"中间 stage 不取数"守卫
+（colocated 里所有 rank 都做 encoder 前传、都需要数据）。
+"""
+
+from functools import partial
+
+import torch
+
+from megatron.core import tensor_parallel
+from megatron.core.models.multimodal import context_parallel
+from megatron.core.models.multimodal.colocated_llava_model import (
+    ColocatedGPTBackbone,
+    ColocatedViTEncoder,
+)
+from megatron.core.models.multimodal.llava_model import IGNORE_INDEX
+from megatron.core.parallel_state import get_tensor_model_parallel_rank
+from megatron.core.pipeline_parallel.colocated_encoder_comm import ForwardPacket
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.training import get_args, get_tokenizer
+
+
+def colocated_encoder_get_batch(data_iterator, image_token_index, img_seq_len):
+    """Phase ①: fetch a micro batch for the encoder producer (image + pack fields).
+
+    只取 encoder 前传 + 打包所需：images（前传）、tokens/labels/num_image_tiles（打包给
+    消费者）。**不生成 loss_mask/position_ids**（2026-08-13 用户确认：消费者在
+    ``colocated_backbone_get_batch`` 里从 labels 的 IGNORE/pad 掩码本地重建，loss_mask
+    本就不随包传）；attention_mask 恒 None（modulespec 指定）。与 ``train.py::get_batch``
+    一致（复制），差异：去掉"中间 stage 不取数"守卫（colocated 里每个 rank 都是
+    producer）、"last stage 不需要 images"分支，以及 loss_mask/position_ids 生成。
+
+    Note: attn_mask_type in layer_specs.py sets the attention mask. Attention mask is None here.
+
+    Returns:
+        (tokens, labels, images, num_tiles)
+    """
+    imgs = None
+    tokens = None
+    labels = None
+    num_tiles = None
+
+    args = get_args()
+
+    # Broadcast data.
+    nvtx_range_push("get_data")
+    if data_iterator is not None and get_tensor_model_parallel_rank() == 0:  # TP rank 0 取数
+        data = next(data_iterator)
+    else:
+        data = None
+
+    data_text = tensor_parallel.broadcast_data(["tokens"], data, torch.int64)["tokens"]
+    labels = tensor_parallel.broadcast_data(["labels"], data, torch.int64)["labels"]
+
+    imgs = tensor_parallel.broadcast_data(["imgs"], data, torch.float32)["imgs"]
+    num_tiles = tensor_parallel.broadcast_data(["num_tiles"], data, torch.int32)["num_tiles"]
+
+    # No image input (text-only sample) if the dataloader returned a size 1 image.
+    if imgs.shape == torch.Size([1, 1]):
+        # FSDP can hang with text-only samples. A workaround is to run a valid dummy image
+        # through the vision model and then add image embeddings with a zero multiplier.
+        if args.use_torch_fsdp2:
+            imgs = torch.zeros((1, 3, args.img_h, args.img_w), dtype=torch.float32, device=data_text.device)
+            num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
+        else:
+            # Similar workaround is not needed without FSDP and we can use an empty image.
+            imgs = torch.tensor([], dtype=torch.float32, device=data_text.device)
+            num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
+
+    nvtx_range_pop("get_data")
+
+    tokens_ = data_text.long()
+
+    nvtx_range_push("index tokens")
+    text_length = tokens_.shape[1]
+    tokens = tokens_[:, :text_length].contiguous()
+    labels = labels[:, 1 : text_length + 1].contiguous()  # left-shift the labels by one
+
+    assert tokens.shape == labels.shape, f"tokens: {tokens.shape} != labels: {labels.shape}"
+    nvtx_range_pop("index tokens")
+
+    # If context parallel is enabled, must shard inputs to CP ranks.
+    # 只 pad tokens/labels；position_ids/loss_mask 不存在——消费者在
+    # ``colocated_backbone_get_batch`` 里从 padded tokens/labels 重建，SP/CP 的 padding
+    # 语义对齐与 packed_seq_params 留 Task 6.3（packed_seq_params 不随包传）。
+    # Only tokens/labels are padded; position_ids/loss_mask are rebuilt by the consumer
+    # from the padded tokens/labels; SP/CP padding-semantics alignment and
+    # packed_seq_params are Task 6.3 (packed_seq_params is not sent in the packet).
+    if args.context_parallel_size > 1 or args.sequence_parallel:
+        assert tokens.shape[0], "micro-batch-size > 1 not supported yet with CP"
+
+        num_image_tokens = torch.sum(tokens == image_token_index).item()
+        num_image_embeddings = img_seq_len * imgs.shape[0] - num_image_tokens
+        seq_len = text_length + num_image_embeddings
+
+        # CP expects sequence length is divisible by CP size so apply padding.
+        mp_padding_needed = context_parallel.get_padding(
+            seq_len, args.context_parallel_size,
+            args.tensor_model_parallel_size, args.sequence_parallel,
+        )
+        tokens, labels = [
+            torch.nn.functional.pad(item, (0, mp_padding_needed))
+            for item in (tokens, labels)
+        ]
+
+    return tokens, labels, imgs, num_tiles
+
+
+def get_ltor_masks_and_position_ids(input_ids, target, pad_token):
+    """Build masks and position id for left to right model (copied from train.py:155)."""
+    seq_length = input_ids.shape[1]
+
+    # Position ids.
+    position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+    position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+
+    # Loss mask.
+    loss_mask = torch.ones(target.size(), dtype=torch.float, device=input_ids.device)
+    loss_mask[target == pad_token] = 0.0  # mask paddings
+    loss_mask[target == IGNORE_INDEX] = 0.0  # mask prompts
+
+    return loss_mask, position_ids
+
+
+def loss_func(loss_mask, output_tensor):
+    """Weighted average of the per-token loss (copied from train.py:244)."""
+    args = get_args()
+
+    losses = output_tensor.view(-1).float()
+    loss_mask = loss_mask.contiguous().view(-1).float()
+    loss = torch.sum(losses * loss_mask)
+
+    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
+
+    return (loss, num_tokens, {'lm loss': reporting_loss})
+
+
+def colocated_backbone_get_batch(packet, pad_token):
+    """Phase ② consumer: transform the forward packet into backbone inputs.
+
+    转换逻辑（2026-08-13 用户确认）：从 ``ForwardPacket`` 读内容字段（image_embeddings/
+    tokens/labels/num_image_tiles——labels 含 IGNORE/pad 掩码），**本地重建 loss_mask 与
+    position_ids**（``get_ltor_masks_and_position_ids`` 逻辑，与 producer 侧 get_batch 的
+    生成完全一致：loss_mask = (labels != pad) & (labels != IGNORE)、position_ids =
+    arange）——loss_mask 不随包传；attention_mask 恒 None（LLaVA 约定）。SP/CP 场景的
+    padding 语义对齐留 Task 6.3（与 position_ids 现状一致）。
+
+    Returns:
+        (image_embeddings, tokens, position_ids, attention_mask, labels, loss_mask,
+        num_image_tiles)
+    """
+    loss_mask, position_ids = get_ltor_masks_and_position_ids(
+        packet.tokens, packet.labels, pad_token
+    )
+    return (
+        packet.image_embeddings,
+        packet.tokens,
+        position_ids,
+        None,  # attention_mask
+        packet.labels,
+        loss_mask,
+        packet.num_image_tiles,
+    )
+
+
+def _encoder_forward(data_iterator, encoder_chunk):
+    """Phase ①: fetch data and run the encoder-only forward -> ForwardPacket.
+
+    phase ①（schedule 外）：取一个 micro batch 的数据，``encoder_chunk(images)`` 纯前传，
+    返回 5 字段前向包 ``ForwardPacket``（4 个内容字段 + microbatch id 字段，id 由
+    schedule 打标；``image_embeddings`` 保留 grad_fn，phase ④ 统一反传用；分离图在
+    发送/组装时 detach）。返回 ``(packet, None)`` 给 schedule 存 buffer。
+    """
+    args = get_args()
+    image_token_index = getattr(args, "image_token_index", None)
+    img_seq_len = getattr(args, "img_seq_len", None)
+    # 只取 images + 打包字段（tokens/labels/num_image_tiles）；loss_mask/position_ids
+    # 不在 producer 侧生成（消费者在 colocated_backbone_get_batch 里重建）。
+    tokens, labels, images, num_tiles = colocated_encoder_get_batch(
+        data_iterator, image_token_index, img_seq_len
+    )
+    image_embeddings = encoder_chunk(images)  # [img_seq_len, num_tiles, h_lang]，保留 grad_fn
+    packet = ForwardPacket(
+        image_embeddings=image_embeddings,
+        tokens=tokens,
+        labels=labels,
+        num_image_tiles=num_tiles,
+    )
+    assert set(packet.to_dict()) == set(ForwardPacket.field_names)
+    return packet, None
+
+
+def _backbone_forward(data_iterator, backbone_chunk, packet=None):
+    """Phase ②: backbone forward with the input already set by the schedule.
+
+    phase ②（1F1B 内）：输入已由 schedule 设置好——consumer（``pre_process=True``）的包
+    经 ``functools.partial`` 绑定到 forward_step_func 后由 schedule 传入（Task 4.3b，
+    **不经模型属性**），非首 stage 的激活已 ``set_input_tensor``。组装在模型 forward
+    内部（colocated_llava_model.py:655）。返回 ``(output, loss_func)``，与现有
+    forward_step 契约一致。
+    """
+    if backbone_chunk.pre_process:
+        # Consumer (stage 0): assemble the schedule-provided packet and run the backbone.
+        # consumer：使用 schedule 传入的包（ForwardPacket，partial 绑定），组装后跑 backbone。
+        assert packet is not None, (
+            "consumer forward step needs the packet bound by the schedule (Task 4.3b)"
+        )
+        # 转换：读包 + 本地重建 position_ids/loss_mask（loss_mask 不随包传，从 labels 的
+        # IGNORE/pad 掩码重建，与 producer 侧 get_batch 的生成逻辑一致）。
+        # Transform: read the packet + rebuild position_ids/loss_mask locally (loss_mask
+        # is not sent in the packet; rebuilt from the IGNORE/pad mask of labels).
+        (
+            image_embeddings,
+            tokens,
+            position_ids,
+            attention_mask,
+            labels,
+            loss_mask,
+            num_image_tiles,
+        ) = colocated_backbone_get_batch(packet, get_tokenizer().pad)
+        output, loss_mask = backbone_chunk(
+            image_embeddings=image_embeddings,
+            input_ids=tokens,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            num_image_tiles=num_image_tiles,
+        )
+    else:
+        # Non-first stage: the activation is injected via set_input_tensor; labels/loss_mask
+        # come from the schedule's P2P accompaniment (4.3i, 4.3h 定案) — the consumer-assembled
+        # new_labels/new_loss_mask travel down the pipeline; the last stage uses them for loss.
+        # 非首 stage：激活已 set_input_tensor；labels/loss_mask 来自 schedule 的伴随传输
+        #（4.3i：consumer 组装的 new_labels/new_loss_mask 沿流水下行，last stage 算 loss）。
+        labels = getattr(backbone_chunk, "colocated_new_labels", None)
+        loss_mask = getattr(backbone_chunk, "colocated_new_loss_mask", None)
+        output, loss_mask = backbone_chunk(labels=labels, loss_mask=loss_mask)
+
+    return output, partial(loss_func, loss_mask)
+
+
+def colocated_forward_step(data_iterator, model, packet=None):
+    """Colocated forward step: one function, branched by the chunk type in ``model``.
+
+    注入给 train_step 的唯一 forward_step_func（签名 ``(data_iterator, model)``），按
+    ``model`` 的 chunk 类型分支：
+    - ``model=[encoder_chunk]``（phase ①，schedule 调，**list**）：encoder 分支，返回
+      ``(ForwardPacket, None)``；
+    - ``model=backbone_chunk``（phase ②，1F1B 调，**已解包的单 chunk**——forward_step
+      辅助函数在 schedules.py 内 ``model = model[0]``）：backbone 分支，输入已由 schedule
+      设置好，返回 ``(output, loss_func)``。
+
+    ``packet``（可选，仅 phase ② consumer 用）：schedule 用 ``functools.partial`` 绑定
+    到本函数后传入（Task 4.3b，packet 走闭包、不经模型属性），backbone 分支的 consumer
+    路径使用；encoder 分支忽略。默认 None 保持与 train_step 注入契约
+    （``(data_iterator, model)``）兼容。
+    """
+    chunk = model[0] if isinstance(model, (list, tuple)) else model
+    if isinstance(chunk, ColocatedViTEncoder):
+        return _encoder_forward(data_iterator, chunk)
+    if isinstance(chunk, ColocatedGPTBackbone):
+        return _backbone_forward(data_iterator, chunk, packet)
+    raise TypeError(
+        f"colocated_forward_step expects the chunk to be ColocatedViTEncoder or "
+        f"ColocatedGPTBackbone, got {type(chunk)}"
+    )

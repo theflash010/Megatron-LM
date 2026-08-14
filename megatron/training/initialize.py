@@ -358,6 +358,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 create_gloo_process_groups=args.use_gloo_process_groups,
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
+                # Colocated encoder training: creates the encoder inner dp group.
+                # 共置 encoder 训练：创建 encoder inner dp 组（仅在开启该开关时）。
+                use_colocated_encoder=getattr(args, "use_colocated_encoder", False),
             )
             print_rank_0(
                 f"> initialized tensor model parallel with size "

@@ -136,6 +136,30 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 # Paralel group of all GPUs in a distributed optimizer instance
 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
+# Encoder inner data parallel group for colocated encoder training:
+# the P ranks inside one outer data-parallel replica (one rank per pipeline
+# stage; with TP=1 these are exactly the members of one pipeline-parallel group).
+# Used for the inner-layer gradient all-reduce of the colocated encoder before
+# the regular (outer) data-parallel all-reduce.
+# 共置训练中 encoder 的内部数据并行组：一个外层 dp 副本内的 P 个 rank
+# （每个 pipeline stage 一个；TP=1 时恰好等于一个 pipeline-parallel 组）。
+# 用于 encoder 梯度的第一层（inner）all-reduce，先于常规（外层）dp all-reduce。
+_ENCODER_INNER_DATA_PARALLEL_GROUP = None
+_ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS = None
+
+# Colocated boundary communication group: same members as the encoder inner dp
+# group (the ranks of one outer dp replica) but a SEPARATE NCCL instance, used
+# exclusively for the encoder->backbone-entry boundary P2P (forward packet and
+# backward grad). Kept independent from the pipeline-parallel group and the
+# encoder inner dp group to avoid serializing boundary P2P with the 1F1B P2P on
+# the same NCCL group.
+# 共置边界通信组：成员与 encoder inner dp 组相同（一个外层 dp 副本内的 rank），
+# 但是独立的 NCCL 实例，专用于 encoder→backbone entry 的边界 P2P（前向数据包与
+# 反向梯度）。与 pp_group / enc_inner_dp 组保持独立，避免边界 P2P 与 1F1B P2P
+# 在同一组上串行。
+_COLOCATED_BOUNDARY_GROUP = None
+_COLOCATED_BOUNDARY_GLOBAL_RANKS = None
+
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
@@ -566,6 +590,7 @@ def initialize_model_parallel(
     sharp_enabled_group: Optional[str] = None,
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
+    use_colocated_encoder: bool = False,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -1127,6 +1152,58 @@ def initialize_model_parallel(
             _POSITION_EMBEDDING_GROUP = group
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
 
+    # Build the encoder inner data-parallel groups (colocated encoder training).
+    # Each encoder inner dp group contains the P ranks inside one outer
+    # data-parallel replica (one rank per pipeline stage). With TP=1 these are
+    # exactly the members of one pipeline-parallel group, so we derive the rank
+    # lists from the pipeline-parallel groups. Used for the inner-layer gradient
+    # all-reduce of the colocated encoder; the outer layer reuses the regular
+    # data-parallel groups. Only created when use_colocated_encoder=True.
+    # 构建共置训练用的 encoder 内部数据并行组：每个组包含一个外层 dp 副本内的
+    # P 个 rank（每个 pipeline stage 一个）。TP=1 时其成员恰好等于一个
+    # pipeline-parallel 组，因此直接复用 pp 组的 rank 列表来创建独立组；
+    # 用于 encoder 梯度的第一层（inner）all-reduce，外层梯度仍复用常规 dp 组。
+    # 仅在 use_colocated_encoder=True 时创建。
+    global _ENCODER_INNER_DATA_PARALLEL_GROUP
+    global _ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS
+    if use_colocated_encoder:
+        assert _ENCODER_INNER_DATA_PARALLEL_GROUP is None, (
+            "encoder inner data parallel group is already initialized"
+        )
+        # Each pipeline-parallel group is one outer replica: reuse its rank list.
+        # 每个 pipeline-parallel 组就是一个外层副本，直接复用其 rank 列表。
+        for inner_ranks in decoder_rank_generator.get_ranks('pp'):
+            group = create_group(
+                inner_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("dp", nccl_comm_cfgs),
+                group_desc="ENCODER_INNER_DATA_PARALLEL_GROUP",
+            )
+            if rank in inner_ranks:
+                _ENCODER_INNER_DATA_PARALLEL_GROUP = group
+                _ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS = inner_ranks
+
+        # Build the colocated boundary communication groups. Same members as the
+        # encoder inner dp groups (one outer replica), but a SEPARATE NCCL
+        # instance, used only for the encoder->backbone-entry boundary P2P.
+        # 构建共置边界通信组：成员与 enc_inner_dp 组相同（一个外层副本），但是独立
+        # NCCL 实例，专用于 encoder→backbone entry 的边界 P2P。
+        global _COLOCATED_BOUNDARY_GROUP
+        global _COLOCATED_BOUNDARY_GLOBAL_RANKS
+        assert _COLOCATED_BOUNDARY_GROUP is None, (
+            "colocated boundary communication group is already initialized"
+        )
+        for boundary_ranks in decoder_rank_generator.get_ranks('pp'):
+            group = create_group(
+                boundary_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("dp", nccl_comm_cfgs),
+                group_desc="COLOCATED_BOUNDARY_GROUP",
+            )
+            if rank in boundary_ranks:
+                _COLOCATED_BOUNDARY_GROUP = group
+                _COLOCATED_BOUNDARY_GLOBAL_RANKS = boundary_ranks
+
     # Build the tensor + data parallel groups.
     global _TENSOR_AND_DATA_PARALLEL_GROUP
     global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
@@ -1462,6 +1539,124 @@ def get_pipeline_model_parallel_group(check_initialized=True):
             _PIPELINE_MODEL_PARALLEL_GROUP is not None
         ), "pipeline_model parallel group is not initialized"
     return _PIPELINE_MODEL_PARALLEL_GROUP
+
+
+def get_encoder_inner_data_parallel_group(check_initialized=True):
+    """Get the encoder inner data-parallel group (colocated encoder training).
+
+    The encoder inner dp group contains the P ranks inside one outer
+    data-parallel replica (one rank per pipeline stage; with TP=1 these are
+    exactly the members of one pipeline-parallel group). It is used for the
+    inner-layer gradient all-reduce of the colocated encoder, which runs before
+    the regular (outer) data-parallel all-reduce.
+
+    获取 encoder 内部数据并行组（共置训练）：包含一个外层 dp 副本内的 P 个
+    rank（每个 pipeline stage 一个；TP=1 时即 pipeline-parallel 组的成员）。
+    用于 encoder 梯度的第一层（inner）all-reduce，先于外层 dp all-reduce 执行。
+
+    Only available when ``initialize_model_parallel(use_colocated_encoder=True)``.
+    仅在 ``initialize_model_parallel(use_colocated_encoder=True)`` 时可用。
+    """
+    if check_initialized:
+        assert _ENCODER_INNER_DATA_PARALLEL_GROUP is not None, (
+            "encoder inner data parallel group is not initialized"
+        )
+    return _ENCODER_INNER_DATA_PARALLEL_GROUP
+
+
+def get_encoder_inner_data_parallel_rank():
+    """Get the caller rank's index within its encoder inner dp group.
+
+    Under the colocated layout this equals the caller's pipeline stage index
+    (s), which is also the microbatch slot assigned to this rank by the
+    round-robin encoder schedule (microbatch s when num_microbatches == pp_size).
+
+    返回当前 rank 在其 encoder inner dp 组内的编号：共置布局下它等于当前
+    rank 的 pipeline stage 序号（s），也就是轮盘式 encoder 调度分配给该
+    rank 的 microbatch 槽位（当 num_microbatches == pp_size 时为 microbatch s）。
+    """
+    group = get_encoder_inner_data_parallel_group()
+    return torch.distributed.get_group_rank(group, torch.distributed.get_rank())
+
+
+def get_encoder_inner_data_parallel_global_ranks():
+    """Get all global ranks of the encoder inner dp group the caller belongs to.
+
+    返回当前 rank 所属 encoder inner dp 组的全部全局 rank 列表。
+    """
+    assert _ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS is not None, (
+        "encoder inner data parallel global ranks are not initialized"
+    )
+    return _ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS
+
+
+def get_colocated_boundary_group(check_initialized=True):
+    """Get the colocated boundary communication group (colocated encoder training).
+
+    The group contains the P ranks of one outer dp replica (same members as the
+    encoder inner dp group) but is a SEPARATE NCCL instance used exclusively for
+    the encoder->backbone-entry boundary P2P (forward packet and backward grad).
+    It stays independent from the pipeline-parallel group to avoid serializing
+    boundary P2P with the 1F1B P2P on the same NCCL group.
+
+    获取共置边界通信组（共置训练）：成员为一个外层 dp 副本内的 P 个 rank（与
+    encoder inner dp 组相同），但是独立的 NCCL 实例，专用于 encoder→backbone
+    entry 的边界 P2P。与 pp_group 独立，避免边界 P2P 与 1F1B P2P 同组串行。
+
+    Only available when ``initialize_model_parallel(use_colocated_encoder=True)``.
+    仅在 ``initialize_model_parallel(use_colocated_encoder=True)`` 时可用。
+    """
+    if check_initialized:
+        assert _COLOCATED_BOUNDARY_GROUP is not None, (
+            "colocated boundary communication group is not initialized"
+        )
+    return _COLOCATED_BOUNDARY_GROUP
+
+
+def get_colocated_boundary_global_ranks():
+    """Get all global ranks of the colocated boundary group the caller belongs to.
+
+    返回当前 rank 所属共置边界通信组的全部全局 rank 列表。
+    """
+    assert _COLOCATED_BOUNDARY_GLOBAL_RANKS is not None, (
+        "colocated boundary communication global ranks are not initialized"
+    )
+    return _COLOCATED_BOUNDARY_GLOBAL_RANKS
+
+
+def validate_colocated_num_microbatches(num_microbatches):
+    """Validate num_microbatches for round-robin colocated encoder scheduling.
+
+    Under the round-robin schedule, the microbatches are distributed across the
+    pipeline stages (microbatch s is computed by stage s), so num_microbatches
+    must be a multiple of the pipeline model parallel size.
+
+    校验轮盘式共置 encoder 调度对 num_microbatches 的要求：轮盘调度把
+    microbatch 按 pipeline stage 分发（microbatch s 由 stage s 计算），因此
+    num_microbatches 必须是 pipeline model parallel size 的整数倍，且为正数。
+    """
+    pp_size = get_pipeline_model_parallel_world_size()
+    assert num_microbatches > 0, f"num_microbatches must be positive, got {num_microbatches}"
+    assert num_microbatches % pp_size == 0, (
+        f"num_microbatches ({num_microbatches}) must be a multiple of the pipeline "
+        f"model parallel size ({pp_size}) for round-robin colocated encoder scheduling"
+    )
+
+
+def get_microbatches_for_pipeline_stage(pp_stage, num_microbatches):
+    """Return the microbatch indices assigned to a pipeline stage under the
+    round-robin colocated encoder schedule.
+
+    With num_microbatches == k * pp_size, stage s computes microbatches
+    s, s + pp_size, s + 2 * pp_size, ... (k of them).
+
+    返回轮盘式共置 encoder 调度下，指定 pipeline stage 负责的 microbatch 索引：
+    num_microbatches == k * pp_size 时，stage s 计算 microbatch
+    s, s + pp_size, s + 2 * pp_size, ...（共 k 个）。
+    """
+    validate_colocated_num_microbatches(num_microbatches)
+    pp_size = get_pipeline_model_parallel_world_size()
+    return list(range(pp_stage, num_microbatches, pp_size))
 
 
 def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
@@ -2103,6 +2298,18 @@ def destroy_model_parallel():
 
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
+
+    global _ENCODER_INNER_DATA_PARALLEL_GROUP
+    _ENCODER_INNER_DATA_PARALLEL_GROUP = None
+
+    global _ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS
+    _ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS = None
+
+    global _COLOCATED_BOUNDARY_GROUP
+    _COLOCATED_BOUNDARY_GROUP = None
+
+    global _COLOCATED_BOUNDARY_GLOBAL_RANKS
+    _COLOCATED_BOUNDARY_GLOBAL_RANKS = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None

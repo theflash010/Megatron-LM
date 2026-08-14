@@ -42,7 +42,7 @@ else:
 
 IGNORE_INDEX = -100  # ID for labels that should be ignored.
 # Image token index can be tokenizer dependent so the default value does not work in all cases.
-DEFAULT_IMAGE_TOKEN_INDEX = -200
+DEFAULT_IMAGE_TOKEN_INDEX = -200 #默认的<image>经过tokenizer得到的token ID
 IMAGE_TOKEN = "<image>"
 VIDEO_TOKEN = "<video>"
 
@@ -117,7 +117,7 @@ class LLaVAModel(MegatronModule):
         language_rope_scaling_factor: float = 8.0,
         hybrid_layer_pattern: str = None,
         fp16_lm_cross_entropy: bool = False,
-        image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
+        image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX, #指定<image>在tokenizer中的token数字ID
         pixel_shuffle: bool = False,
         tile_tags: Optional[list] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -898,7 +898,7 @@ class LLaVAModel(MegatronModule):
         language_embeddings = None
         if self.pre_process:
             input_ids_text = input_ids.clone()
-            input_ids_text[input_ids_text == self.image_token_index] = 0 #把input_ids_text中等于self.image_token_index的元素变成0
+            input_ids_text[input_ids_text == self.image_token_index] = 0 #把input_ids_text中等于self.image_token_index的元素变成0，也就是<image>
             # Note: This adds absolute position embedding but not RoPE.
             # Each image is counted as one position.
             # RoPE is added in language_model forward. Each image embedding is one position.
@@ -921,7 +921,7 @@ class LLaVAModel(MegatronModule):
         combined_embeddings, new_labels, new_loss_mask = self._preprocess_data( #将文本embedding中的<image>替换为image_embeddings，同时labels和loss_mask都会自动对齐到新的embedding
             image_embeddings,
             language_embeddings,
-            input_ids,
+            input_ids, #注意这里传给 _preprocess_data 的是原始的input_ids,_preprocess_data 仍然可以通过input_ids == self.image_token_index找到图片位置
             loss_mask,
             labels,
             use_inference_kv_cache,

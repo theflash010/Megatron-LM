@@ -643,7 +643,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             {"role": "assistant", "content": str(cur_answer)},
         ]
 
-        input_ids, target = self.tokenizer.tokenize_conversation(conversation, True, False) #返回input_ids：模型输入（模型拿到完整的对话）；target 训练标签（system和user的输入被覆盖为IGNORE_INDEX，loss 只在 assistant 回复上计算，模型只学习"如何回答"，不会学到"如何提问"）
+        input_ids, target = self.tokenizer.tokenize_conversation(conversation, True, False) #返回input_ids：模型输入（模型拿到完整的对话）；target 训练标签（system和user的输入被覆盖为IGNORE_INDEX，loss 只在 assistant 回复上计算，模型只学习"如何回答"，不会学到"如何提问"）。这里的输出值都是数字token ID，图片标识<image>对应image_token_index
 
         if self.is_packing_enabled:
             input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles)

@@ -9,6 +9,14 @@ def add_multimodal_extra_args(parser):
     group.add_argument("--prompt-path", type=str, default=None)
     group.add_argument('--freeze-LM', action='store_true', default=False)
     group.add_argument('--freeze-ViT', action='store_true', default=False)
+    group.add_argument(
+        "--use-colocated-encoder",
+        action="store_true",
+        default=False,
+        help="Colocated training: every rank holds the full vision encoder (inner/outer "
+        "two-level DP) and 1/P of the GPT backbone (1F1B PP). Builds the model as two "
+        "chunks (ColocatedViTEncoder + ColocatedGPTBackbone) instead of LLaVAModel.",
+    )
     group.add_argument('--language-model-type', type=str, required=True)
     group.add_argument('--vision-model-type', type=str, default="clip")
     group.add_argument("--disable-vision-class-token", action="store_true", default=False)
