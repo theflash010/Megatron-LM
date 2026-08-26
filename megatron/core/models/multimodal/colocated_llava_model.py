@@ -303,12 +303,10 @@ class ColocatedGPTBackbone(MegatronModule):
             self.cp_group = None
         self.tensor_model_parallel_size_lm = language_transformer_config.tensor_model_parallel_size
 
-        # --- 4.3i：组装后的展开 labels/loss_mask 交接（backbone P2P 伴随传输）---
-        # pre_process（consumer）组装后设置，schedule 伴随 send；非 pre_process 由
-        # schedule 伴随 recv 后写入，last stage 用它算 loss。None 表示当前 stage 不参与
-        #（4.3h 定案：last stage 直接用伴随传输的 new_labels，不需要自己重建）。
-        self.colocated_new_labels = None
-        self.colocated_new_loss_mask = None
+        # 注：4.3j 重构后本模型不再持有 ``colocated_new_labels``/``colocated_new_loss_mask``
+        # 交接属性——展开 labels/loss_mask 改由 forward 返回 3 元组，经
+        # ``colocated_forward_step`` 的 ``intra_packet`` 载体与 schedule 交接（模型
+        # 不再充当 schedule mailbox）。
 
     def set_input_tensor(self, input_tensor) -> None:
         """Set model chunk input tensor (PP schedule entry point).
@@ -319,7 +317,7 @@ class ColocatedGPTBackbone(MegatronModule):
         ``input_tensor`` (transformer_block.py, ``pre_process=False``), so this
         forwarding is required.
 
-        将 PP 调度注入的激活转发给内部 GPTModel（最终落到 TransformerBlock 的
+        将 PP schedule 注入的激活转发给内部 GPTModel（最终落到 TransformerBlock 的
         ``input_tensor``）。非首 stage 时 TransformerBlock 会忽略 decoder_input 参数、
         强制读自己的 input_tensor（transformer_block.py 的 pre_process=False 分支），
         因此必须在此转发（与 LLaVAModel 的做法一致）。
@@ -486,10 +484,18 @@ class ColocatedGPTBackbone(MegatronModule):
                 image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
             )
 
-        # Create the final labels and loss mask (if this is the last language model stage).
-        # 组装最终 labels / loss_mask（post_process 且有 labels 时）。
+        # Create the final labels and loss mask (if labels are provided). In the
+        # colocated split the consumer (pre_process, post_process=False when PP>1) must
+        # also assemble the expanded labels/loss_mask: they are transported down the
+        # pipeline (4.3h/4.3j accompaniment) for the last stage's loss. Gating on
+        # post_process would leave them None for the consumer, and the receiver's
+        # irecv in _recv_targets would hang.
+        # 组装最终 labels / loss_mask（有 labels 时）。共置拆分下 consumer（pre_process，
+        # PP>1 时 post_process=False）也必须组装展开的 labels/loss_mask——它们要沿流水
+        # 伴随传输（4.3h/4.3j，供 last stage 算 loss）；若 gate 在 post_process，consumer
+        # 会得到 None，接收端 _recv_targets 的 irecv 将挂死。
         final_labels, final_loss_mask = None, None
-        if self.post_process and has_labels:
+        if has_labels:
             final_labels = torch.full(
                 (batch_size, max_seq_len), IGNORE_INDEX, dtype=labels.dtype, device=labels.device
             )
@@ -653,17 +659,20 @@ class ColocatedGPTBackbone(MegatronModule):
         写法问题）：
         - **组装只发生在 pre_process（consumer）**——image_embeddings（来自边界包）+
           本地文本组装为 combined_embeddings，展开 labels/loss_mask（new_labels/
-          new_loss_mask），写入 ``colocated_new_labels``/``colocated_new_loss_mask``
-          （交接给 schedule 做 backbone P2P 伴随传输，4.3h 定案）；
+          new_loss_mask）随返回值一并交还（4.3j 重构：不再写入模型属性，由
+          ``colocated_forward_step`` 写回 intra_packet 供 schedule 做 backbone P2P
+          伴随传输）；
         - **非 pre_process**：激活已 set_input_tensor（decoder_input=None 走
-          input_tensor），labels/loss_mask 来自 schedule 伴随 recv 写入的属性——**last
-          stage 用它算 loss**（不再是传入的 None）；
-        - 统一的 ``language_model`` 调用与返回 ``(output, new_loss_mask)``。
+          input_tensor），labels/loss_mask 直接用入参（schedule 伴随 recv 后经
+          intra_packet 闭包绑定传入，4.3j）——**last stage 用它算 loss**（不再是
+          传入的 None）；
+        - 统一的 ``language_model`` 调用与返回 ``(output, new_loss_mask, new_labels)``。
 
         Returns:
-            (output_tensor, loss_mask): output 为激活（中间 stage）或 per-token
-            loss/logits（末 stage）；loss_mask 为组装后的 new_loss_mask（consumer）
-            或伴随传输的 new_loss_mask（非 consumer）。
+            (output_tensor, loss_mask, labels): output 为激活（中间 stage）或
+            per-token loss/logits（末 stage）；loss_mask 为组装后的 new_loss_mask
+            （consumer）或入参 loss_mask（非 consumer）；labels 为组装后的
+            new_labels（consumer，供伴随传输）或入参 labels（非 consumer）。
         """
         if self.pre_process:
             # Optional per-call override of the image token id (defaults to the
@@ -714,15 +723,13 @@ class ColocatedGPTBackbone(MegatronModule):
                     )
                 )
             decoder_input = combined_embeddings
-            # 4.3i：组装产物交接给 schedule（伴随传输用）。
-            self.colocated_new_labels = new_labels
-            self.colocated_new_loss_mask = new_loss_mask
         else:
             # 非 consumer：激活已 set_input_tensor（decoder_input=None 走 input_tensor）；
-            # labels/loss_mask 来自 schedule 的伴随 recv（colocated_new_*，4.3h 定案）。
+            # labels/loss_mask 由 schedule 伴随 recv 后经 intra_packet 闭包绑定传入
+            #（4.3j 重构：不再依赖模型属性——模型不充当 schedule 交接的 mailbox）。
             decoder_input = None
-            new_labels = self.colocated_new_labels
-            new_loss_mask = self.colocated_new_loss_mask
+            new_labels = labels
+            new_loss_mask = loss_mask
 
         output = self.language_model(
             input_ids=None,
@@ -734,4 +741,7 @@ class ColocatedGPTBackbone(MegatronModule):
             runtime_gather_output=runtime_gather_output,
             packed_seq_params=packed_seq_params,
         )
-        return output, new_loss_mask
+        # 4.3j：返回三元组 (output, loss_mask, labels)——consumer（pre_process）的
+        # new_labels 由 colocated_forward_step 写回 intra_packet 供伴随传输；非
+        # consumer 的 new_labels 即闭包传入的 labels（last stage 算 loss）。
+        return output, new_loss_mask, new_labels

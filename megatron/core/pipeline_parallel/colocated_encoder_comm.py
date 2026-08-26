@@ -464,6 +464,53 @@ class EncoderBackboneBoundaryCommunicator:
         """
         return self.producer_id == 0
 
+    def warmup_boundary_communicators(self) -> None:
+        """Create the per-pair communicator and both transport directions up-front.
+
+        流水线开始前预热边界通信：对每个 producer p ∈ [1, group_size) **双向各做一次
+        1 元素交换**，把懒初始化的会合开销挪到两端都确定会到的位置（Task 4.6g）。
+
+        为什么必须预热（2026-08-26 实测 + torch 2.13.0 源码核对）：非批量 P2P 的
+        communicator 按 rank 对懒创建（key 是排序后的 ``"low:high"``，两个方向共用一个
+        comm，走 ``ncclCommInitRank`` + store 广播 uniqueId），而底层 p2p transport
+        **按方向**懒建连——因此每对有 3 个同步会合点：comm 创建 1 次（无向）+ 两个方向
+        各 1 次。**这些会合带超时**：两端到达时间差一旦超过 PG timeout（store 侧默认
+        60s），先到的一端不是继续等而是直接报错退出
+        （``store->get('0:2') wait timeout``），进程随之被 watchdog 拖下来。1F1B 里
+        consumer 与 producer 到达边界收发的时刻天然错开（最长 P-2 步），所以懒初始化在
+        这里不只是慢，是会让训练崩掉。
+
+        两端严格同序（先 producer→consumer，再 consumer→producer）：一个 rank 对只有一条
+        CUDA stream（torch 用同一个 key 索引 comm 与 stream），双向 op 严格 FIFO、不存在
+        全双工，同序才不互锁。
+        """
+        if self.group_size == 1:
+            # PP=1: everything is local, there is no boundary network at all.
+            # PP=1 全本地直传，没有边界网络，无需预热。
+            return
+        send_buffer = torch.ones(1, dtype=self.dtype, device="cuda")
+        recv_buffer = torch.empty(1, dtype=self.dtype, device="cuda")
+        if self.is_consumer():
+            for producer in range(1, self.group_size):
+                producer_rank = self.group_ranks[producer]
+                dist.irecv(
+                    recv_buffer, src=producer_rank, group=self.colocated_boundary_group
+                ).wait()
+                dist.isend(
+                    send_buffer, dst=producer_rank, group=self.colocated_boundary_group
+                ).wait()
+        else:
+            dist.isend(
+                send_buffer,
+                dst=self.consumer_global_rank,
+                group=self.colocated_boundary_group,
+            ).wait()
+            dist.irecv(
+                recv_buffer,
+                src=self.consumer_global_rank,
+                group=self.colocated_boundary_group,
+            ).wait()
+
     # ------------------------------------------------------------------
     # Internal helpers.
     # 内部辅助。
@@ -561,6 +608,19 @@ class EncoderBackboneBoundaryCommunicator:
         ``wait=False``：提交后立即返回两个 handle（producer replenish 用，
         wait 由调用方在 phase ② 后统一做）。
         """
+        # 发送端按张量自身 dtype 展平，接收端按 ``self.dtype``（config.pipeline_dtype）
+        # 反推浮点字段的字节数——两者不一致会让接收端所有偏移错位、解析出垃圾（例如
+        # microbatch id 变成随机整数），且不报错、只在下游校验时才暴露。跨 rank 协议
+        # 边界，值得断言。
+        # The sender flattens each tensor by its own dtype while the receiver derives the
+        # float field's byte length from self.dtype (config.pipeline_dtype); a mismatch
+        # silently shifts every offset (the microbatch id decodes to garbage), so assert
+        # here — this is a cross-rank protocol boundary.
+        assert packet.image_embeddings.dtype == self.dtype, (
+            f"forward packet image_embeddings dtype {packet.image_embeddings.dtype} != "
+            f"communicator dtype {self.dtype} (config.pipeline_dtype): the receiver would "
+            f"parse the flat buffer with the wrong element size"
+        )
         header, flat = packet.serialize() #需要序列化因为dist通信只支持tensor数据，不支持类型对象
         handles = [
             dist.isend(header, dst=dst_rank, group=self.colocated_boundary_group),

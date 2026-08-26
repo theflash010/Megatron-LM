@@ -303,8 +303,8 @@ class P2PCommunicator:
                 tensors sent and received in a single function call are
                 the same shape).
 
-            wait_on_reqs (boolean, optional, default=False): #控制 _communicate 内部是否等通信完成再返回，只能用于非批量提交 p2p 通信，因为批量提交的请求无法单独管理等待时机。
-                For non-batched p2p communication, wait on each request
+            wait_on_reqs (boolean, optional, default=True): #控制 _communicate 内部是否会将通信完成Event插入到计算流中，以确保计算流数据依赖，不管是否batched p2p都可以指定，默认True
+                For non-batched p2p communication, wait on each request #非批量时是一个一个 wait
                 before returning.
 
         Returns:
@@ -413,7 +413,7 @@ class P2PCommunicator:
                 req.wait() #在返回给上层之前，把四个方向的通信完成事件都挂到当前 compute stream 上。这样上层拿到 tensor_recv_prev 直接送进下一层网络计算就是安全的，不需要关心通信是否真的结束——GPU 会自己在正确的位置等。
             reqs = None
 
-        if config.batch_p2p_comm and config.batch_p2p_sync: #强制同步完成batch p2p通信
+        if config.batch_p2p_comm and config.batch_p2p_sync: #旧版 PyTorch 的 batch_isend_irecv 返回的 Work 对象 wait() 有竞态 bug（可能提前返回/事件没记录对），所以当时加了这个"全设备同步"兜底，注释明说：现代 torch 不需要这个
             # To protect against race condition when using batch_isend_irecv().
             # User should assert that we have a modern enough PyTorch to not need this
             torch.cuda.synchronize()

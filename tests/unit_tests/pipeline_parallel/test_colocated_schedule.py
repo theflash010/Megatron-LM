@@ -14,10 +14,9 @@
 - 跨 rank：所有 producer 的 microbatch 恰好覆盖 0..num_microbatches-1 一次（不重不漏）；
 - 主函数 wiring（4.3f）：完整跑 phase ①+②（PP=1 全本地 / PP>1 边界配对），返回
   forward_data_store；forward step encoder 分支每 microbatch 恰一次、num_microbatches
-  非 pp 倍数在校验处抛 AssertionError。
-
-运行（CI 标准方式）：
-    torchrun --nproc_per_node=N -m pytest tests/unit_tests/pipeline_parallel/test_colocated_schedule.py
+  非 pp 倍数在校验处抛 AssertionError；
+- n>P 完整节奏（4.6f）：n = 2*P 跑 phase ①→②→④，覆盖 4.4 补货、4.5 逐 step
+  prefetch、4.6c/4.6d 的边界梯度往返与 4.6e 的统一 encoder 反传。
 """
 
 import pytest
@@ -35,6 +34,22 @@ from megatron.core.pipeline_parallel.colocated_schedule import (
 from tests.unit_tests.test_utilities import Utils
 
 _IMG_H, _IMG_W, _H_LANG = 4, 4, 8
+# 边界包的浮点字段（image_embeddings）与 backbone activation 都必须是
+# config.pipeline_dtype——通信器按它反推字节数（colocated_encoder_comm 的 send 断言）。
+# The boundary packet's float field and the backbone activation must both be
+# config.pipeline_dtype: the communicator derives byte lengths from it.
+_PIPELINE_DTYPE = torch.bfloat16
+# backbone activation 的形状契约：1F1B 的接收端不看发送端实际发了什么，它按
+# get_tensor_shapes(seq_length, micro_batch_size, hidden_size) 分配 buffer 再 post irecv
+# （schedules.py 的 recv_tensor_shapes），所以 backbone forward 的输出必须正好是
+# [seq_length, micro_batch_size, hidden]——形状不符时 NCCL 的 send/recv 元素数对不上、
+# recv 永远配不上，两端一起挂死（2026-08-26 flight recorder 实测）。
+# The activation shape contract: the 1F1B receiver allocates its buffer from
+# get_tensor_shapes(seq_length, micro_batch_size, hidden_size) rather than from whatever
+# the sender produces, so the backbone forward must return exactly
+# [seq_length, micro_batch_size, hidden]; a mismatch makes the NCCL recv unmatchable
+# and deadlocks both ends.
+_SEQ_LENGTH, _MICRO_BATCH_SIZE = 10, 1
 
 
 class MockEncoder(torch.nn.Module):
@@ -46,12 +61,12 @@ class MockEncoder(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.proj = torch.nn.Linear(3 * _IMG_H * _IMG_W, _H_LANG)
+        self.proj = torch.nn.Linear(3 * _IMG_H * _IMG_W, _H_LANG).to(_PIPELINE_DTYPE)
 
     def forward(self, images):
         if images.shape[0] == 0:
-            return torch.tensor([], dtype=images.dtype, device=images.device).reshape(0, 0, 0)
-        out = self.proj(images.flatten(1))  # [num_tiles, h_lang]
+            return torch.tensor([], dtype=_PIPELINE_DTYPE, device=images.device).reshape(0, 0, 0)
+        out = self.proj(images.flatten(1).to(_PIPELINE_DTYPE))  # [num_tiles, h_lang]
         return out.unsqueeze(0).contiguous()  # [1, num_tiles, h_lang]
 
 
@@ -66,7 +81,20 @@ class FakeBackbone(torch.nn.Module):
 
     def __init__(self, pre_process=True):
         super().__init__()
-        self.config = ModelParallelConfig(pipeline_dtype=torch.bfloat16)
+        self.config = ModelParallelConfig(
+            pipeline_dtype=_PIPELINE_DTYPE,
+            # 4.3k/4.4（2026-08-23 诊断）：跳过 _communicate 的设备级同步
+            #（batch_p2p_sync）——它是旧 torch 的防御 workaround；且 unbatched 的
+            # targets 传输（_send_targets/_recv_targets）在 pp_group 上会触发新的
+            # NCCL 通信器 lazy-init，若两端不齐（一端卡在同步）会死锁。
+            # 完成性由 _communicate 内 batch 级 req.wait() 保证。
+            # 4.3k/4.4 (2026-08-23 diagnostic): skip the device-wide sync in _communicate
+            # (batch_p2p_sync) — an old-torch defensive workaround; the unbatched targets
+            # transport (_send_targets/_recv_targets) lazily creates a new pp_group NCCL
+            # communicator, whose collective init deadlocks if the peer is stuck in the
+            # device sync. Completion is still guaranteed by the batch-level req.wait().
+            batch_p2p_sync=False,
+        )
         # phase ② 运行需要 ModelParallelConfig 缺失的字段（在 TransformerConfig 里），
         # 补默认值（get_tensor_shapes / forward_step_calc_loss / 循环尾部等读取）。
         for _attr, _value in {
@@ -83,10 +111,18 @@ class FakeBackbone(torch.nn.Module):
                 setattr(self.config, _attr, _value)
         self.pre_process = pre_process
         self.input_tensor = None
-        self.proj = torch.nn.Linear(_H_LANG, _H_LANG)
+        self.proj = torch.nn.Linear(_H_LANG, _H_LANG).to(_PIPELINE_DTYPE)
 
     def set_input_tensor(self, input_tensor):
-        self.input_tensor = input_tensor
+        # 与 ColocatedGPTBackbone.set_input_tensor 一致（colocated_llava_model.py:325-330）：
+        # schedule 注入的 activation 可能是单元素 list（P2PCommunicator 的返回形态不统一），
+        # 统一解包成张量。
+        # Mirror ColocatedGPTBackbone.set_input_tensor: the schedule may inject a
+        # single-element list (the P2P API's return shape is not uniform), so unwrap it.
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+        assert len(input_tensor) == 1, "input_tensor should only be length 1 for colocated backbone"
+        self.input_tensor = input_tensor[0]
 
     def forward(
         self,
@@ -99,11 +135,22 @@ class FakeBackbone(torch.nn.Module):
     ):
         x = image_embeddings if self.pre_process else self.input_tensor
         if x is None:
-            x = torch.zeros(1, 1, _H_LANG, dtype=torch.bfloat16, device="cuda")
-        return self.proj(x.reshape(-1, _H_LANG)).unsqueeze(0).contiguous(), loss_mask
+            x = torch.zeros(1, 1, _H_LANG, dtype=_PIPELINE_DTYPE, device="cuda")
+        # 输出必须是 [seq_length, micro_batch_size, hidden]（见 _SEQ_LENGTH 处的形状契约）：
+        # 先把输入压成 [hidden]（sum 保留到 image_embeddings / input_tensor 的梯度通路），
+        # 再展开成契约形状。真实的 ColocatedGPTBackbone 天然输出该形状，这里只是补齐桩的保真度。
+        # The output must be [seq_length, micro_batch_size, hidden] (see the shape contract
+        # above): reduce the input to [hidden] (sum keeps the gradient path to
+        # image_embeddings / input_tensor), then expand to the contracted shape. The real
+        # ColocatedGPTBackbone produces this shape naturally.
+        hidden = self.proj(x.reshape(-1, _H_LANG)).sum(0)
+        activation = hidden.view(1, 1, _H_LANG).expand(
+            _SEQ_LENGTH, _MICRO_BATCH_SIZE, _H_LANG
+        ).contiguous()
+        return activation, loss_mask
 
 
-def _make_fake_batch(seed, num_tiles, seq=10):
+def _make_fake_batch(seed, num_tiles, seq=_SEQ_LENGTH):
     """Deterministic batch 4-tuple (colocated_encoder_get_batch contract).
 
     与 ``colocated_train.colocated_encoder_get_batch`` 一致（4 元组
@@ -119,15 +166,17 @@ def _make_fake_batch(seed, num_tiles, seq=10):
 
 
 def _make_fake_colocated_forward_step(batches, my_microbatches, encoder, backbone, served):
-    """Fake 'colocated_forward_step': (data_iterator, model, packet=None), branched by chunk.
+    """Fake 'colocated_forward_step': (data_iterator, model, packet=None, intra_packet=None),
+    branched by chunk.
 
-    模拟 colocated_train.colocated_forward_step（4.3f）：
+    模拟 colocated_train.colocated_forward_step（4.3f，4.3j 加 intra_packet）：
     - encoder 分支（``model=[encoder]`` list，phase ①）：取一个 micro batch 数据 +
       ``encoder_chunk(images)`` -> 4 字段 ForwardPacket（schedule 打标 id 后存 buffer）；
     - backbone 分支（``model=backbone`` 单 chunk 或 list，phase ②）：consumer
-      （``pre_process``）用 **partial 绑定的 packet** 的 image_embeddings 跑 FakeBackbone；
-      非 consumer 直接 ``chunk()``（input_tensor 已 set_input_tensor）。返回
-      ``(output, loss_func)``。
+      （``pre_process``）用 **partial 绑定的 packet** 的 image_embeddings 跑 FakeBackbone，
+      并把展开 labels/loss_mask 写回 intra_packet（4.3j，伴随传输用）；非 consumer 用
+      intra_packet 闭包绑定传入的 labels/loss_mask 跑 FakeBackbone（input_tensor 已
+      set_input_tensor）。返回 ``(output, loss_func)``。
     """
 
     def fake_loss_func(loss_mask, output_tensor):
@@ -139,7 +188,7 @@ def _make_fake_colocated_forward_step(batches, my_microbatches, encoder, backbon
         loss_reduced = {'lm loss': loss.detach().clone().view(1)}
         return loss, num_tokens, loss_reduced
 
-    def fake_colocated_forward_step(data_iterator, model, packet=None):
+    def fake_colocated_forward_step(data_iterator, model, packet=None, intra_packet=None):
         chunk = model[0] if isinstance(model, (list, tuple)) else model
         if isinstance(chunk, MockEncoder):
             microbatch = my_microbatches[len(served)]
@@ -163,8 +212,30 @@ def _make_fake_colocated_forward_step(batches, my_microbatches, encoder, backbon
                     labels=packet.labels,
                     num_image_tiles=packet.num_image_tiles,
                 )
+                # 4.3j：consumer 写回展开 labels/loss_mask 供伴随传输（fake 从输出
+                # shape 派生，与接收端推导一致——activation [s',b,h] → [b,s']，
+                # 避免 NCCL P2P 形状不匹配卡死）。与业务层一致：intra_packet 是强制
+                # 契约（schedule 对 consumer 总是绑定）。
+                assert intra_packet is not None, (
+                    "consumer forward step needs the intra_packet bound by the schedule (4.3j)"
+                )
+                s_prime, batch = output.shape[0], output.shape[1]
+                intra_packet.labels = torch.zeros(
+                    (batch, s_prime), dtype=torch.int64, device=output.device
+                )
+                intra_packet.loss_mask = torch.ones(
+                    (batch, s_prime), dtype=torch.float32, device=output.device
+                )
             else:
-                output, loss_mask = chunk()
+                # 4.3j：非 consumer 用 intra_packet 闭包绑定传入的 labels/loss_mask
+                #（伴随 recv 的结果，last stage 算 loss；中间 stage 无损失计算）。
+                assert intra_packet is not None, (
+                    "non-consumer forward step needs the intra_packet bound by the "
+                    "schedule (4.3j)"
+                )
+                output, loss_mask = chunk(
+                    labels=intra_packet.labels, loss_mask=intra_packet.loss_mask
+                )
             return output, partial(fake_loss_func, loss_mask)
         raise TypeError(f"unexpected chunk type {type(chunk)}")
 
@@ -175,10 +246,10 @@ def _my_microbatches_setup(world, num_microbatches=None):
     """Init parallel state (TP=1, PP=world, colocated) and return per-rank microbatches + batches.
 
     ``num_microbatches`` 默认 ``2*world``（round_robin 负载验证每 producer 2 个）；wiring
-    测试传 ``world``（=P，每 producer 1 个包）——**4.3b 的全量异步发送在 n/P>1 时死锁**
-    （NCCL 同组 P2P 中未配对的 send 会阻塞同组后续 isend，producer 连发多包时第 2 个包
-    阻塞、进不了 backbone recv，见 doc §2.11"last stage labels"备注 / 4.4 replenish 解决）；
-    冒烟用 n=P 验证 1 发 1 收配对与无死锁。
+    测试传 ``world``（=P，每 producer 1 个包）做最小配对冒烟。**n/P>1 的完整节奏**
+    （4.4 producer 启动+补货、4.5 consumer 逐 step prefetch、4.6d 的梯度 ①③）由
+    ``test_forward_backward_colocated_multi_microbatch_per_producer`` 覆盖——n=P 时
+    ``current_microbatch - group_size < 0``，这些分支全是 no-op（4.6f）。
     """
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1,
@@ -290,8 +361,8 @@ def test_forward_backward_colocated_wiring():
             data_iterator=object(),
             model=[encoder, backbone],
             num_microbatches=num_microbatches,
-            seq_length=10,
-            micro_batch_size=1,
+            seq_length=_SEQ_LENGTH,
+            micro_batch_size=_MICRO_BATCH_SIZE,
         )
         # phase ①+② 跑通：返回 forward_data_store（list，末 stage 存 loss_reduced）。
         assert isinstance(loss_store, list), (
@@ -311,8 +382,68 @@ def test_forward_backward_colocated_wiring():
                     data_iterator=object(),
                     model=[encoder, backbone],
                     num_microbatches=world + 1,  # 不是 pp_size 的整数倍
-                    seq_length=10,
-                    micro_batch_size=1,
+                    seq_length=_SEQ_LENGTH,
+                    micro_batch_size=_MICRO_BATCH_SIZE,
                 )
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_forward_backward_colocated_multi_microbatch_per_producer():
+    """n = 2*P: exercise restock, per-step prefetch and boundary-grad round trip (Task 4.6f).
+
+    n=P 的冒烟走不到 4.4/4.5/4.6 的核心分支（``current_microbatch - group_size < 0``
+    时补货、逐 step prefetch、梯度 ①③ 全是 no-op）。本用例用 **n = 2*P**（每 producer
+    2 个 microbatch）跑完整 phase ①→②→④，覆盖：
+    - 4.4 producer 启动发第 1 包 + 补货 step 异步发第 2 包；
+    - 4.5 consumer 流水前全量 prefetch + 循环内提前一整步 prefetch；
+    - 4.6c consumer 反传后 ``.grad`` 派发（本地留存 / 按 producer 分桶 isend）；
+    - 4.6d producer 补货 step 的梯度 ①③ + cooldown 补收最后一个 owned microbatch；
+    - 4.6e phase ④ 统一 encoder 反传（断言 encoder 参数拿到梯度）。
+    schedule 内部的两条收尾断言（``pending_grad_requests`` 已空、
+    ``producer_grad_buffers`` 键 == ``encoder_buffers`` 键）会在运行中自检。
+    """
+    world = Utils.world_size
+    num_microbatches, my_microbatches, batches = _my_microbatches_setup(
+        world, num_microbatches=2 * world
+    )
+    try:
+        encoder = MockEncoder().cuda()
+        backbone = FakeBackbone(pre_process=(ps.get_pipeline_model_parallel_rank() == 0)).cuda()
+        served = []
+        fake_forward_step = _make_fake_colocated_forward_step(
+            batches, my_microbatches, encoder, backbone, served
+        )
+        loss_store = forward_backward_colocated(
+            forward_step_func=fake_forward_step,
+            data_iterator=object(),
+            model=[encoder, backbone],
+            num_microbatches=num_microbatches,
+            seq_length=_SEQ_LENGTH,
+            micro_batch_size=_MICRO_BATCH_SIZE,
+        )
+        assert isinstance(loss_store, list), (
+            f"expected forward_data_store (list), got {type(loss_store)}"
+        )
+        # 每 producer 恰好 2 个 microbatch，且顺序即轮盘序列。
+        assert served == my_microbatches, (
+            f"phase ① must serve the round-robin microbatches in order, got {served}"
+        )
+        assert len(served) == num_microbatches // world == 2, (
+            f"expected 2 microbatches per producer, got {len(served)}"
+        )
+        # phase ④ 真的跑了：encoder 参数拿到梯度（裸模型，无 DDP —— 4.6e 跳过 no_sync/
+        # finalize，直接 autograd.backward 到参数上）。
+        assert encoder.proj.weight.grad is not None, (
+            "phase ④ must backward the encoder with the boundary grads (4.6e)"
+        )
+        assert torch.isfinite(encoder.proj.weight.grad).all(), (
+            "encoder grad must be finite after the phase-④ backward"
+        )
+        # backbone 也反传过（1F1B 的 backward_step）。
+        assert backbone.proj.weight.grad is not None, (
+            "backbone params must receive grads from the 1F1B backward"
+        )
+    finally:
+        Utils.destroy_model_parallel()
+

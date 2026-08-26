@@ -1,9 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Colocated training entry helpers: data, forward step, loss (business layer).
+"""Colocated training entry helpers: data, forward step, loss (implementation layer).
 
-共置训练的业务层（对应 ``examples/multimodal/train.py`` 的职责）：数据获取、模型
-forward 的分支函数、loss。schedule（``colocated_schedule.py``）只做编排：
+共置训练入口辅助（对应 ``examples/multimodal/train.py`` 的职责）：数据获取、模型
+forward 的分支函数、loss。schedule（``colocated_schedule.py``）只做 orchestration：
 - phase ① 循环调 ``colocated_forward_step`` 的 encoder 分支拿回包存 buffer；
 - phase ② 调其 backbone 分支（输入已由 schedule 设置好：consumer 的包 / 非首 stage
   的 ``set_input_tensor`` 激活）。
@@ -36,6 +36,7 @@ from megatron.core.models.multimodal.colocated_llava_model import (
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX
 from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from megatron.core.pipeline_parallel.colocated_encoder_comm import ForwardPacket
+from megatron.core.pipeline_parallel.colocated_schedule import IntraPacket
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from megatron.training import get_args, get_tokenizer
 
@@ -94,7 +95,7 @@ def colocated_encoder_get_batch(data_iterator, image_token_index, img_seq_len):
     nvtx_range_push("index tokens")
     text_length = tokens_.shape[1]
     tokens = tokens_[:, :text_length].contiguous()
-    labels = labels[:, 1 : text_length + 1].contiguous()  # left-shift the labels by one
+    labels = labels[:, 1 : text_length + 1].contiguous()  # left-shift the labels by one  # 取 columns [1, 2, ..., text_length]，这里对label进行了偏移（左移一位），真正的label
 
     assert tokens.shape == labels.shape, f"tokens: {tokens.shape} != labels: {labels.shape}"
     nvtx_range_pop("index tokens")
@@ -195,8 +196,8 @@ def _encoder_forward(data_iterator, encoder_chunk):
     args = get_args()
     image_token_index = getattr(args, "image_token_index", None)
     img_seq_len = getattr(args, "img_seq_len", None)
-    # 只取 images + 打包字段（tokens/labels/num_image_tiles）；loss_mask/position_ids
-    # 不在 producer 侧生成（消费者在 colocated_backbone_get_batch 里重建）。
+    # 只取 images + 打包字段（tokens/labels/num_image_tiles）；
+    # loss_mask/position_ids 不在 producer 侧生成（消费者在 colocated_backbone_get_batch 里重建）。
     tokens, labels, images, num_tiles = colocated_encoder_get_batch(
         data_iterator, image_token_index, img_seq_len
     )
@@ -211,7 +212,7 @@ def _encoder_forward(data_iterator, encoder_chunk):
     return packet, None
 
 
-def _backbone_forward(data_iterator, backbone_chunk, packet=None):
+def _backbone_forward(data_iterator, backbone_chunk, packet=None, intra_packet=None):
     """Phase ②: backbone forward with the input already set by the schedule.
 
     phase ②（1F1B 内）：输入已由 schedule 设置好——consumer（``pre_process=True``）的包
@@ -219,6 +220,11 @@ def _backbone_forward(data_iterator, backbone_chunk, packet=None):
     **不经模型属性**），非首 stage 的激活已 ``set_input_tensor``。组装在模型 forward
     内部（colocated_llava_model.py:655）。返回 ``(output, loss_func)``，与现有
     forward_step 契约一致。
+
+    4.3j 重构：consumer 的展开 labels/loss_mask 写回 ``intra_packet``（输出盒子，
+    schedule 在 forward_step 返回后读取做 backbone P2P 伴随发送）；非 consumer 的
+    labels/loss_mask 由 schedule 经 ``intra_packet`` 闭包绑定传入（last stage 算
+    loss）。模型不再持有交接状态。
     """
     if backbone_chunk.pre_process:
         # Consumer (stage 0): assemble the schedule-provided packet and run the backbone.
@@ -239,7 +245,10 @@ def _backbone_forward(data_iterator, backbone_chunk, packet=None):
             loss_mask,
             num_image_tiles,
         ) = colocated_backbone_get_batch(packet, get_tokenizer().pad)
-        output, loss_mask = backbone_chunk(
+        # 4.3j：模型 forward 返回 3 元组——labels 是组装展开后的 new_labels（之前没有
+        # 出口），现随返回值交还并写回 intra_packet，供 schedule 伴随发送（4.3h/4.3i
+        # 定案的 backbone P2P 伴随传输）。
+        output, loss_mask, new_labels = backbone_chunk(
             image_embeddings=image_embeddings,
             input_ids=tokens,
             position_ids=position_ids,
@@ -248,20 +257,32 @@ def _backbone_forward(data_iterator, backbone_chunk, packet=None):
             loss_mask=loss_mask,
             num_image_tiles=num_image_tiles,
         )
+        # 4.3j：consumer 的伴随传输是强制的（PP>1 时接收端 _recv_targets 无条件 irecv）——
+        # 若 schedule 未绑定 intra_packet，属配置错误，须在源头大声失败而非下游静默死锁。
+        assert intra_packet is not None, (
+            "consumer forward step needs the intra_packet bound by the schedule (4.3j)"
+        )
+        intra_packet.labels = new_labels
+        intra_packet.loss_mask = loss_mask
     else:
         # Non-first stage: the activation is injected via set_input_tensor; labels/loss_mask
-        # come from the schedule's P2P accompaniment (4.3i, 4.3h 定案) — the consumer-assembled
-        # new_labels/new_loss_mask travel down the pipeline; the last stage uses them for loss.
+        # come from the schedule's P2P accompaniment (4.3i, 4.3h 定案) bound through the
+        # intra_packet (4.3j) — the consumer-assembled new_labels/new_loss_mask travel down
+        # the pipeline; the last stage uses them for loss.
         # 非首 stage：激活已 set_input_tensor；labels/loss_mask 来自 schedule 的伴随传输
-        #（4.3i：consumer 组装的 new_labels/new_loss_mask 沿流水下行，last stage 算 loss）。
-        labels = getattr(backbone_chunk, "colocated_new_labels", None)
-        loss_mask = getattr(backbone_chunk, "colocated_new_loss_mask", None)
-        output, loss_mask = backbone_chunk(labels=labels, loss_mask=loss_mask)
+        #（4.3i：consumer 组装的 new_labels/new_loss_mask 沿流水下行，last stage 算 loss），
+        # 4.3j 起经 intra_packet 闭包绑定传入，不再读取模型属性。
+        assert intra_packet is not None, (
+            "non-consumer forward step needs the intra_packet bound by the schedule (4.3j)"
+        )
+        output, loss_mask, _ = backbone_chunk(
+            labels=intra_packet.labels, loss_mask=intra_packet.loss_mask
+        )
 
     return output, partial(loss_func, loss_mask)
 
 
-def colocated_forward_step(data_iterator, model, packet=None):
+def colocated_forward_step(data_iterator, model, packet=None, intra_packet=None):
     """Colocated forward step: one function, branched by the chunk type in ``model``.
 
     注入给 train_step 的唯一 forward_step_func（签名 ``(data_iterator, model)``），按
@@ -276,12 +297,18 @@ def colocated_forward_step(data_iterator, model, packet=None):
     到本函数后传入（Task 4.3b，packet 走闭包、不经模型属性），backbone 分支的 consumer
     路径使用；encoder 分支忽略。默认 None 保持与 train_step 注入契约
     （``(data_iterator, model)``）兼容。
+
+    ``intra_packet``（可选，4.3j）：schedule 与 ``colocated_forward_step`` 之间的
+    内部交接载体（IntraPacket）——consumer 用它做输出盒子（``colocated_forward_step``
+    写回展开 labels/loss_mask，schedule 在 forward_step 返回后读取伴随发送）；非
+    consumer 用它做输入载体（schedule 伴随 recv 的 labels/loss_mask，last stage 算
+    loss）。默认 None 保持契约兼容。
     """
     chunk = model[0] if isinstance(model, (list, tuple)) else model
     if isinstance(chunk, ColocatedViTEncoder):
         return _encoder_forward(data_iterator, chunk)
     if isinstance(chunk, ColocatedGPTBackbone):
-        return _backbone_forward(data_iterator, chunk, packet)
+        return _backbone_forward(data_iterator, chunk, packet=packet, intra_packet=intra_packet)
     raise TypeError(
         f"colocated_forward_step expects the chunk to be ColocatedViTEncoder or "
         f"ColocatedGPTBackbone, got {type(chunk)}"

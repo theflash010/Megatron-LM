@@ -197,6 +197,20 @@ def model_provider(
     tile_tags = _get_tile_tags(args, tokenizer) #没有使用tile tags
 
     if args.use_colocated_encoder:
+        # 4.3k/4.4（2026-08-22 设计定案，方案 B）：colocated 场景跳过
+        # p2p_communication._communicate 里的设备级 torch.cuda.synchronize()
+        # （batch_p2p_sync）——它是旧版 PyTorch batch_isend_irecv 竞态的防御
+        # workaround，现代 torch 不需要；且全设备同步会把边界组的有界 pending op
+        # （4.4 replenish 提前发送）拖成死锁。pp P2P 完成性仍由 _communicate 内的
+        # batch 级 req.wait() 保证（流级、正确）。只影响本 backbone config 的 P2P。
+        # 4.3k/4.4 (2026-08-22 design, option B): the colocated scenario skips the
+        # device-wide torch.cuda.synchronize() in p2p_communication._communicate
+        # (batch_p2p_sync) — a defensive workaround for an old torch batch_isend_irecv
+        # race that modern torch does not need; the device-wide sync would deadlock on
+        # the boundary group's bounded pending ops (4.4 replenish sends ahead). The pp
+        # P2P completion is still guaranteed by the batch-level req.wait() inside
+        # _communicate (stream-scoped). Only affects this backbone config's P2P.
+        language_config.batch_p2p_sync = False
         # Colocated training: every rank builds the full encoder chunk and its
         # 1/P backbone chunk. Both are always constructed regardless of
         # add_encoder/add_decoder, because the encoder is replicated on all ranks

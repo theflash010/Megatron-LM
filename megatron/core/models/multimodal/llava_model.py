@@ -448,7 +448,7 @@ class LLaVAModel(MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
-        """Preprocess input data before input to language model. #将文本embedding中的<image>替换为image_embeddings，同时labels和loss_mask都会自动对齐到新的embedding
+        """Preprocess input data before input to language model. #将文本embedding中的<image>替换为image_embeddings，同时labels和loss_mask都会自动对齐到新的embedding。对于需要pre_process的first stage，最终主要返回final_embedding，而final_labels, final_loss_mask都是none。对于需要post_process的last stage，它主要返回final_labels, final_loss_mask，而final_embedding会是None。
 
         This function is adopted from
         https://github.com/huggingface/transformers/blob/85817d98fb60977c97e3014196a462b732d2ed1a/src/transformers/models/llava_next/modeling_llava_next.py#L409
