@@ -147,6 +147,16 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 _ENCODER_INNER_DATA_PARALLEL_GROUP = None
 _ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS = None
 
+# Distributed optimizer instance groups derived from the colocated encoder's own
+# data-parallel domain and instance-count argument. These are independent of the
+# language model's groups even when a particular topology gives them equal members.
+# 根据共置 encoder 自身的数据并行域和实例数参数构造的分布式优化器实例组。即使某种
+# 拓扑下成员恰好相同，它们也与 language model 的对应通信组保持独立。
+_COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+_COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS = None
+_COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+_COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS = None
+
 # Colocated boundary communication group: same members as the encoder inner dp
 # group (the ranks of one outer dp replica) but a SEPARATE NCCL instance, used
 # exclusively for the encoder->backbone-entry boundary P2P (forward packet and
@@ -159,6 +169,50 @@ _ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS = None
 # 在同一组上串行。
 _COLOCATED_BOUNDARY_GROUP = None
 _COLOCATED_BOUNDARY_GLOBAL_RANKS = None
+
+# Colocated data parallel group for colocated encoder training: ALL W ranks that
+# hold a replica of the encoder, i.e. the cartesian product of the outer
+# data-parallel dimension and the encoder inner dimension (D_outer x P). The
+# encoder chunk hands this group to DDP as its dp/dp_cp group, so that a single
+# gradient reduction covers both the inner and the outer dimension at once
+# (valid because per-token loss makes the reduction a pure SUM).
+# 共置训练中 encoder 的数据并行组：持有 encoder 副本的**全部 W 个 rank**，即外层
+# 数据并行维度与 encoder 内部维度的笛卡尔积（D_outer x P）。encoder chunk 把该组
+# 作为 dp/dp_cp 组交给 DDP，于是一次梯度归约同时覆盖 inner 与 outer 两个维度
+# （成立前提是 per-token loss 使归约退化为纯 SUM）。
+_COLOCATED_DATA_PARALLEL_GROUP = None
+_COLOCATED_DATA_PARALLEL_GLOBAL_RANKS = None
+
+# Colocated encoder pipeline (and context) parallel group: the encoder is NOT
+# pipeline parallel under colocated training (every rank holds a full replica,
+# vision_config.pipeline_model_parallel_size == 1) and does not use context
+# parallelism either, so its pipeline/context group is the caller rank alone.
+# Handing this group to the encoder chunk's DDP instead of the backbone's
+# pipeline group is what keeps the encoder's communication description honest:
+# every member of the colocated data-parallel group then reports pipeline rank 0
+# and derives the same bucket layout, whereas the backbone pipeline group would
+# report a different rank per member and split the buckets inconsistently.
+# 共置 encoder 的 pipeline（兼 context）并行组：共置训练下 encoder 不做 PP（每个
+# rank 持完整副本，vision_config.pipeline_model_parallel_size == 1），也不做 CP，
+# 因此它的 pipeline/context 组就是当前 rank 自己。把这个组（而不是 backbone 的
+# pipeline 组）交给 encoder chunk 的 DDP，才是对 encoder 通信拓扑的忠实描述：
+# 共置数据并行组内每个成员报出的 pipeline rank 都是 0、推导出同样的分桶布局；
+# 若用 backbone 的 pipeline 组，各成员报出的 rank 不同、分桶会不一致。
+_COLOCATED_ENCODER_PIPELINE_MODEL_PARALLEL_GROUP = None
+
+# Tensor model parallel group of the colocated encoder: same members as the job's
+# regular tensor model parallel group (the encoder tensor parallel size is an
+# explicit argument and must equal the job's, see validate_colocated_args), but a
+# SEPARATE NCCL instance, so that the encoder's tensor-parallel collectives and its
+# data broadcast are described by - and issued on - the encoder's own communicator
+# instead of borrowing the backbone's. Same "same members, separate instance"
+# device as the colocated boundary group.
+# 共置 encoder 的张量并行组：成员与作业常规 tp 组相同（encoder tp 并行度是显式参数且
+# 必须等于作业的，见 validate_colocated_args），但是**独立 NCCL 实例**，让 encoder 的
+# 张量并行集合操作与取数广播都发生在 encoder 自己的通信子上，而不是借用 backbone 的。
+# 与共置边界组同样是"同成员、独立实例"的手法。
+_COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GROUP = None
+_COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
 
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
@@ -591,6 +645,8 @@ def initialize_model_parallel(
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
     use_colocated_encoder: bool = False,
+    colocated_encoder_tensor_model_parallel_size: Optional[int] = None,
+    colocated_encoder_num_distributed_optimizer_instances: int = 1,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -661,6 +717,10 @@ def initialize_model_parallel(
         num_distributed_optimizer_instances (int, default = 1):
             The number of distributed optimizer replicas across the data-
             parallel domain. #针对ZeRO-1/2的逻辑，数值代表优化器状态切成几分
+
+        colocated_encoder_num_distributed_optimizer_instances (int, default = 1):
+            The independently configured number of distributed optimizer replicas
+            across the colocated encoder's own data-parallel domain.
 
         expert_tensor_parallel_size (int, default = tp_size):
             The number of GPUs to split individual tensors of expert.
@@ -1204,6 +1264,151 @@ def initialize_model_parallel(
                 _COLOCATED_BOUNDARY_GROUP = group
                 _COLOCATED_BOUNDARY_GLOBAL_RANKS = boundary_ranks
 
+        # Build the colocated data-parallel groups: all W ranks holding an encoder
+        # replica (the outer dp-cp dimension times the inner pipeline dimension).
+        # The rank lists come from the rank generator's 'dp-cp-pp' token, so the
+        # membership is derived from the group layout instead of an index formula
+        # and stays correct under any rank order.
+        # This group is the encoder's complete data-parallel domain. Its distributed
+        # optimizer intra/inter hierarchy is derived independently below from this rank
+        # list and the encoder-specific instance-count argument.
+        # 构建共置数据并行组：持有 encoder 副本的全部 W 个 rank（外层 dp-cp 维度 ×
+        # 内部 pipeline 维度）。rank 列表取自 rank generator 的 'dp-cp-pp' token，
+        # 成员关系由组布局推导而非下标算式，因此在任意 rank order 下都正确。该组是
+        # encoder 完整的数据并行域；其 DistOpt intra/inter 层次在下方根据这份 rank
+        # 列表与 encoder 专属实例数独立推导。
+        global _COLOCATED_DATA_PARALLEL_GROUP
+        global _COLOCATED_DATA_PARALLEL_GLOBAL_RANKS
+        assert _COLOCATED_DATA_PARALLEL_GROUP is None, (
+            "colocated data parallel group is already initialized"
+        )
+        for colocated_data_parallel_ranks in decoder_rank_generator.get_ranks('dp-cp-pp'):
+            group = create_group(
+                colocated_data_parallel_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
+                group_desc="COLOCATED_DATA_PARALLEL_GROUP",
+            )
+            if rank in colocated_data_parallel_ranks:
+                _COLOCATED_DATA_PARALLEL_GROUP = group
+                _COLOCATED_DATA_PARALLEL_GLOBAL_RANKS = colocated_data_parallel_ranks
+
+            # Derive the encoder's distributed optimizer hierarchy from the encoder's own
+            # data-parallel ranks and external instance-count argument. Do not reuse the
+            # language model hierarchy: the two components can choose different counts.
+            # 根据 encoder 自己的数据并行 rank 与外部实例数参数推导分布式优化器层次，不能
+            # 复用 language model 的层次，因为两个组件可以选择不同的实例数。
+            assert colocated_encoder_num_distributed_optimizer_instances > 0, (
+                "colocated encoder distributed optimizer instances must be greater than 0"
+            )
+            assert (
+                len(colocated_data_parallel_ranks)
+                % colocated_encoder_num_distributed_optimizer_instances
+                == 0
+            ), (
+                "colocated encoder data parallel size "
+                f"({len(colocated_data_parallel_ranks)}) must be divisible by its number of "
+                "distributed optimizer instances "
+                f"({colocated_encoder_num_distributed_optimizer_instances})"
+            )
+            global _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+            global _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS
+            global _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+            global _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS
+            if colocated_encoder_num_distributed_optimizer_instances == 1:
+                if rank in colocated_data_parallel_ranks:
+                    _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = group
+                    _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS = (
+                        colocated_data_parallel_ranks
+                    )
+            else:
+                colocated_encoder_intra_distributed_optimizer_instance_size = (
+                    len(colocated_data_parallel_ranks)
+                    // colocated_encoder_num_distributed_optimizer_instances
+                )
+                hierarchical_groups, _ = create_hierarchical_groups(
+                    rank,
+                    colocated_data_parallel_ranks,
+                    [
+                        colocated_encoder_intra_distributed_optimizer_instance_size,
+                        colocated_encoder_num_distributed_optimizer_instances,
+                    ],
+                    pg_options=[
+                        get_nccl_options("colocated_encoder_intra_dist_opt", nccl_comm_cfgs),
+                        get_nccl_options("colocated_encoder_inter_dist_opt", nccl_comm_cfgs),
+                    ],
+                    timeout=timeout,
+                    group_desc="COLOCATED_ENCODER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP",
+                )
+                if rank in colocated_data_parallel_ranks:
+                    (
+                        _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP,
+                        _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP,
+                    ) = hierarchical_groups
+                    _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS = (
+                        torch.distributed.get_process_group_ranks(
+                            _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+                        )
+                    )
+                    _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS = (
+                        torch.distributed.get_process_group_ranks(
+                            _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+                        )
+                    )
+
+        # Build the colocated encoder pipeline (and context) parallel groups: one
+        # single-member group per rank, because the encoder is replicated in full
+        # on every rank and is neither pipeline- nor context-parallel. Group
+        # creation is collective, so every rank walks the same list of groups.
+        # 构建共置 encoder 的 pipeline（兼 context）并行组：每个 rank 一个单成员组，
+        # 因为 encoder 在每个 rank 上都是完整副本，既不做 PP 也不做 CP。建组是集合
+        # 操作，因此所有 rank 都要遍历同一份组列表。
+        global _COLOCATED_ENCODER_PIPELINE_MODEL_PARALLEL_GROUP
+        assert _COLOCATED_ENCODER_PIPELINE_MODEL_PARALLEL_GROUP is None, (
+            "colocated encoder pipeline model parallel group is already initialized"
+        )
+        for encoder_pipeline_rank in range(torch.distributed.get_world_size()):
+            group = create_group(
+                [encoder_pipeline_rank],
+                timeout=timeout,
+                pg_options=get_nccl_options("pp", nccl_comm_cfgs),
+                group_desc="COLOCATED_ENCODER_PIPELINE_MODEL_PARALLEL_GROUP",
+            )
+            if rank == encoder_pipeline_rank:
+                _COLOCATED_ENCODER_PIPELINE_MODEL_PARALLEL_GROUP = group
+
+        # Build the colocated encoder tensor model parallel groups. The encoder's
+        # tensor parallel size is an explicit argument and must equal the job's
+        # (the boundary packet pairs the tensor-parallel slot of the same index on
+        # the producer and the consumer), so the member lists are the job's 'tp'
+        # rank lists; the point of building them again is to give the encoder its
+        # OWN communicator instead of borrowing the backbone's.
+        # 构建共置 encoder 的张量并行组：encoder 的 tp 并行度是显式参数且必须等于作业的
+        # （边界包按 tp 槽位一一对应发送），所以成员列表就取作业的 'tp' rank 列表；重新
+        # 建一遍的意义在于让 encoder 拥有**自己的**通信子，而不是借用 backbone 的。
+        global _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GROUP
+        global _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+        assert _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GROUP is None, (
+            "colocated encoder tensor model parallel group is already initialized"
+        )
+        if colocated_encoder_tensor_model_parallel_size is None:
+            colocated_encoder_tensor_model_parallel_size = tensor_model_parallel_size
+        assert colocated_encoder_tensor_model_parallel_size == tensor_model_parallel_size, (
+            "colocated encoder tensor model parallel size "
+            f"({colocated_encoder_tensor_model_parallel_size}) must equal the job's tensor "
+            f"model parallel size ({tensor_model_parallel_size})"
+        )
+        for encoder_tensor_ranks in decoder_rank_generator.get_ranks('tp'):
+            group = create_group(
+                encoder_tensor_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("tp", nccl_comm_cfgs),
+                group_desc="COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GROUP",
+            )
+            if rank in encoder_tensor_ranks:
+                _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GROUP = group
+                _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = encoder_tensor_ranks
+
     # Build the tensor + data parallel groups.
     global _TENSOR_AND_DATA_PARALLEL_GROUP
     global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
@@ -1590,6 +1795,52 @@ def get_encoder_inner_data_parallel_global_ranks():
     return _ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS
 
 
+def get_colocated_encoder_intra_distributed_optimizer_instance_group(check_initialized=True):
+    """Get the colocated encoder's intra distributed optimizer instance group.
+
+    获取共置 encoder 自己的分布式优化器实例内通信组。
+    """
+    if check_initialized:
+        assert _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None, (
+            "colocated encoder intra distributed optimizer instance group is not initialized"
+        )
+    return _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+
+
+def get_colocated_encoder_intra_distributed_optimizer_instance_global_ranks():
+    """Get global ranks in the colocated encoder's intra optimizer instance group.
+
+    获取共置 encoder 分布式优化器实例内通信组的全部全局 rank。
+    """
+    assert _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS is not None, (
+        "colocated encoder intra distributed optimizer instance ranks are not initialized"
+    )
+    return _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS
+
+
+def get_colocated_encoder_inter_distributed_optimizer_instance_group(check_initialized=True):
+    """Get the group spanning the colocated encoder's optimizer instances.
+
+    获取横跨共置 encoder 各分布式优化器实例的通信组。
+    """
+    if check_initialized:
+        assert _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None, (
+            "colocated encoder inter distributed optimizer instance group is not initialized"
+        )
+    return _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+
+
+def get_colocated_encoder_inter_distributed_optimizer_instance_global_ranks():
+    """Get global ranks in the colocated encoder's inter optimizer instance group.
+
+    获取横跨共置 encoder 各分布式优化器实例通信组的全部全局 rank。
+    """
+    assert _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS is not None, (
+        "colocated encoder inter distributed optimizer instance ranks are not initialized"
+    )
+    return _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS
+
+
 def get_colocated_boundary_group(check_initialized=True):
     """Get the colocated boundary communication group (colocated encoder training).
 
@@ -1613,6 +1864,23 @@ def get_colocated_boundary_group(check_initialized=True):
     return _COLOCATED_BOUNDARY_GROUP
 
 
+def is_colocated_encoder_enabled():
+    """Whether colocated encoder training is enabled in this process.
+
+    True once ``initialize_model_parallel(use_colocated_encoder=True)`` has built the
+    colocated groups. This is the predicate the schedule dispatcher
+    (``get_forward_backward_func``) uses to pick ``forward_backward_colocated``:
+    megatron.core must not read megatron.training's args, so the parallel state that
+    the flag already produced is the single source of truth.
+
+    本进程是否启用共置 encoder 训练：``initialize_model_parallel(use_colocated_encoder=True)``
+    建好共置组后为 True。schedule 分发（``get_forward_backward_func``）用它选
+    ``forward_backward_colocated``——megatron.core 不读 megatron.training 的 args，
+    以该开关已经落地的并行状态为单一来源。
+    """
+    return _COLOCATED_BOUNDARY_GROUP is not None
+
+
 def get_colocated_boundary_global_ranks():
     """Get all global ranks of the colocated boundary group the caller belongs to.
 
@@ -1622,6 +1890,220 @@ def get_colocated_boundary_global_ranks():
         "colocated boundary communication global ranks are not initialized"
     )
     return _COLOCATED_BOUNDARY_GLOBAL_RANKS
+
+
+def get_colocated_data_parallel_group(check_initialized=True):
+    """Get the colocated data-parallel group (colocated encoder training).
+
+    The group contains ALL W ranks that hold an encoder replica, i.e. the outer
+    data-parallel dimension times the encoder inner dimension (D_outer x P). The
+    encoder chunk gives this group to DDP as its dp/dp_cp group, so one gradient
+    reduction covers both dimensions at once. This is only equivalent to the
+    two-step (inner SUM, then outer reduction) formulation because per-token loss
+    makes the data-parallel reduction a pure SUM.
+
+    获取共置数据并行组（共置训练）：包含持有 encoder 副本的全部 W 个 rank，即外层
+    数据并行维度 × encoder 内部维度（D_outer x P）。encoder chunk 把它作为
+    dp/dp_cp 组交给 DDP，一次归约同时覆盖两个维度；与"先 inner SUM 再 outer 归约"
+    等价的前提是 per-token loss 使数据并行归约为纯 SUM。
+
+    Only available when ``initialize_model_parallel(use_colocated_encoder=True)``.
+    仅在 ``initialize_model_parallel(use_colocated_encoder=True)`` 时可用。
+    """
+    if check_initialized:
+        assert _COLOCATED_DATA_PARALLEL_GROUP is not None, (
+            "colocated data parallel group is not initialized"
+        )
+    return _COLOCATED_DATA_PARALLEL_GROUP
+
+
+def get_colocated_data_parallel_global_ranks():
+    """Get all global ranks of the colocated data-parallel group the caller belongs to.
+
+    返回当前 rank 所属共置数据并行组的全部全局 rank 列表。
+    """
+    assert _COLOCATED_DATA_PARALLEL_GLOBAL_RANKS is not None, (
+        "colocated data parallel global ranks are not initialized"
+    )
+    return _COLOCATED_DATA_PARALLEL_GLOBAL_RANKS
+
+
+def get_colocated_encoder_pipeline_model_parallel_group(check_initialized=True):
+    """Get the colocated encoder pipeline group (colocated encoder training).
+
+    The group holds the caller rank alone: the encoder is replicated in full on
+    every rank, so it is neither pipeline- nor context-parallel. It is handed to
+    the encoder chunk as both its pipeline and its context group.
+
+    获取共置 encoder 的 pipeline 组（共置训练）：组内只有当前 rank——encoder 在每个
+    rank 上都是完整副本，既不做 PP 也不做 CP。它同时作为 encoder chunk 的 pipeline
+    组与 context 组。
+
+    Only available when ``initialize_model_parallel(use_colocated_encoder=True)``.
+    仅在 ``initialize_model_parallel(use_colocated_encoder=True)`` 时可用。
+    """
+    if check_initialized:
+        assert _COLOCATED_ENCODER_PIPELINE_MODEL_PARALLEL_GROUP is not None, (
+            "colocated encoder pipeline model parallel group is not initialized"
+        )
+    return _COLOCATED_ENCODER_PIPELINE_MODEL_PARALLEL_GROUP
+
+
+def get_colocated_encoder_tensor_model_parallel_group(check_initialized=True):
+    """Get the tensor model parallel group of the colocated encoder.
+
+    获取共置 encoder 的张量并行组：成员与作业常规 tp 组相同，但是独立 NCCL 实例。
+    encoder 侧的一切张量并行行为（参数切分、取数广播）都应该走这个组。
+
+    Only available when ``initialize_model_parallel(use_colocated_encoder=True)``.
+    仅在 ``initialize_model_parallel(use_colocated_encoder=True)`` 时可用。
+    """
+    if check_initialized:
+        assert _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GROUP is not None, (
+            "colocated encoder tensor model parallel group is not initialized"
+        )
+    return _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GROUP
+
+
+def get_colocated_encoder_tensor_model_parallel_global_ranks():
+    """Get the global ranks of the colocated encoder tensor model parallel group.
+
+    获取共置 encoder 张量并行组的全局 rank 列表。
+    """
+    assert _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS is not None, (
+        "colocated encoder tensor model parallel group is not initialized"
+    )
+    return _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+
+
+def build_colocated_encoder_process_groups():
+    """Build the process group collection of the colocated encoder model chunk.
+
+    The collection describes the ENCODER's own topology, not the backbone's,
+    because the encoder's communication is fully separate from the backbone's:
+      - ``dp`` / ``dp_cp``: the colocated data-parallel group (all W ranks), the
+        group DDP reduces the encoder gradients over;
+      - ``pp`` / ``cp``: the single-member colocated encoder pipeline group, since
+        every rank holds a full encoder replica (no pipeline, no context
+        parallelism). This also makes every member of the colocated
+        data-parallel group report pipeline rank 0 and therefore derive the same
+        bucket layout - handing over the backbone's pipeline group instead would
+        make the members disagree on the number of buckets and deadlock the
+        per-bucket gradient reduction (distributed_data_parallel.py:102-107);
+      - ``intra_dp_cp`` / ``intra_dist_opt``: the encoder's own intra optimizer
+        instance group, derived from its data-parallel ranks and instance count;
+      - ``inter_dist_opt``: the encoder's own inter-instance group, or ``None``
+        when the encoder has one optimizer instance;
+      - ``embd`` / ``pos_embd``: the single-member colocated encoder pipeline
+        group as well. Those two groups exist only to keep tied word / position
+        embeddings in sync between the first and the last pipeline stage, so they
+        are meaningless for a component that has no pipeline and no tied
+        embeddings, and a single-member group is exactly how "nothing to sync"
+        is expressed: ``_allreduce_embedding_grad`` gates on
+        ``get_pg_size(embd_group) > 1`` plus membership
+        (finalize_model_grads.py:229-230), so both sections are skipped.
+        Note that ``None`` does NOT work here even though ``get_pg_size(None)``
+        returns 1: ``_allreduce_word_embedding_grads`` treats a ``None`` group as
+        "not supplied" and falls back to the JOB-WIDE embedding group
+        (finalize_model_grads.py:189-193), which has two members under PP>1 and
+        then trips ``assert pp_group is None`` because the encoder collection did
+        supply a pipeline group. Inheriting the backbone's embedding group would
+        be wrong for the same reason the fallback is: on the first / last
+        backbone stage it would walk into the ViT chunk looking for
+        ``pre_process`` and ``share_embeddings_and_output_weights``, neither of
+        which ``ColocatedViTEncoder`` has;
+      - ``mp``: the encoder's tensor-parallel group alone. ``mp`` is the group the
+        optimizer all-reduces the gradient norm over (optimizer.py:181-199 ->
+        clip_grads.py:133-137), so it must cover exactly the ranks the parameters
+        are PARTITIONED over and none of the ranks holding replicas. The encoder
+        is replicated across the pipeline dimension, so the job's regular
+        tp x pp group would sum the same squared norm P times and over-clip the
+        encoder gradients; with a single-member pipeline group the encoder's
+        tp x pp product IS its tensor-parallel group;
+      - ``tp``: the colocated encoder tensor model parallel group - same members as
+        the job's (the encoder tensor parallel size is an explicit argument and must
+        equal the job's, see validate_colocated_args) but the encoder's own
+        communicator, so that no part of the encoder's description points at a
+        backbone group.
+    The intra/inter pair is only consumed once
+    ``ddp_config.num_distributed_optimizer_instances > 1``, so attaching it here
+    is inert for the current (non distributed optimizer) path and lets that
+    variant be a configuration change instead of a process-group change.
+
+    构建共置 encoder model chunk 的进程组集合：描述的是 **encoder 自身**的拓扑而
+    非 backbone 的，因为 encoder 的通信与 backbone 完全分开——``dp``/``dp_cp`` 为
+    共置数据并行组（全部 W 个 rank，encoder 梯度就在其上归约）；``pp``/``cp`` 为
+    单成员的共置 encoder pipeline 组，因为每个 rank 都持有完整 encoder 副本（既无
+    PP 也无 CP），这同时让共置数据并行组内每个成员报出的 pipeline rank 都是 0、
+    推导出相同的分桶布局——若改传 backbone 的 pipeline 组，成员间桶数不一致会让
+    逐 bucket 的梯度归约死锁（distributed_data_parallel.py:102-107）；
+    ``intra_dp_cp``/``intra_dist_opt`` 为根据 encoder 自己的数据并行 rank 和实例数
+    推导出的实例内组；``inter_dist_opt`` 为 encoder 自己的跨实例组，单实例时为 None。
+    intra/inter 这一对只在
+    ``ddp_config.num_distributed_optimizer_instances > 1`` 时才被消费，因此在当前
+    （非分布式优化器）路径下挂了不生效，但能让该变体只改配置、不动进程组。
+    ``embd``/``pos_embd`` 同样取那个单成员 pipeline 组：这两个组的唯一用途是让首尾
+    pipeline stage 上共享的 word/position embedding 保持同步，对"无 PP、无共享 embedding"
+    的组件毫无意义，而"单成员组"正是"没什么要同步"的表达方式——``_allreduce_embedding_grad``
+    按 ``get_pg_size(embd_group) > 1`` 与成员身份放行（finalize_model_grads.py:229-230），
+    单成员 ⇒ 两段都跳过。注意**不能置 ``None``**（虽然 ``get_pg_size(None)`` 返回 1）：
+    ``_allreduce_word_embedding_grads`` 把 ``None`` 当成"没传"，会退回去取**全作业**的
+    embedding 组（finalize_model_grads.py:189-193），PP>1 时它有两个成员，紧接着的
+    ``assert pp_group is None`` 就会炸——因为 encoder collection 确实传了 pipeline 组。
+    沿用 backbone 的 embedding 组错在同一处：首/末 backbone stage 上会走进去、在 ViT
+    chunk 上取 ``pre_process`` 与 ``share_embeddings_and_output_weights``，而
+    ``ColocatedViTEncoder`` 两者都没有。
+    ``mp`` 单独取 encoder 的张量并行组：``mp`` 是优化器做梯度范数 all_reduce 的组
+    （optimizer.py:181-199 → clip_grads.py:133-137），它必须恰好覆盖参数被**切分**
+    的 rank、不能覆盖持有副本的 rank；encoder 在 pipeline 维上是副本，若用作业常规
+    的 tp × pp 组会把同一份范数平方加 P 次、过度裁剪 encoder 梯度。pp 组只有一个
+    成员时，encoder 的 tp × pp 就等于它的张量并行组。
+    ``tp`` 取共置 encoder 张量并行组：成员与作业 tp 组相同（encoder tp 并行度是显式
+    参数且必须等于作业的，见 validate_colocated_args），但是 encoder 自己的通信子，
+    这样 encoder 的通信描述里不再有任何一项指向 backbone 的组。
+
+    Only available when ``initialize_model_parallel(use_colocated_encoder=True)``.
+    仅在 ``initialize_model_parallel(use_colocated_encoder=True)`` 时可用。
+    """
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    pg_collection.dp = get_colocated_data_parallel_group()
+    pg_collection.dp_cp = get_colocated_data_parallel_group()
+    pg_collection.pp = get_colocated_encoder_pipeline_model_parallel_group()
+    pg_collection.cp = get_colocated_encoder_pipeline_model_parallel_group()
+    pg_collection.intra_dp_cp = (
+        get_colocated_encoder_intra_distributed_optimizer_instance_group()
+    )
+    pg_collection.intra_dist_opt = (
+        get_colocated_encoder_intra_distributed_optimizer_instance_group()
+    )
+    pg_collection.inter_dist_opt = (
+        get_colocated_encoder_inter_distributed_optimizer_instance_group(
+            check_initialized=False
+        )
+    )
+    pg_collection.embd = get_colocated_encoder_pipeline_model_parallel_group()
+    pg_collection.pos_embd = get_colocated_encoder_pipeline_model_parallel_group()
+    pg_collection.tp = get_colocated_encoder_tensor_model_parallel_group()
+    pg_collection.mp = get_colocated_encoder_tensor_model_parallel_group()
+    # Task 5.12: the encoder has no MoE experts, so its expert-parallel groups are
+    # single-member (each rank its own), exactly like pp/cp/embd/pos_embd - the
+    # "nothing to shard" expression. They must be the ENCODER's own communicator:
+    # ``_set_random_seed`` computes expert-parallel-rng from ``ep``/``expt_tp`` and
+    # would otherwise fall back to the backbone's EP/ETP groups, tying the encoder's
+    # RNG stream to the backbone topology. A single-member group yields rank 0 on
+    # every rank, so the encoder's expert seed is identical across all replicas.
+    # Task 5.12：encoder 没有 MoE 专家，其专家并行组取单成员（每 rank 各自一个），
+    # 与 pp/cp/embd/pos_embd 同为"无切分"的表达。它们必须是 encoder **自己的**通信子：
+    # ``_set_random_seed`` 用 ``ep``/``expt_tp`` 算 expert-parallel-rng，若不覆盖会回落
+    # 到 backbone 的 EP/ETP 组，把 encoder 的随机流绑到 backbone 拓扑上。单成员组在
+    # 每个 rank 上 rank 都是 0，因此 encoder 的 expert 种子在所有副本间一致。
+    pg_collection.ep = get_colocated_encoder_pipeline_model_parallel_group()
+    pg_collection.expt_tp = get_colocated_encoder_pipeline_model_parallel_group()
+    pg_collection.tp_ep = get_colocated_encoder_pipeline_model_parallel_group()
+    pg_collection.tp_ep_pp = get_colocated_encoder_pipeline_model_parallel_group()
+    return pg_collection
 
 
 def validate_colocated_num_microbatches(num_microbatches):
@@ -1643,20 +2125,30 @@ def validate_colocated_num_microbatches(num_microbatches):
     )
 
 
-def get_microbatches_for_pipeline_stage(pp_stage, num_microbatches):
-    """Return the microbatch indices assigned to a pipeline stage under the
+def get_microbatches_for_producer(producer_id, num_microbatches, num_producers):
+    """Return the microbatch indices assigned to one encoder producer under the
     round-robin colocated encoder schedule.
 
-    With num_microbatches == k * pp_size, stage s computes microbatches
-    s, s + pp_size, s + 2 * pp_size, ... (k of them).
+    With num_microbatches == k * num_producers, producer p computes microbatches
+    p, p + num_producers, p + 2 * num_producers, ... (k of them). The producer id is a
+    slot index inside the boundary group (the group's own rank), not a global rank, so
+    the mapping is independent of the job's rank order (Task 5.7).
 
-    返回轮盘式共置 encoder 调度下，指定 pipeline stage 负责的 microbatch 索引：
-    num_microbatches == k * pp_size 时，stage s 计算 microbatch
-    s, s + pp_size, s + 2 * pp_size, ...（共 k 个）。
+    返回轮盘式共置 encoder 调度下，指定 encoder producer 负责的 microbatch 索引：
+    num_microbatches == k * num_producers 时，producer p 计算 microbatch
+    p, p + num_producers, p + 2 * num_producers, ...（共 k 个）。producer 编号是边界组
+    内的槽位（组内 rank）而非全局 rank，因此该映射与作业的 rank order 无关（Task 5.7）。
     """
-    validate_colocated_num_microbatches(num_microbatches)
-    pp_size = get_pipeline_model_parallel_world_size()
-    return list(range(pp_stage, num_microbatches, pp_size))
+    assert num_producers > 0, f"num_producers must be positive, got {num_producers}"
+    assert 0 <= producer_id < num_producers, (
+        f"producer_id ({producer_id}) must be in [0, num_producers ({num_producers}))"
+    )
+    assert num_microbatches > 0, f"num_microbatches must be positive, got {num_microbatches}"
+    assert num_microbatches % num_producers == 0, (
+        f"num_microbatches ({num_microbatches}) must be a multiple of the number of encoder "
+        f"producers ({num_producers}) for round-robin colocated encoder scheduling"
+    )
+    return list(range(producer_id, num_microbatches, num_producers))
 
 
 def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
@@ -2305,13 +2797,41 @@ def destroy_model_parallel():
     global _ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS
     _ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS = None
 
+    global _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+    _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+
+    global _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS
+    _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS = None
+
+    global _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+    _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+
+    global _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS
+    _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS = None
+
     global _COLOCATED_BOUNDARY_GROUP
     _COLOCATED_BOUNDARY_GROUP = None
 
     global _COLOCATED_BOUNDARY_GLOBAL_RANKS
     _COLOCATED_BOUNDARY_GLOBAL_RANKS = None
 
+    global _COLOCATED_DATA_PARALLEL_GROUP
+    _COLOCATED_DATA_PARALLEL_GROUP = None
+
+    global _COLOCATED_DATA_PARALLEL_GLOBAL_RANKS
+    _COLOCATED_DATA_PARALLEL_GLOBAL_RANKS = None
+
+    global _COLOCATED_ENCODER_PIPELINE_MODEL_PARALLEL_GROUP
+    _COLOCATED_ENCODER_PIPELINE_MODEL_PARALLEL_GROUP = None
+
+    global _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GROUP
+    _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GROUP = None
+
+    global _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+    _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
+
     global _DATA_PARALLEL_GROUP_WITH_CP
+
     _DATA_PARALLEL_GROUP_WITH_CP = None
 
     global _CONTEXT_PARALLEL_GROUP

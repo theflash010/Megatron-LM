@@ -25,20 +25,39 @@ forward 的分支函数、loss。schedule（``colocated_schedule.py``）只做 o
 
 from functools import partial
 
+import os
+import sys
+
 import torch
 
+# 与 ``train.py`` 同款：把仓库根目录加入 sys.path，使以脚本方式启动时也能 import megatron。
+# Same as train.py: make the repository root importable when launched as a script.
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+)
+
 from megatron.core import tensor_parallel
+from megatron.core.enums import ModelType
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.colocated_llava_model import (
     ColocatedGPTBackbone,
     ColocatedViTEncoder,
 )
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX
-from megatron.core.parallel_state import get_tensor_model_parallel_rank
+from megatron.core.parallel_state import get_colocated_encoder_tensor_model_parallel_group
 from megatron.core.pipeline_parallel.colocated_encoder_comm import ForwardPacket
 from megatron.core.pipeline_parallel.colocated_schedule import IntraPacket
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
-from megatron.training import get_args, get_tokenizer
+from megatron.core.transformer.module import Float16Module
+from megatron.core.utils import (
+    get_attr_wrapped_model,
+    get_pg_rank,
+    nvtx_range_pop,
+    nvtx_range_push,
+    unwrap_model,
+)
+from megatron.training import get_args, get_tokenizer, pretrain
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import parse_and_validate_args
 
 
 def colocated_encoder_get_batch(data_iterator, image_token_index, img_seq_len):
@@ -63,18 +82,31 @@ def colocated_encoder_get_batch(data_iterator, image_token_index, img_seq_len):
 
     args = get_args()
 
-    # Broadcast data.
+    # Broadcast data on the ENCODER's own tensor model parallel group: this is the encoder
+    # producer's data path, so every rank / group reference here must be the encoder's.
+    # 取数与广播都走 **encoder 自己的**张量并行组：这是 encoder producer 的数据通路，取数
+    # rank 的判断与广播的源 rank 必须同属这一个组（``is_colocated_dataloader_rank`` 用的也是
+    # 它），否则建了 dataloader 的 rank 与广播源不是同一个 rank，广播会挂死。
     nvtx_range_push("get_data")
-    if data_iterator is not None and get_tensor_model_parallel_rank() == 0:  # TP rank 0 取数
+    encoder_tensor_group = get_colocated_encoder_tensor_model_parallel_group()
+    if data_iterator is not None and get_pg_rank(encoder_tensor_group) == 0:  # encoder TP rank 0 取数
         data = next(data_iterator)
     else:
         data = None
 
-    data_text = tensor_parallel.broadcast_data(["tokens"], data, torch.int64)["tokens"]
-    labels = tensor_parallel.broadcast_data(["labels"], data, torch.int64)["labels"]
+    data_text = tensor_parallel.broadcast_data(
+        ["tokens"], data, torch.int64, tp_group=encoder_tensor_group
+    )["tokens"]
+    labels = tensor_parallel.broadcast_data(
+        ["labels"], data, torch.int64, tp_group=encoder_tensor_group
+    )["labels"]
 
-    imgs = tensor_parallel.broadcast_data(["imgs"], data, torch.float32)["imgs"]
-    num_tiles = tensor_parallel.broadcast_data(["num_tiles"], data, torch.int32)["num_tiles"]
+    imgs = tensor_parallel.broadcast_data(
+        ["imgs"], data, torch.float32, tp_group=encoder_tensor_group
+    )["imgs"]
+    num_tiles = tensor_parallel.broadcast_data(
+        ["num_tiles"], data, torch.int32, tp_group=encoder_tensor_group
+    )["num_tiles"]
 
     # No image input (text-only sample) if the dataloader returned a size 1 image.
     if imgs.shape == torch.Size([1, 1]):
@@ -185,6 +217,22 @@ def colocated_backbone_get_batch(packet, pad_token):
     )
 
 
+def _half_precision_forward_kwargs(chunk):
+    """Return ``{"fp32_output": False}`` when the chunk is wrapped in ``Float16Module``.
+
+    共置 encoder 的 pipeline 组只有一个成员 ⇒ ``Float16Module.forward`` 里
+    ``is_pp_first_stage`` 与 ``is_pp_last_stage`` **同时**为真（module.py:491-499）：入参被
+    转成 bf16（需要），出参又被升回 fp32（不能要）。encoder 的输出要经边界通信发出，
+    communicator 的 dtype 是 ``config.pipeline_dtype``（bf16），升回 fp32 会让接收端按
+    错误的元素宽度解析扁平缓冲区——这正是 4.x 那条 dtype 断言拦住的情况。
+    ``fp32_output=False`` 是上游为此留的开关（module.py:470-473）。
+    没有这层包装时（单测里的裸模块）不能传这个关键字，模块 forward 不认识它。
+    """
+    if isinstance(chunk, Float16Module) or isinstance(getattr(chunk, "module", None), Float16Module):
+        return {"fp32_output": False}
+    return {}
+
+
 def _encoder_forward(data_iterator, encoder_chunk):
     """Phase ①: fetch data and run the encoder-only forward -> ForwardPacket.
 
@@ -201,7 +249,9 @@ def _encoder_forward(data_iterator, encoder_chunk):
     tokens, labels, images, num_tiles = colocated_encoder_get_batch(
         data_iterator, image_token_index, img_seq_len
     )
-    image_embeddings = encoder_chunk(images)  # [img_seq_len, num_tiles, h_lang]，保留 grad_fn
+    image_embeddings = encoder_chunk(
+        images, **_half_precision_forward_kwargs(encoder_chunk)
+    )  # [img_seq_len, num_tiles, h_lang]，保留 grad_fn
     packet = ForwardPacket(
         image_embeddings=image_embeddings,
         tokens=tokens,
@@ -226,7 +276,10 @@ def _backbone_forward(data_iterator, backbone_chunk, packet=None, intra_packet=N
     labels/loss_mask 由 schedule 经 ``intra_packet`` 闭包绑定传入（last stage 算
     loss）。模型不再持有交接状态。
     """
-    if backbone_chunk.pre_process:
+    # ``pre_process`` 在被包装的模块上，训练时 chunk 是 DDP(Float16Module(...))，
+    # 直接取属性会落在包装类上而取不到。
+    # pre_process lives on the wrapped module, not on the DDP / Float16Module wrapper.
+    if get_attr_wrapped_model(backbone_chunk, "pre_process"):
         # Consumer (stage 0): assemble the schedule-provided packet and run the backbone.
         # consumer：使用 schedule 传入的包（ForwardPacket，partial 绑定），组装后跑 backbone。
         assert packet is not None, (
@@ -304,12 +357,61 @@ def colocated_forward_step(data_iterator, model, packet=None, intra_packet=None)
     consumer 用它做输入载体（schedule 伴随 recv 的 labels/loss_mask，last stage 算
     loss）。默认 None 保持契约兼容。
     """
+    # 分派看**解包后**的类型，前传仍走最外层包装：训练时 chunk 是
+    # ``DDP(Float16Module(module))``，Float16Module 负责输入/输出的 bf16 转换，绕过它会让
+    # encoder 吃 fp32 图像、与 checkpoint 的精度口径不符。
+    # Dispatch on the unwrapped type but keep calling the outermost wrapper: the training
+    # chunk is DDP(Float16Module(module)) and the half-precision cast lives in the wrapper.
     chunk = model[0] if isinstance(model, (list, tuple)) else model
-    if isinstance(chunk, ColocatedViTEncoder):
+    inner_chunk = unwrap_model(chunk)
+    if isinstance(inner_chunk, ColocatedViTEncoder):
         return _encoder_forward(data_iterator, chunk)
-    if isinstance(chunk, ColocatedGPTBackbone):
+    if isinstance(inner_chunk, ColocatedGPTBackbone):
         return _backbone_forward(data_iterator, chunk, packet=packet, intra_packet=intra_packet)
     raise TypeError(
         f"colocated_forward_step expects the chunk to be ColocatedViTEncoder or "
-        f"ColocatedGPTBackbone, got {type(chunk)}"
+        f"ColocatedGPTBackbone, got {type(inner_chunk)}"
+    )
+
+
+if __name__ == "__main__":
+    # 入口与 ``train.py`` 同构，三处替换：dataloader provider 换成共置版（分片域=全 W、
+    # 每个 rank 都取数）、forward_step_func 换成 ``colocated_forward_step``、去掉评估相关
+    # 的回调（共置不支持评估，arguments.py 的共置校验块已断言 --eval-iters 0）。
+    # 模型侧不需要替换：``model_provider`` 自己按 ``colocated_module`` 分派，共置与否由
+    # ``--use-colocated-encoder`` 在 setup_model_and_optimizer 里决定
+    # （``mpu.is_colocated_encoder_enabled()`` -> ``get_colocated_model``）。
+    # The entry mirrors train.py with three substitutions: the colocated dataloader provider,
+    # colocated_forward_step, and no evaluation callbacks. The model provider is unchanged - it
+    # dispatches on colocated_module, and the colocated path is selected inside
+    # setup_model_and_optimizer.
+    # 延迟到入口再 import：这几个模块（Energon 数据、examples 侧 model/args、train.py 的
+    # embedding rank 辅助函数）只有真正启动训练时才需要，import 它们的代价与副作用不该落在
+    # "被 schedule 复用的实现层"上。
+    # Imported here rather than at module scope: these are entry-only dependencies.
+    from colocated_args import add_colocated_extra_args, validate_colocated_args
+    from colocated_dataloader_provider import colocated_train_valid_test_dataloaders_provider
+    from model import model_provider
+    from train import llava_embedding_ranks, llava_position_embedding_ranks
+
+    colocated_train_valid_test_dataloaders_provider.is_distributed = True
+
+    args = parse_and_validate_args(
+        extra_args_provider=add_colocated_extra_args,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    )
+    # encoder 的并行度参数由共置侧自己补默认值与校验：core 的 validate_args 不认识这几个字段。
+    # The colocated encoder parallel sizes are defaulted and checked here - core's validate_args
+    # does not know these fields.
+    validate_colocated_args(args)
+    full_config = pretrain_cfg_container_from_args(args)
+
+    pretrain(
+        full_config,
+        colocated_train_valid_test_dataloaders_provider,
+        model_provider,
+        ModelType.encoder_or_decoder,
+        colocated_forward_step,
+        get_embedding_ranks=llava_embedding_ranks,
+        get_position_embedding_ranks=llava_position_embedding_ranks,
     )

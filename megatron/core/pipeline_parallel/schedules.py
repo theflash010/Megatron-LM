@@ -49,6 +49,10 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state. #根据 PP 大小返回不同的PP调度函数
 
+    Returns ``forward_backward_colocated`` when colocated encoder training is enabled
+    (``parallel_state.is_colocated_encoder_enabled()``), regardless of pp/vp size.
+    共置 encoder 训练启用时直接返回 ``forward_backward_colocated``（不看 pp/vp 大小）。
+
     Returns a function that will perform all of the forward and
     backward passes of the model given the pipeline model parallel
     world size and virtual pipeline model parallel world size in the
@@ -143,6 +147,24 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
     if pp_size is None and vp_size is None:
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+    # Task 4.7：共置分支必须排在 pp/vp 判断**之前**——共置布局下 pp_size 恒 > 1，交给标准
+    # 1F1B 就会绕过 encoder 轮盘前传（phase ①）、边界收发（phase ②）与统一 encoder 反传
+    # （phase ④）。判据取 parallel_state（由 initialize_model_parallel(use_colocated_encoder
+    # =True) 建组时落地），megatron.core 不读 megatron.training 的 args。
+    # Task 4.7: the colocated branch must precede the pp/vp dispatch — pp_size is always > 1
+    # under the colocated layout, and the standard 1F1B loop knows nothing about the encoder
+    # forward, the boundary transfers or the unified encoder backward.
+    if parallel_state.is_colocated_encoder_enabled():
+        # 函数内延迟 import：colocated_schedule 反过来要用本模块的 forward_step /
+        # backward_step，模块级 import 会成循环依赖（4.3a 记录）。
+        # Import here rather than at module level: colocated_schedule imports forward_step /
+        # backward_step from this module, so a top-level import would be circular.
+        from megatron.core.pipeline_parallel.colocated_schedule import (
+            forward_backward_colocated,
+        )
+
+        return forward_backward_colocated
 
     if pp_size > 1:
         if vp_size is not None:

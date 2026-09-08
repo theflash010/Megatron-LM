@@ -21,7 +21,7 @@ from megatron.core.utils import log_single_rank
 
 def model_provider(
     pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True,
-    vp_stage=None, config=None, pg_collection=None
+    vp_stage=None, config=None, pg_collection=None, colocated_module=None
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -36,6 +36,11 @@ def model_provider(
         vp_stage: Optional virtual pipeline stage. Used with virtual pipeline parallelism.
         config: Optional transformer config. If None, will be created from args.
         pg_collection: Optional process group collection. If None, will use default.
+        colocated_module (str): Which component to build under colocated encoder
+            training, "encoder" or "language_model". get_model is called once per
+            component so that every call sees a single consistent topology.
+            共置 encoder 训练下要构建的组件（"encoder" 或 "language_model"）。
+            get_model 按组件各调一次，使每次调用只面对一份自洽的拓扑。
 
     Returns:
         model: A multimodal model.
@@ -89,7 +94,7 @@ def model_provider(
     base_config.calculate_per_token_loss = True
 
     language_config = deepcopy(base_config)
-    language_config = get_language_model_config(language_config) #根据language_model_type，参数设置与语言模型结构对齐
+    language_config = get_language_model_config(language_config) #根据language_model_type，参数设置与语言模型结构对齐。同时包括language模型的并行配置
 
     if language_model_type.startswith("hf://"):
         assert args.tensor_model_parallel_size == 1, "Huggingface models do not support --tensor-model-parallel-size > 1"
@@ -116,7 +121,7 @@ def model_provider(
     vision_config = deepcopy(base_config)
     vision_config = get_vision_model_config(
         vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling
-    ) #按照vision_model_type，参数设置与视觉模型结构对齐
+    ) #按照vision_model_type，参数设置与视觉模型结构对齐。同时包括language模型的并行配置
     if vision_model_type.startswith("hf://"):
         assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
         assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
@@ -163,7 +168,7 @@ def model_provider(
     # Make sure the vision model does not inherit first and last pipeline num layers from the language model.
     vision_config.first_pipeline_num_layers = vision_config.last_pipeline_num_layers = None
 
-    if vision_projection_config.normalization:
+    if vision_projection_config.normalization: #在上面的encoder的TP/PP并行配置修改完之后才进行layer_spec的构建
         vision_projection_layer_spec = get_norm_mlp_module_spec_te().submodules #有normalize
     else:
         vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules #无normalizee，取视觉投影层的spec，但是好奇怪，竟然是submodules
@@ -197,6 +202,10 @@ def model_provider(
     tile_tags = _get_tile_tags(args, tokenizer) #没有使用tile tags
 
     if args.use_colocated_encoder:
+        assert colocated_module in ("encoder", "language_model"), (
+            "Colocated encoder training builds one component per model_provider call; "
+            f"colocated_module must be 'encoder' or 'language_model', got {colocated_module}"
+        )
         # 4.3k/4.4（2026-08-22 设计定案，方案 B）：colocated 场景跳过
         # p2p_communication._communicate 里的设备级 torch.cuda.synchronize()
         # （batch_p2p_sync）——它是旧版 PyTorch batch_isend_irecv 竞态的防御
@@ -211,25 +220,51 @@ def model_provider(
         # P2P completion is still guaranteed by the batch-level req.wait() inside
         # _communicate (stream-scoped). Only affects this backbone config's P2P.
         language_config.batch_p2p_sync = False
-        # Colocated training: every rank builds the full encoder chunk and its
-        # 1/P backbone chunk. Both are always constructed regardless of
-        # add_encoder/add_decoder, because the encoder is replicated on all ranks
-        # and the backbone is pipeline-parallel split across all ranks.
-        # 共置训练：每个 rank 都构建完整 encoder chunk 与 1/P 的 backbone chunk。
-        # 恒构建两者（encoder 在所有 rank 上复制、backbone 在所有 rank 上做 PP 切分），
-        # 忽略 add_encoder/add_decoder 参数。
-        encoder_model = ColocatedViTEncoder(
-            vision_transformer_config=vision_config,
-            vision_transformer_layer_spec=vision_transformer_layer_spec,
-            drop_vision_class_token=args.disable_vision_class_token,
-            vision_projection_config=vision_projection_config,
-            vision_projection_layer_spec=vision_projection_layer_spec,
-            vision_projection_type="mlp",
-            img_h=args.img_h,
-            img_w=args.img_w,
-            patch_dim=args.patch_dim,
-            pixel_shuffle=args.pixel_shuffle,
-        )
+        # Colocated training: every rank builds the full encoder replica and its
+        # 1/P backbone shard, so both components are always built regardless of
+        # add_encoder/add_decoder - but each call builds only the requested one.
+        # 共置训练：每个 rank 都持有完整 encoder 副本与 1/P 的 backbone 分片，故忽略
+        # add_encoder/add_decoder 两个参数；但每次调用只构建被请求的那一个组件。
+        if colocated_module == "encoder":
+            # The encoder replica is not pipeline-parallel, so pre_process /
+            # post_process (both True here, its pipeline group has one member)
+            # carry no information for it.
+            # encoder 副本不做 PP，因此 pre_process / post_process（此处都为 True，
+            # 它的 pipeline 组只有一个成员）对它没有意义。
+            encoder_model = ColocatedViTEncoder(
+                vision_transformer_config=vision_config,
+                vision_transformer_layer_spec=vision_transformer_layer_spec,
+                drop_vision_class_token=args.disable_vision_class_token,
+                vision_projection_config=vision_projection_config,
+                vision_projection_layer_spec=vision_projection_layer_spec,
+                vision_projection_type="mlp",
+                # Pretrained CLIP weights carry no vision projection (LLaVA trains it
+                # from scratch in its first stage), so this flag must reach this chunk
+                # too - under colocated training it is the chunk that owns
+                # vision_projection.
+                # 预训练 CLIP 权重里没有 vision projection（LLaVA 第一阶段才从头训它），
+                # 因此这个开关必须传到本 chunk——共置下 vision_projection 属于它。
+                allow_missing_vision_projection_checkpoint=(
+                    args.allow_missing_vision_projection_checkpoint
+                ),
+                img_h=args.img_h,
+                img_w=args.img_w,
+                patch_dim=args.patch_dim,
+                pixel_shuffle=args.pixel_shuffle,
+                # The component's own process groups: the ViT blocks read pp/tp
+                # off this collection (transformer_block.py:280-282, :334), so
+                # without it they would judge against the backbone's groups.
+                # 本组件自己的进程组：ViT block 会从这份集合读 pp/tp
+                # （transformer_block.py:280-282、:334），不传就会拿 backbone 的组做判断。
+                pg_collection=pg_collection,
+            )
+            # Freeze the requested sub-model (simple traversal over chunk params).
+            # 按需冻结子模型（简单遍历 chunk 参数）。
+            if args.freeze_ViT:
+                for param in encoder_model.parameters():
+                    param.requires_grad = False
+            return encoder_model
+
         backbone_model = ColocatedGPTBackbone(
             language_transformer_config=language_config,
             language_transformer_layer_spec=language_transformer_layer_spec,
@@ -248,18 +283,23 @@ def model_provider(
             img_seq_len=num_image_embeddings,
             tile_tags=tile_tags,
             tokenizer_type=args.tokenizer_prompt_format,
+            # Same as the encoder above. Today this collection is exactly what the
+            # fallback would produce (the job's regular mpu groups), but passing it
+            # keeps the topology explicit and gives 8.x a single place to change.
+            # 与上面 encoder 同理。当前这份集合与兜底分支产出的完全相同（作业常规 mpu
+            # 组），显式传入是为了让拓扑来源唯一，后续 8.x 只需改一处。
+            pg_collection=pg_collection,
+            # get_model passes vp_stage only on its virtual-pipeline path; the
+            # backbone is the component that can take that path, so forward it.
+            # get_model 只在虚拟流水线路径上传 vp_stage，而 backbone 正是可能走那条
+            # 路径的组件，因此原样转发。
+            vp_stage=vp_stage,
         )
-
-        # Freeze the requested sub-models (simple traversal over chunk params).
-        # 按需冻结子模型（简单遍历 chunk 参数）。
-        if args.freeze_ViT:
-            for param in encoder_model.parameters():
-                param.requires_grad = False
         if args.freeze_LM:
             for param in backbone_model.parameters():
                 param.requires_grad = False
 
-        return [encoder_model, backbone_model]
+        return backbone_model
 
     model = LLaVAModel(#构建llava模型，占用空间
         language_transformer_config=language_config,

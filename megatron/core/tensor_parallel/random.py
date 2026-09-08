@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import logging
 from collections.abc import Callable
 from typing import Any, Optional, TypeVar, Union
@@ -353,6 +354,12 @@ def initialize_rng_tracker(
     if force_reset:
         _CUDA_RNG_STATE_TRACKER = None
         _CUDA_RNG_STATE_TRACKER_INITIALIZED = False
+        # Task 5.12: the colocated encoder snapshot is a copy OF this tracker, so a
+        # forced reset invalidates it too - keeping it would hand out states seeded for
+        # a torn-down parallel configuration.
+        # Task 5.12：共置 encoder 的快照是**这个** tracker 的拷贝，强制重置一并让它失效——
+        # 留着会交出按已销毁的并行配置播下的状态。
+        _reset_colocated_encoder_rng_tracker()
 
     if _CUDA_RNG_STATE_TRACKER_INITIALIZED:
         return
@@ -456,6 +463,11 @@ def model_parallel_cuda_manual_seed(
     expert-parallel-seed: This state is only used for the expert layer of MoE models.
     It is different among expert-tensor and expert-model parallel GPUs, and the same
     across expert-data parallel groups.
+
+    ``tp_rank`` / ``ep_rank`` / ``etp_rank`` default to the job-wide (mpu) coordinates.
+    They are explicit arguments for colocated encoder training, where the encoder is
+    seeded under ITS OWN topology - see ``_set_random_seed`` (initialize.py) and
+    ``snapshot_colocated_encoder_rng_tracker`` below.
     """
     if tp_rank is None:
         tp_rank = get_tensor_model_parallel_rank()
@@ -482,6 +494,127 @@ def model_parallel_cuda_manual_seed(
 
     expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
     _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
+
+
+# Task 5.12: the colocated encoder's OWN RNG tracker, plus the global CUDA RNG state
+# that goes with it. The encoder and the backbone have different topologies, so their
+# named states ("model-parallel-rng" above all) must be seeded from different
+# coordinates - but the names are fixed, so one shared tracker cannot hold both: the
+# component seeded LAST (the backbone) wins, because model_parallel_cuda_manual_seed
+# resets the tracker on every call. Isolation therefore has to happen at the tracker
+# level, not at the named-state level: the encoder's tracker is frozen right after the
+# encoder is built and swapped in for the duration of the encoder forward.
+# Task 5.12：共置 encoder 自己的 RNG tracker，以及与之配套的全局 CUDA RNG 状态。
+# encoder 与 backbone 拓扑不同，命名状态（尤其 "model-parallel-rng"）必须按不同坐标
+# 播种；但名字是固定的，一个共享 tracker 容不下两份——`model_parallel_cuda_manual_seed`
+# 每次调用都 reset tracker，因此**最后**播种的那个组件（backbone）胜出。所以隔离必须做在
+# **tracker 层面**而非命名状态层面：encoder 构建完立刻冻结它的 tracker，在 encoder 前传
+# 期间整体换入。
+_COLOCATED_ENCODER_CUDA_RNG_STATE_TRACKER = None
+_COLOCATED_ENCODER_GLOBAL_CUDA_RNG_STATE = None
+
+
+def _reset_colocated_encoder_rng_tracker():
+    """Drop the colocated encoder snapshot (see ``initialize_rng_tracker(force_reset)``).
+
+    丢弃共置 encoder 的快照（见 ``initialize_rng_tracker(force_reset)``）。
+    """
+    global _COLOCATED_ENCODER_CUDA_RNG_STATE_TRACKER
+    global _COLOCATED_ENCODER_GLOBAL_CUDA_RNG_STATE
+    _COLOCATED_ENCODER_CUDA_RNG_STATE_TRACKER = None
+    _COLOCATED_ENCODER_GLOBAL_CUDA_RNG_STATE = None
+
+
+def snapshot_colocated_encoder_rng_tracker():
+    """Freeze the current RNG tracker as the colocated encoder's own tracker.
+
+    Must be called right after the encoder component is built and BEFORE the backbone's
+    ``_set_random_seed`` call, which resets the tracker and re-seeds every named state
+    from the backbone's coordinates. The snapshot captures all named states at once
+    (data-parallel-rng / model-parallel-rng / expert-parallel-rng), so no random point
+    inside the encoder needs to know a special state name - the default-name forks
+    (e.g. attention dropout, dot_product_attention.py:217) resolve to the encoder's
+    version automatically once the tracker is swapped in.
+    The global CUDA RNG state is captured too, because the fused hidden dropout
+    (fused_bias_dropout.py:47) draws from it WITHOUT forking the tracker.
+
+    必须在 encoder 组件构建完、backbone 的 ``_set_random_seed`` 之前调用——后者会 reset
+    tracker 并按 backbone 坐标重播所有命名状态。快照一次性抓住全部命名状态
+    （data-parallel-rng / model-parallel-rng / expert-parallel-rng），因此 encoder 内部
+    任何随机点都不需要知道某个特殊状态名：换入 tracker 后，那些用默认名 fork 的地方
+    （如 attention dropout，dot_product_attention.py:217）自动解析到 encoder 的那份。
+    全局 CUDA RNG 状态也一并抓住，因为融合的 hidden dropout（fused_bias_dropout.py:47）
+    直接吃全局流、不经过 tracker。
+    """
+    global _COLOCATED_ENCODER_CUDA_RNG_STATE_TRACKER
+    global _COLOCATED_ENCODER_GLOBAL_CUDA_RNG_STATE
+
+    tracker = get_cuda_rng_tracker()
+    # A deep copy is required: ``reset()`` replaces ``states_`` wholesale, so sharing
+    # the dict would let the backbone's reset empty the encoder's snapshot as well.
+    # The copy is only sound for the Megatron tracker holding tensor states - TE keeps
+    # its states in its own global registry (so swapping this pointer would not isolate
+    # anything) and the cudagraphable variant holds torch.Generator objects (which do
+    # not deep-copy).
+    # 必须深拷贝：``reset()`` 是整体替换 ``states_``，共享同一个 dict 会让 backbone 的
+    # reset 连 encoder 快照一起清空。该拷贝仅对持有 tensor 状态的 Megatron tracker 成立
+    # ——TE 把状态放在它自己的全局注册表里（换我们这个指针隔离不了任何东西），而
+    # cudagraphable 变体持有 torch.Generator（无法深拷贝）。
+    assert isinstance(tracker, CudaRNGStatesTracker), (
+        "colocated encoder RNG isolation requires the Megatron RNG tracker; "
+        f"got {type(tracker).__name__} (do not pass --te-rng-tracker)"
+    )
+    assert not tracker.use_cudagraphable_rng, (
+        "colocated encoder RNG isolation requires --cuda-graph-impl none, because a "
+        "cudagraphable tracker holds torch.Generator states that cannot be deep-copied"
+    )
+    _COLOCATED_ENCODER_CUDA_RNG_STATE_TRACKER = copy.deepcopy(tracker)
+    _COLOCATED_ENCODER_GLOBAL_CUDA_RNG_STATE = _get_cuda_rng_state(clone=True)
+
+
+@contextlib.contextmanager
+def colocated_encoder_rng_tracker():
+    """Run a block with the colocated encoder's RNG tracker installed globally.
+
+    Every random point resolves its tracker through ``get_cuda_rng_tracker()``, which
+    reads this module's global on each call, so rebinding that global redirects the
+    whole encoder forward - including the forks that use the DEFAULT state name and
+    would otherwise hit the backbone's "model-parallel-rng". ``initialize_rng_tracker``
+    cannot undo the swap because it returns early once the tracker is initialized.
+
+    On exit the advanced states are kept on the encoder side (the tracker object is
+    mutated in place by ``fork``, and the global CUDA RNG state is written back
+    explicitly) so the encoder's streams keep advancing across training steps instead
+    of restarting from the snapshot at every step. The caller's tracker and global CUDA
+    RNG state are restored exactly.
+
+    在这个上下文内，全局 RNG tracker 是共置 encoder 自己的那份。所有随机点都通过
+    ``get_cuda_rng_tracker()`` 取 tracker，而它每次调用都现读本模块的全局变量，因此重新
+    绑定这个全局变量就能重定向整段 encoder 前传——**包括那些用默认状态名 fork、否则会命中
+    backbone 的 "model-parallel-rng" 的地方**。``initialize_rng_tracker`` 不会把替换冲掉：
+    tracker 已初始化时它直接返回。
+
+    退出时把推进后的状态留在 encoder 一侧（tracker 对象由 ``fork`` 原地更新，全局 CUDA RNG
+    状态显式写回），这样 encoder 的随机流跨 step 持续前进，而不是每步都从快照重新开始；
+    调用方的 tracker 与全局 CUDA RNG 状态被精确还原。
+    """
+    global _CUDA_RNG_STATE_TRACKER
+    global _COLOCATED_ENCODER_GLOBAL_CUDA_RNG_STATE
+
+    assert _COLOCATED_ENCODER_CUDA_RNG_STATE_TRACKER is not None, (
+        "the colocated encoder RNG tracker has not been snapshotted; "
+        "snapshot_colocated_encoder_rng_tracker must run right after the encoder is built"
+    )
+    caller_tracker = _CUDA_RNG_STATE_TRACKER
+    caller_cuda_rng_state = _get_cuda_rng_state(clone=True)
+    _CUDA_RNG_STATE_TRACKER = _COLOCATED_ENCODER_CUDA_RNG_STATE_TRACKER
+    _set_cuda_rng_state(_COLOCATED_ENCODER_GLOBAL_CUDA_RNG_STATE)
+    try:
+        yield
+    finally:
+        _COLOCATED_ENCODER_GLOBAL_CUDA_RNG_STATE = _get_cuda_rng_state(clone=True)
+        _set_cuda_rng_state(caller_cuda_rng_state)
+        _CUDA_RNG_STATE_TRACKER = caller_tracker
 
 
 def is_graph_safe_cuda_rng_tracker(cuda_rng_tracker):

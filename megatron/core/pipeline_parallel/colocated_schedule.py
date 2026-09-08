@@ -46,15 +46,24 @@ from megatron.core.pipeline_parallel.schedules import (
     backward_step,
     check_first_val_step,
     clear_embedding_activation_buffer,
+    custom_backward,
     deallocate_output_tensor,
     finish_embedding_wgrad_compute,
     forward_step,
     get_tensor_shapes,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import colocated_encoder_rng_tracker
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.utils import get_model_config
+from megatron.core.utils import (
+    get_attr_wrapped_model,
+    get_model_config,
+    group_colocated_model_chunks,
+    nvtx_decorator,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 
 @dataclass
@@ -84,6 +93,16 @@ class IntraPacket:
     loss_mask: Optional[torch.Tensor] = None
 
 
+# NVTX（nsys 时间线用）：共置 schedule 的三大相位各打一个区间——encoder 前传/反传是
+# 共置独有的计算块，backbone 1F1B 内部再分 colocated-warmup/steady/cooldown。区间名统一
+# 加 colocated- 前缀，与标准 schedules.py 的同名区间（"warmup"/"steady"/"cooldown"，
+# schedules.py:1449-2020）区分开。_nvtx_enabled 门控（--nvtx-ranges 才打开）保证关闭时
+# 只有函数调用开销。
+# NVTX (for the nsys timeline): one range per colocated phase. The encoder forward /
+# backward are colocated-only compute blocks; the backbone 1F1B loop is further split
+# into colocated-warmup/steady/cooldown. The colocated- prefix distinguishes them from
+# the standard schedules.py ranges of the same name.
+@nvtx_decorator(message="colocated-iteration")
 def forward_backward_colocated(
     *,
     forward_step_func,
@@ -125,11 +144,23 @@ def forward_backward_colocated(
     → **phase ④（统一 encoder 反传，4.6e）**——三段都是本函数编排的**分段解耦子过程**，
     phase ② 只负责 backbone 流水本身，不承担全流程收尾。
     """
-    assert isinstance(model, (list, tuple)) and len(model) == 2, (
-        "colocated schedule needs model = [encoder_chunk, backbone_chunk], "
-        f"got {type(model)} of len {len(model)}"
+    # 按 chunk 自身声明的 ``colocated_module_name`` 取出两个组件，而不是按下标拆
+    # （与训练入口构建 model 列表、串接优化器时用的是同一个函数，core/utils.py）。
+    # 每个组件恰好一个 chunk 是当前最小实现的前提：encoder 的 pipeline 组是单成员组、
+    # 不进 VPP 分支；backbone 的 VPP 属于 Task 8 范围，届时这里改为遍历 chunk 列表。
+    # Split by each chunk's own colocated_module_name rather than by position, reusing the
+    # same helper the training entry uses to build the model list and chain the optimizers.
+    # Exactly one chunk per component is the current minimal implementation's premise.
+    chunks_per_module = group_colocated_model_chunks(model)
+    encoder_chunks = chunks_per_module["encoder"]
+    backbone_chunks = chunks_per_module["language_model"]
+    assert len(encoder_chunks) == 1 and len(backbone_chunks) == 1, (
+        "colocated schedule needs exactly one chunk per component, got "
+        f"{len(encoder_chunks)} encoder and {len(backbone_chunks)} language_model chunks "
+        f"out of {len(model)} model chunks"
     )
-    encoder_chunk, backbone_chunk = model
+    encoder_chunk = encoder_chunks[0]
+    backbone_chunk = backbone_chunks[0]
     config = get_model_config(backbone_chunk)  # backbone config（dtype 等）
 
     # num_microbatches 必须是 pipeline_parallel_size 的整数倍（轮盘要求：每 producer
@@ -154,10 +185,19 @@ def forward_backward_colocated(
 
     # Phase ①：encoder 轮盘前传 -> 本地 buffer。schedule 只调注入的 forward_step_func
     # 的 encoder 分支拿包并存储，数据/模型细节全在 colocated_forward_step 内部。
-    # Phase ①: encoder round-robin forward -> local buffer. The schedule only calls
-    # the forward step's encoder branch and stores the returned packet.
+    # producer 槽位取自边界组内的编号（``comm.producer_id``）而不是 pipeline rank：
+    # 包的收发路由用的就是这个编号，槽位与路由必须同源，否则一旦 rank order 变化、
+    # 两者不再重合，microbatch 归属与发包目标就会错配（Task 5.7）。
+    # Phase ①: encoder round-robin forward -> local buffer. The producer slot comes from
+    # the boundary group's own rank (``comm.producer_id``), the very id used to route the
+    # packets, instead of the pipeline rank — slot and routing must share one source.
     encoder_buffers = _colocated_encoder_forward(
-        forward_step_func, data_iterator, encoder_chunk, num_microbatches
+        forward_step_func,
+        data_iterator,
+        encoder_chunk,
+        num_microbatches,
+        producer_id=comm.producer_id,
+        num_producers=comm.group_size,
     )
     # Phase ②：backbone 1F1B schedule（Task 4.3c，2026-08-13 用户确认统一走自写循环）。
     # 自写循环天然覆盖 PP=1：P=1 时 producer 恒 0、is_consumer=True、全部本地 take、
@@ -207,16 +247,21 @@ def forward_backward_colocated(
     return forward_data_store
 
 
+@nvtx_decorator(message="colocated-encoder-forward")
 def _colocated_encoder_forward(
     forward_step_func,
     data_iterator,
     encoder_chunk,
     num_microbatches: int,
+    producer_id: int,
+    num_producers: int,
 ) -> Dict[int, ForwardPacket]:
     """Phase ①: schedule loops over the forward step's encoder branch, stores packets.
 
-    本 rank（producer p）负责的 microbatch = p, p+P, p+2P, ...（``get_microbatches_for_pipeline_stage``，
+    本 rank（producer p）负责的 microbatch = p, p+P, p+2P, ...（``get_microbatches_for_producer``，
     Task 1.2）——每 producer 恰好 ``num_microbatches / P`` 个 = ``global_mbs / (dp * inner_dp)``。
+    ``producer_id`` / ``num_producers`` 由调用方从边界组的组内编号与组大小取得（Task 5.7：
+    槽位与包路由同源，不再各自从 pipeline rank 推）。
     逐 microbatch 调注入的 forward_step_func（``colocated_forward_step``）的 **encoder
     分支**，把返回的 ``ForwardPacket``（image_embeddings 保留 grad_fn、phase ④ 统一
     反传用；文本字段一并携带）存入 buffer[microbatch]——**数据获取与 encoder 前传全在
@@ -227,33 +272,54 @@ def _colocated_encoder_forward(
     对喂给 backbone 的那份做 ``detach().requires_grad_(True)``，backbone 反传不进入 encoder
     图；本地原图保留给 phase ④ 反传）。
     """
-    pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
-    pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     # 轮盘分配：producer p -> microbatch p, p+P, p+2P, ...（每个 producer num_microbatches/P 个）。
     # Round-robin: producer p handles microbatches p, p+P, p+2P, ... (num_microbatches/P each).
-    microbatches = parallel_state.get_microbatches_for_pipeline_stage(
-        pipeline_parallel_rank, num_microbatches
+    microbatches = parallel_state.get_microbatches_for_producer(
+        producer_id, num_microbatches, num_producers
     )
 
     encoder_buffers: Dict[int, ForwardPacket] = {}
-    for microbatch in microbatches:
-        # forward step 的 encoder 分支：取一个 micro batch 数据 + encoder_chunk(images)，
-        # 返回 (ForwardPacket, None)。schedule 只拿包存 buffer，并给包打上 microbatch id
-        # 字段（1 元素 int64 张量）——colocated_forward_step 不知道 id，id 是 schedule
-        # 的元数据；serialize 时作为字段写入，consumer 在 _take_boundary_packet 校验。
-        packet, _ = forward_step_func(data_iterator, [encoder_chunk])
-        packet.microbatch_id = torch.tensor(
-            [microbatch], dtype=torch.int64, device=packet.image_embeddings.device
-        )
-        encoder_buffers[microbatch] = packet
+    # Task 5.12: the whole encoder forward runs with the ENCODER's own RNG tracker
+    # installed globally, not merely under one forked named state. Two kinds of random
+    # points have to be covered and a single fork covers only the first:
+    #   - the ViT hidden dropout (bda, fused_bias_dropout.py:47) draws from the GLOBAL
+    #     cuda RNG without touching the tracker;
+    #   - the attention dropout (dot_product_attention.py:217) forks the DEFAULT state
+    #     name, i.e. "model-parallel-rng", and an inner fork overrides any outer one.
+    # The backbone is seeded last, so the tracker's "model-parallel-rng" holds the
+    # BACKBONE's state, whose seed contains the backbone pipeline rank - different on
+    # every stage. Consuming it here would give the encoder replicas different dropout
+    # masks, i.e. they would stop computing the same function, and gradient reduction
+    # would average inconsistent results. Swapping the tracker itself redirects every
+    # fork inside the forward, default-named ones included.
+    # Task 5.12：整个 encoder 前传都在**换入 encoder 自己的 RNG tracker** 下运行，而不是
+    # 只包一层某个命名状态的 fork。需要覆盖两类随机点，而单层 fork 只能覆盖第一类：
+    #   - ViT 的 hidden dropout（bda，fused_bias_dropout.py:47）直接吃**全局** cuda RNG、
+    #     完全不碰 tracker；
+    #   - attention dropout（dot_product_attention.py:217）fork 的是**默认状态名**，即
+    #     "model-parallel-rng"，而内层 fork 会覆盖任何外层 fork。
+    # backbone 是最后播种的，所以 tracker 里的 "model-parallel-rng" 装的是 **backbone** 的
+    # 状态，其种子含 backbone pipeline rank——各 stage 都不同。在这里消费它会让 encoder 各
+    # 副本拿到不同的 dropout 掩码，即副本不再计算同一个函数，梯度归约就在平均互不一致的
+    # 结果。换掉 tracker 本身则能重定向前传内部所有 fork，包括用默认名的那些。
+    with colocated_encoder_rng_tracker():
+        for microbatch in microbatches:
+            # forward step 的 encoder 分支：取一个 micro batch 数据 + encoder_chunk(images)，
+            # 返回 (ForwardPacket, None)。schedule 只拿包存 buffer，并给包打上 microbatch id
+            # 字段（1 元素 int64 张量）——colocated_forward_step 不知道 id，id 是 schedule
+            # 的元数据；serialize 时作为字段写入，consumer 在 _take_boundary_packet 校验。
+            packet, _ = forward_step_func(data_iterator, [encoder_chunk])
+            packet.microbatch_id = torch.tensor(
+                [microbatch], dtype=torch.int64, device=packet.image_embeddings.device
+            )
+            encoder_buffers[microbatch] = packet
 
     # 完整性：本 rank 恰好 num_microbatches / P 个 microbatch（每个 producer 负载一致）。
     # Completeness: exactly num_microbatches / P entries (balanced across producers).
-    expected = num_microbatches // pipeline_parallel_size
+    expected = num_microbatches // num_producers
     assert len(encoder_buffers) == expected, (
-        f"rank pipeline_parallel_rank={pipeline_parallel_rank} got {len(encoder_buffers)} "
-        f"microbatches, expected {expected} (num_microbatches {num_microbatches} / "
-        f"pipeline_parallel_size {pipeline_parallel_size})"
+        f"producer {producer_id} got {len(encoder_buffers)} microbatches, expected "
+        f"{expected} (num_microbatches {num_microbatches} / num_producers {num_producers})"
     )
     assert sorted(encoder_buffers) == microbatches, (
         f"buffer keys {sorted(encoder_buffers)} != round-robin microbatches {microbatches}"
@@ -261,6 +327,7 @@ def _colocated_encoder_forward(
     return encoder_buffers
 
 
+@nvtx_decorator(message="colocated-encoder-backward")
 def _colocated_encoder_backward(
     encoder_chunk,
     encoder_buffers: Dict[int, ForwardPacket],
@@ -271,8 +338,9 @@ def _colocated_encoder_backward(
 
     每个 rank 在**backbone 流水全部前传与反传结束后**统一做自己的 encoder 反传，逐
     microbatch ``torch.autograd.backward(image_embeddings, grad)``，最后做 encoder 自己的
-    梯度收尾（``finalize_colocated_encoder_grads``：outer DP 由 DDP 归约 + inner DP 求和
-    + per-token 归一化）。两件事绑在一起：收尾的正确性依赖这里的 no_sync 纪律
+    梯度收尾（复用 ``finalize_model_grads``，传 encoder 自己的 ``pg_collection``：DDP 在
+    colocated dp 组上的一次 SUM 同时完成"跨副本"与"副本内轮盘"两个数据并行维的求和，随后
+    按全局 token 数归一化）。两件事绑在一起：收尾的正确性依赖这里的 no_sync 纪律
     （最后一个 microbatch 触发 DDP 桶归约），拆开写等于把一个不变量分到两处。
 
     反传对每个 rank 完全同构（consumer 用 4.6c 本地留存的梯度、producer 用 4.6d 收到的
@@ -288,21 +356,36 @@ def _colocated_encoder_backward(
     **DDP grad sync 纪律（与 1F1B 同套路）**：除**最后一个** microbatch 外都在
     ``no_sync()`` 里反传（梯度只在本地 buffer 累积、不发起 DP 通信），最后一个 microbatch
     的反传在 no_sync 之外——由它触发 DDP 的桶归约（``overlap_grad_reduce`` 下与反传重叠），
-    之后由 ``finish_grad_sync`` 等它完成。否则每个 microbatch 都会各发起一次 DP 归约
-    （n/P 次冗余通信）。
-    encoder 尚未套 DDP 时（Task 5 之前、以及 4.8 用裸模型比对数值）没有 ``no_sync`` /
-    ``finish_grad_sync``，梯度直接累积到 ``param.grad``、跳过纪律与收尾，由调用方自取。
+    之后由收尾里的 ``finish_grad_sync`` 等它完成。否则每个 microbatch 都会各发起一次 DP
+    归约（n/P 次冗余通信）。
+    ``no_sync`` 与收尾都从 encoder chunk **自己那份 config** 取（与 backbone 相位同一套写法）：
+    ``config.no_sync_func`` 为 ``None`` 时退化为 ``nullcontext``——裸模型（4.8 数值对照）与
+    未开 ``overlap_grad_reduce`` 都是这种情况，后者下 DDP 反传期间根本不发起桶归约，故不进
+    ``no_sync`` 也不影响正确性。
 
     Args:
         num_tokens: per-token 模式（``calculate_per_token_loss=True``）下 phase ② 交回的
             **未规约**本 rank token 数；其余模式传 None。
     """
     microbatches = sorted(encoder_buffers)
-    no_sync_func = getattr(encoder_chunk, "no_sync", None)
-    no_sync_context = None
-    if no_sync_func is not None:
-        no_sync_context = no_sync_func()
-        no_sync_context.__enter__()
+    # no_sync 与梯度收尾都从 encoder chunk **自己那份 config** 取，与 backbone 相位同一套写法
+    # （schedules.py 的 1F1B 也是 config.no_sync_func + nullcontext 兜底）。值是本组件那个
+    # chunk 的 bound method——training.py 的 group_model_chunks_by_config 会逐份写入，encoder
+    # 组件只有一个 chunk，故挂的是单个函数而不是列表。
+    # 该字段为 None 的两种情况都不影响正确性：① 裸模型（4.8 用它做数值对照，没有 DDP）；
+    # ② 未开 overlap_grad_reduce——此时 DDP 在反传期间根本不发起桶归约
+    # （register_grad_ready 有 assert ddp_config.overlap_grad_reduce，
+    # param_and_grad_buffer.py:742-744），梯度只在 buffer 里累积，不进 no_sync 也一样。
+    # Both the no_sync discipline and the grad finalize read the encoder chunk's OWN config,
+    # the same way the backbone phase does. The value is this component's single chunk bound
+    # method; None (bare model, or overlap_grad_reduce off) is harmless because DDP then
+    # issues no bucket reduction during backward at all.
+    config = get_model_config(encoder_chunk)
+    no_sync_func = config.no_sync_func
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
+    no_sync_context = no_sync_func()
+    no_sync_context.__enter__()
 
     for index, microbatch in enumerate(microbatches):
         # 最后一个 microbatch 的反传放到 no_sync 之外，由它启动 DDP 的 DP 归约。
@@ -312,37 +395,60 @@ def _colocated_encoder_backward(
             no_sync_context = None
         packet = encoder_buffers.pop(microbatch)
         grad = producer_grad_buffers.pop(microbatch)
-        assert grad.shape == packet.image_embeddings.shape, (
-            f"microbatch {microbatch}: boundary grad shape {tuple(grad.shape)} != encoder "
-            f"output shape {tuple(packet.image_embeddings.shape)}"
-        )
-        torch.autograd.backward(packet.image_embeddings, grad_tensors=grad)
+        # 4.9：只有**确实被伪释放过**的包才走 custom_backward——判断依据是包的实际状态
+        # （``numel() == 1`` 的空壳），不是全局开关。因为 consumer 自己那份（producer 0
+        # 本地直传）按设计**不**伪释放（见 _deallocate_encoder_output 的说明），若按开关
+        # 一刀切，consumer 会拿一个完好的张量去调 custom_backward，撞上 schedules.py:221
+        # 的 ``output.numel() == 1`` 断言。空壳的图与 shape 元数据仍在，但形状断言与 Python
+        # 侧 torch.autograd.backward 的 shape 检查都不再成立，只能直接调 C++ autograd 引擎
+        # （与 1F1B 对 deallocate_pipeline_outputs 的处理同款，schedules.py 的 backward_step）。
+        # 4.9: use custom_backward only for packets that were actually pseudo-deallocated (a
+        # numel()==1 shell), not based on the global switch — the consumer's own packets are
+        # intentionally never deallocated, and custom_backward asserts on numel()==1.
+        if packet.image_embeddings.numel() == 1:
+            custom_backward(packet.image_embeddings, grad)
+        else:
+            assert grad.shape == packet.image_embeddings.shape, (
+                f"microbatch {microbatch}: boundary grad shape {tuple(grad.shape)} != encoder "
+                f"output shape {tuple(packet.image_embeddings.shape)}"
+            )
+            torch.autograd.backward(packet.image_embeddings, grad_tensors=grad)
         del packet, grad
 
-    # encoder 的梯度收尾——**独立函数**而非 finalize_model_grads 的分支（encoder 无 PP，
-    # word/position embedding 与 backbone TP 组的归约对它都不适用）。
-    # 函数内延迟 import：megatron.core.distributed 反向依赖 pipeline_parallel，顶层 import
-    # 会成环（与 4.7 接入 get_forward_backward_func 同样的处理）。
-    # The encoder's grad finalize — a separate function, not a branch of finalize_model_grads.
-    # Deferred import: megatron.core.distributed depends back on pipeline_parallel.
-    if hasattr(encoder_chunk, "finish_grad_sync"):
-        from megatron.core.distributed.finalize_model_grads import (
-            finalize_colocated_encoder_grads,
-        )
-
-        finalize_colocated_encoder_grads(
+    # encoder 的梯度收尾走 ``config.finalize_model_grads_func``（与 backbone 相位同一个入口，
+    # 不再函数内延迟 import）：Task 5 起 encoder 带着自己的 ``pg_collection``（每次 get_model
+    # 调用只有一种拓扑），``finalize_model_grads`` 的每一段都按 encoder 自己的组判断——DDP
+    # 归约走 colocated dp 组（全 W，一次 SUM 同时覆盖"跨副本"与"副本内轮盘"两个数据并行维，
+    # finalize_model_grads.py:446-447，doc §2.9）；conditional embedding 与非 TP 参数两段被
+    # pp/tp 单成员的门挡掉（:104、:333，后者在 encoder 支持 TP 后自动生效）；word/position
+    # embedding 两段因 ``embd``/``pos_embd`` 为 None 而跳过
+    # （parallel_state.build_colocated_encoder_process_groups）。
+    # The encoder's grad finalize goes through config.finalize_model_grads_func, the same
+    # entry point the backbone phase uses.
+    if config.finalize_model_grads_func is not None and hasattr(
+        encoder_chunk, "finish_grad_sync"
+    ):
+        # per-token 的分母：encoder 的 pipeline 组只有一个成员，finalize_model_grads.py:494
+        # 的 broadcast 因此是空操作，全局 token 数完全由 :497 在 colocated dp 组（全 W）上的
+        # 一次 SUM 得到——每个副本内只有 backbone 末 stage 的 rank 持有非零值，求和即全局
+        # 总数。这依赖上游"中间 stage 不算 loss、num_tokens 恒为 0"（schedules.py:262-269），
+        # 由 Task 5.8 的数值用例守（分母错 P 倍会直接反映在梯度上），不在训练主循环里加
+        # 断言——那需要 .item() 同步，且属于为当前不可能发生的状态加防御。
+        # The per-token divisor: the encoder's pipeline group is single-member, so that
+        # broadcast is a no-op and the global token count comes solely from the SUM over the
+        # colocated data-parallel group - only the backbone last stage of each replica holds a
+        # non-zero value. That upstream assumption is guarded by the Task 5.8 numerical test,
+        # not by a runtime assert (which would need a .item() sync every iteration).
+        # NVTX：encoder 的梯度收尾（DP 归约 + per-token 归一化）是通信爆发段，单独打区间。
+        # NVTX: the encoder grad finalize (DP reduce + per-token normalization) is a
+        # communication burst - give it its own range.
+        nvtx_range_push("colocated-encoder-grad-finalize")
+        config.finalize_model_grads_func(
             [encoder_chunk],
-            encoder_inner_dp_group=parallel_state.get_encoder_inner_data_parallel_group(),
-            # token 数只在 pp 末 stage 有，而 inner 组成员 = pp 组成员且按 stage 有序，
-            # 故末 stage 的 global rank = inner 组 rank 列表的最后一个（收尾里广播用）。
-            # The token count only exists on the pp last stage; the inner group's ranks are the
-            # pp group's ranks in stage order, so its last entry is the broadcast source.
-            encoder_inner_dp_last_rank=(
-                parallel_state.get_encoder_inner_data_parallel_global_ranks()[-1]
-            ),
-            dp_cp_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
-            num_tokens=num_tokens,
+            num_tokens,
+            pg_collection=get_attr_wrapped_model(encoder_chunk, "pg_collection"),
         )
+        nvtx_range_pop("colocated-encoder-grad-finalize")
 
 
 def colocated_backbone_forward_backward_pipelining_without_interleaving(
@@ -545,6 +651,45 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
     pending_grad_requests: Dict[int, _GradRecvRequest] = {}
     consumer_boundary_inputs: List[Tuple[int, torch.Tensor]] = []
 
+    def _deallocate_encoder_output(packet: ForwardPacket) -> None:
+        """Task 4.9: pseudo-deallocate a sent packet's encoder output (data only, graph kept).
+
+        与 1F1B 对 PP 激活的处理同一套路（``deallocate_output_tensor``，schedules.py:179）：
+        ``colocated_send_forward`` 内部 ``packet.serialize()`` 已把各字段**拷进扁平发送
+        缓冲**，所以调用返回后 ``image_embeddings`` 的数据对通信而言不再需要；phase ④ 的
+        统一反传只用它的 ``grad_fn`` 与形状，不用数据。省下每个已发出 microbatch 一份
+        encoder 输出（``[img_seq, num_tiles, h_lang]``）。默认关（``deallocate_encoder_outputs``）。
+
+        **正因为有那份拷贝，这里不需要等通信完成**（``wait=False`` 后可直接伪释放）：
+        在飞的 isend 读的是独立的扁平缓冲，不是 ``image_embeddings`` 的存储；先后顺序由
+        ProcessGroupNCCL 在 enqueue P2P 前让 NCCL 流等计算流保证。两份空间最终都会回收——
+        原张量在这里伪释放，扁平缓冲在发送完成后由 caching allocator 自动回收（它没有
+        Python 引用，块早已归还，只是被 ``recordStream`` 标记为"NCCL 用完才可复用"），
+        所以不需要任何 handle 或 wait。代价只有 ``torch.cat`` 那一瞬的两份峰值。
+        对比原框架：同步路径是"send_forward 返回（内部 ``req.wait()``）→ deallocate"
+        （schedules.py:2280/2335），异步 overlap 路径必须**显式先 wait 再 deallocate**
+        （schedules.py:1592-1595）——那里发的就是激活本身，没有这份拷贝可依赖。
+        The serialize copy is what makes a wait unnecessary here: the in-flight isend reads
+        the flat buffer, not image_embeddings' storage, and the flat buffer is reclaimed by
+        the caching allocator once the send completes (recordStream guards reuse).
+
+        **只对 producer 的网络路径调用**：consumer 自己那份（producer 0 本地直传）的数据
+        与 4.6b ``detach()`` 出来的边界 leaf **共享同一块存储**，而 leaf 要活到反传取
+        ``.grad``，单独伪释放原张量不会真正降低峰值，故不做（避免制造"看起来省了"的假象）。
+
+        **契约**：``image_embeddings`` 不能是别的张量的 view（``_base is None``），否则
+        ``deallocate_output_tensor`` 断言失败——释放 view 的数据不会释放 base 持有的显存。
+        真实路径的最后一步是 ``vision_projection`` 的 bias add（实测 ``grad_fn=AddBackward0``、
+        ``_base is None``），天然满足。注意 ``unsqueeze`` 产生 view，而 ``contiguous()`` 对已
+        连续张量返回自身、去不掉 view 身份；``nn.Linear`` 作用于 3D 输入时内部
+        reshape→mm→view，输出**也是 view**（2D 输入才不是）。
+        Contract: image_embeddings must not be a view of another tensor; freeing a view
+        would not release the base's memory, and deallocate_output_tensor asserts on it.
+        """
+        if not config.deallocate_encoder_outputs:
+            return
+        deallocate_output_tensor(packet.image_embeddings, deallocate_pipeline_outputs=True)
+
     # 4.4/4.5b：进入 backbone 流水前，每个 producer 先给 consumer 发**第 1 个包**
     #（microbatch == producer_id）作为**启动**——**异步 `wait=False`**（4.5b 用户定案，
     # 取代 4.3k 的同步等待）：consumer 已不在流水前 post irecv，同步等会直接挂死；异步
@@ -560,6 +705,11 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
     # dropped on purpose (same as _restock_boundary_packet): the packet itself stays alive in
     # encoder_buffers until phase ④, so the send buffer cannot be reclaimed early.
     if not is_consumer: #producer直接异步发送一个micro batch给consumer
+        # NVTX：流水前的启动首包——它在时间线上标出"producer 何时开始喂 consumer"，是
+        # 判断 backbone 流水启动是否被 encoder 相位拖住的锚点。
+        # NVTX: the pre-pipeline startup packet marks when the producer starts feeding the
+        # consumer - the anchor for judging whether the backbone start is held up.
+        nvtx_range_push("colocated-boundary-packet-startup")
         first_microbatch = producer_id
         assert first_microbatch in encoder_buffers, (
             f"producer {producer_id} must own the first microbatch {first_microbatch}"
@@ -567,28 +717,37 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         comm.colocated_send_forward(
             encoder_buffers[first_microbatch], producer=producer_id, wait=False
         )
+        _deallocate_encoder_output(encoder_buffers[first_microbatch])
+        nvtx_range_pop("colocated-boundary-packet-startup")
 
     def _take_boundary_packet(microbatch: int) -> ForwardPacket:
         """Consumer (stage 0): take the boundary packet of ``microbatch``.
 
         消费者（stage 0）前传 microbatch ``microbatch`` 前取它的边界包（encoder 输出 +
         文本字段）：producer 0 本地直传（``encoder_buffers[microbatch]``，零拷贝）、
-        producer>0 用 prefetch 的 ``_ForwardRecvRequest`` 的 ``finish()``（4.3k：
-        start() 已在 prefetch 后提前执行——header 已等完、数据 irecv 已入队，finish 等
-        数据 → 组装）。
+        producer>0 用 prefetch 的 ``_ForwardRecvRequest`` 的 ``finish()``（4.3k：prefetch
+        时通信器已把 request 启动好——header 已等完、数据 irecv 已入队，finish 等数据 →
+        组装）。
         **返回包，由调用方用 ``functools.partial`` 绑定到 forward step**（packet 走闭包
         传给 ``colocated_forward_step``，不经模型属性——模型不背 schedule 交接状态）。
 
         4.6b：返回前把 image_embeddings 换成**边界切断点**
         ``detach().requires_grad_(True)``，并把 ``(microbatch, boundary_embeddings)``
         追加进 ``consumer_boundary_inputs``（4.6c 在 backward 之后 pop 取 ``.grad``）。
+
+        NVTX：外层区间覆盖"取包 + 边界切断 + FIFO 记账"整段——内层
+        ``colocated-boundary-forward-recv-finish`` 只覆盖等数据那一步，外减内即为
+        本地侧的组装开销（producer 0 的本地直传路径完全没有内层区间）。
+        NVTX: the outer range covers take + boundary cut + FIFO bookkeeping; the inner
+        finish range covers only the data wait (absent on producer 0's local path).
         """
+        nvtx_range_push("colocated-boundary-packet-take")
         producer = microbatch % group_size  # 轮盘映射：microbatch s 由 producer s%P 算（doc §2.2）
         if producer == 0:
             packet = encoder_buffers[microbatch]  # producer 0 = 自己：本地直传（零拷贝）
         else:
-            # 4.3k：start() 已在 prefetch 后提前执行（数据 irecv 已入队），take 时只需
-            # finish() 取数据（若未 start，finish() 内部会兜底自动 start）。
+            # 4.3k：prefetch 时通信器已启动 request（数据 irecv 已入队），take 时只需
+            # finish() 取数据。
             packet = prefetched[producer].finish()
 
         # 4.6b：边界切断——本地路径与网络路径**同构处理**（无分支），两个操作各服务一条路径：
@@ -618,6 +777,7 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         # In forward_only (eval) nothing pops the FIFO, so skip the bookkeeping entirely.
         if not forward_only:
             consumer_boundary_inputs.append((microbatch, boundary_embeddings))
+        nvtx_range_pop("colocated-boundary-packet-take")
         return replace(packet, image_embeddings=boundary_embeddings)
 
     # 4.6c：consumer 侧梯度派发的在飞 isend handle，**按 producer 分桶**（与 prefetched 同构）
@@ -658,7 +818,15 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
 
         **只有 consumer 调用本函数**——``is_consumer`` 判断放在两处调用点（2026-08-26
         用户要求：写在调用处更清晰，避免让人以为 producer 也要发边界梯度）。
+
+        NVTX：一个区间覆盖"取梯度 + 排空上一次 isend + 派发"整段（内层的
+        ``colocated-boundary-send-backward`` 由通信器提供，外减内即为本函数自身的开销）。
+        **不给排空的 ``handle.wait()`` 单独标区间**：它只是插 stream-wait、CPU 不阻塞，
+        单标恒为 0；真正的等待要看 GPU 时间线（见 _send_intra_packet 的说明）。
+        NVTX: one range for the whole helper (the inner send range comes from the
+        communicator); deliberately none around the drain wait, which does not block the CPU.
         """
+        nvtx_range_push("colocated-boundary-grad-dispatch")
         microbatch, boundary_embeddings = consumer_boundary_inputs.pop(0)
         boundary_grad = boundary_embeddings.grad
         assert boundary_grad is not None, (
@@ -669,6 +837,7 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         producer = microbatch % group_size
         if producer == 0:
             producer_grad_buffers[microbatch] = boundary_grad  # producer 0 = 自己：本地留存
+            nvtx_range_pop("colocated-boundary-grad-dispatch")
             return
         # 先 wait 掉**这个 producer** 上一次派发的 isend（跨 producer 独立，不互等）——那次
         # 发送已被它的补货 step 收走（早 P 步），wait 只是确认、不实际阻塞。
@@ -679,6 +848,7 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         boundary_grad_send_handles[producer] = comm.colocated_send_backward(
             BackwardPacket(grad=boundary_grad), producer=producer, wait=False
         )
+        nvtx_range_pop("colocated-boundary-grad-dispatch")
 
     # --- 4.4/4.6d：producer 的补货 step——**steady 阶段**顺序固定为 ① 收梯度 → ② forward →
     # ③ 等梯度 → ④ 补货；**warmup 阶段只有 ④**（纯前传、consumer 尚未反传，无梯度可收）。
@@ -689,8 +859,9 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
     def _start_boundary_grad_recv(microbatch: int) -> None:
         """Producer step ①: post the grad irecv of ``microbatch`` (one it owns).
 
-        生产者异步收 **microbatch ``microbatch``**（自己产的）的边界梯度并 ``start()``
-        （等 shape 头 → 分配 buffer → post 数据 irecv），handle 存 ``pending_grad_requests``。
+        生产者异步收 **microbatch ``microbatch``**（自己产的）的边界梯度：
+        ``colocated_recv_backward(wait=False)`` 内部已完成"提交 shape 头 → 等头 → 分配
+        buffer → post 数据 irecv"，返回的 request 已在后台传输，存 ``pending_grad_requests``。
         参数是"**要收谁的梯度**"而不是"当前 step 的 microbatch"——这样 steady 的补货 step
         （收 k-P）与 cooldown 收尾（收最后一个自己产的）用同一个接口，不必造一个不存在的
         step 号。所有权判断对两者等价（``(k-P) % P == k % P``）。
@@ -700,11 +871,22 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         早 1 步（stage i 做 backward x 的时刻 = stage 0 做 backward x+i 的时刻，doc §2.11），
         所以 irecv 立即配对、不阻塞。
         ``microbatch < 0`` 表示"本 rank 自己产的第一个 microbatch 没有上一个"，直接返回。
+
+        ``forward_only``（eval）下直接返回：consumer 走的是纯前传分支、根本不会派发边界
+        梯度，这里 post 的 irecv 永远没有对端，而 ``colocated_recv_backward(wait=False)``
+        内部含"等 shape 头"这一次会合，会阻塞并把整个 pipeline 挂死。梯度相关的其它动作
+        早已门住（consumer 的 FIFO 记账、cooldown 整块、phase ④ 的 encoder 反传、两处
+        finalize_model_grads），守卫写在函数体里而不是逐个调用点，是为了让 steady 与
+        cooldown 收尾两处调用一次性覆盖。
+        Return immediately under ``forward_only`` (eval): the consumer takes the pure-forward
+        branch and never dispatches boundary grads, so this irecv would have no counterpart and
+        the header rendezvous inside the receive would block and hang the whole pipeline. The
+        guard lives in the function body rather than at each call site so that both the
+        steady-state call and the cooldown tail call are covered at once.
         """
-        if is_consumer or microbatch < 0 or microbatch % group_size != producer_id:
+        if forward_only or is_consumer or microbatch < 0 or microbatch % group_size != producer_id:
             return
         request = comm.colocated_recv_backward(producer=producer_id, wait=False)
-        request.start()
         pending_grad_requests[microbatch] = request
 
     def _finish_boundary_grad_recv(microbatch: int) -> None:
@@ -716,7 +898,14 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         必须在 ④ 补货**之前**完成：补货的 isend 与这里的梯度 irecv 是**同一对 peer**
         （producer p ↔ consumer 0）→ 同一个 NCCL communicator 与 stream，未完成的 irecv
         会挡住后面 enqueue 的 isend。
+        ``forward_only``（eval）下直接返回：与 ① 对称——eval 不产生边界梯度，此时字典本该
+        是空的，早返回让这个不变量显式而不是依赖"pop 不到就返回"的巧合。
+        Return immediately under ``forward_only``, symmetric with step ①: eval produces no
+        boundary grads, so the dictionary is expected to be empty and the early return states
+        that invariant explicitly instead of relying on the pop simply missing.
         """
+        if forward_only:
+            return
         request = pending_grad_requests.pop(microbatch, None)
         if request is None:
             return
@@ -728,14 +917,21 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         生产者在补货 step 的**最后一件事**：forward 推进到 microbatch k（k%P==producer_id，
         即"流水消耗到我负责的包"）后，异步发下一个自己负责的包（k+P）——"消费一个补一个"。
         ``wait=False`` 提前发送，与 consumer 的提前一整步 prefetch（4.5）配对。
+
+        NVTX：外层区间额外覆盖补货的所属判断与 4.9 的伪释放——内层
+        ``colocated-boundary-send-forward`` 只覆盖发送本身。
+        NVTX: the outer range also covers the ownership check and the 4.9 pseudo-release.
         """
         if is_consumer or microbatch % group_size != producer_id:
             return
+        nvtx_range_push("colocated-boundary-packet-restock")
         next_microbatch = microbatch + group_size
         if next_microbatch < num_microbatches:
             comm.colocated_send_forward(
                 encoder_buffers[next_microbatch], producer=producer_id, wait=False
             )
+            _deallocate_encoder_output(encoder_buffers[next_microbatch])  # 4.9
+        nvtx_range_pop("colocated-boundary-packet-restock")
 
     # --- 4.3i：backbone P2P 伴随传输展开 labels/loss_mask（4.3h 定案；4.3l 起命名
     # 统一为 intra_packet 伴随传输）---
@@ -758,15 +954,29 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         **4.3l：与 _recv_intra_packet 对称（统一结构），同步等 isend 完成**——
         intra_packet 与 activation 是绑定的一对通信（send_forward/recv_forward 已同步
         两端到同一拍），同步 wait 不会额外阻塞；不再需要外部 handle 列表与末尾统一 wait。
+
+        NVTX：intra_packet 走的是 **pp_group**（不是共置边界组），既不在
+        ``colocated-boundary-*`` 覆盖内，也不在 p2p_communication.py 的装饰器覆盖内，
+        故单独标一个区间。**不给 ``handle.wait()`` 单独标区间**：``Work::wait()`` 只是把
+        「等 NCCL 完成事件」插进当前 stream 后立即返回，CPU 不阻塞（probe 实测 0.000 s），
+        单标只会得到一个恒为 0 的区间；真正的等待发生在 GPU 时间线上（计算 stream 的空隙
+        对齐到该 NCCL kernel 的结束），要用 ``nsys stats -r nvtx_gpu_proj_sum`` 的
+        NVTX-GPU 投影看，而不是 CPU 侧区间。
+        NVTX: one range for the whole helper, and deliberately none around handle.wait() -
+        Work::wait() only enqueues a stream wait and returns (measured 0.000 s on the CPU),
+        so a range there would always be empty; the real wait shows up on the GPU timeline
+        and must be read through the NVTX-GPU projection.
         """
         if is_pp_last_stage or labels is None or loss_mask is None:
             return
+        nvtx_range_push("colocated-intra-packet-send")
         intra_packet_send_handles = [
             dist.isend(labels.contiguous(), dst=pp_next_rank, group=pp_group),
             dist.isend(loss_mask.contiguous(), dst=pp_next_rank, group=pp_group),
         ]
         for handle in intra_packet_send_handles:
             handle.wait()
+        nvtx_range_pop("colocated-intra-packet-send")
 
     def _recv_intra_packet(
         input_tensor: Optional[torch.Tensor], is_pp_first_stage: bool
@@ -777,6 +987,13 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         绑定进 intra_packet 并透传（4.3j：不再写入模型属性）。shape 由 activation
         推导：activation [s', b, h] → labels/loss_mask [b, s']。首 stage 或 activation
         为 None 时返回 ``(None, None)``。
+
+        NVTX：与 ``_send_intra_packet`` 对称——一个区间覆盖 shape 推导 + 分配 + 提交 + 插
+        stream-wait，同样不给 ``handle.wait()`` 单独标区间（理由见那里）。区间从形状推导之后
+        才开始（首 stage / activation 为 None 的早返回不产生区间，避免时间线上出现大量零长度
+        噪音区间）。
+        NVTX: symmetric with _send_intra_packet (no separate range around the wait); the range
+        starts after the early returns so non-participating stages emit no zero-length noise.
         """
         if isinstance(input_tensor, list):
             # P2PCommunicator 的 recv_forward / send_backward_recv_forward 返回值形态不统一
@@ -803,6 +1020,7 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         #   batch   = activation dim 1 = the micro-batch size;
         # labels and loss_mask share the same shape [batch, seq_len] (the transpose of
         # the activation).
+        nvtx_range_push("colocated-intra-packet-recv")
         seq_len, batch = input_tensor.shape[0], input_tensor.shape[1]
         labels = torch.empty((batch, seq_len), dtype=torch.int64, device=input_tensor.device)
         loss_mask = torch.empty(
@@ -814,6 +1032,7 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         ]
         for handle in intra_packet_recv_handles:
             handle.wait()
+        nvtx_range_pop("colocated-intra-packet-recv")
         return labels, loss_mask
 
     # Compute number of warmup microbatches.
@@ -865,6 +1084,9 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         output_tensors = []
     forward_data_store = []
 
+    # NVTX：backbone warmup 阶段（纯前传）。对应 schedules.py 的 "warmup" 区间。
+    # NVTX: the backbone warmup phase (forward only), mirroring schedules.py's "warmup".
+    nvtx_range_push("colocated-warmup")
     # Run warmup forward passes.
     # 执行 warmup 阶段的前传。
     for i in range(num_warmup_microbatches):
@@ -909,7 +1131,6 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
                 prefetched[next_producer] = comm.colocated_recv_forward(
                     next_producer, expected_microbatch_id=next_microbatch, wait=False
                 )
-                prefetched[next_producer].start()
         # 4.3b：consumer 前传 microbatch i 前 take 包（stage 0 前传 0..P-2），并用
         # ``functools.partial`` 绑定到 forward step（packet 走闭包，不经模型属性）。
         # 4.3j：intra_packet——consumer 用输出盒子（colocated_forward_step 写回组装
@@ -963,6 +1184,8 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
             output_tensors.append(output_tensor)
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
+    nvtx_range_pop("colocated-warmup")
+
     # Before running 1F1B, need to receive first forward tensor.
     # 进入 steady 前先收 steady 第一个 microbatch 的输入激活。
     # 4.3i：steady 第一个 microbatch 的伴随 labels/loss_mask——存为 pending 变量，
@@ -976,6 +1199,9 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
             input_tensor, p2p_communicator.is_pp_first_stage
         )
 
+    # NVTX：backbone steady 阶段（1F1B 主体）。对应 schedules.py 的 "steady" 区间。
+    # NVTX: the backbone steady phase (the 1F1B main loop), mirroring schedules.py's "steady".
+    nvtx_range_push("colocated-steady")
     # Run 1F1B in steady state.
     # 执行 steady 阶段的 1F1B。
     for i in range(num_microbatches_remaining):
@@ -1009,7 +1235,6 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
                 prefetched[next_producer] = comm.colocated_recv_forward(
                     next_producer, expected_microbatch_id=next_microbatch, wait=False
                 )
-                prefetched[next_producer].start()
 
         # 4.3b：consumer 前传 microbatch W+i 前 take 包，并 partial 绑定到 forward step。
         # 4.3j：intra_packet——consumer 用输出盒子，非 consumer 用 pending 的输入载体。
@@ -1106,9 +1331,15 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
                     input_tensor, p2p_communicator.is_pp_first_stage
                 )
 
+    nvtx_range_pop("colocated-steady")
+
     # Run cooldown backward passes.
     # 执行 cooldown 阶段的反传。
     if not forward_only:
+        # NVTX：backbone cooldown 阶段（剩余反传）。对应 schedules.py 的 "cooldown" 区间。
+        # NVTX: the backbone cooldown phase (remaining backwards), mirroring schedules.py's
+        # "cooldown".
+        nvtx_range_push("colocated-cooldown")
         for i in range(num_warmup_microbatches):
             if i == num_warmup_microbatches - 1:
                 if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
@@ -1131,10 +1362,16 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
                 input_tensor_grad, p2p_communicator.is_pp_first_stage
             )
 
+        nvtx_range_pop("colocated-cooldown")
+
         # 4.6c：cooldown 结束——wait 掉各 producer 桶里剩余的 isend，此后 consumer 侧无在飞
         # 梯度发送；并断言 FIFO 已空（每个前传的 microbatch 都恰好被反传+派发一次）。
         # 4.6c: after cooldown, drain every producer's remaining isend and assert the FIFO
         # drained (every forwarded microbatch was backwarded and dispatched exactly once).
+        # NVTX：这里**不标区间**——整段只有 handle.wait()，而 Work::wait() 只插 stream-wait、
+        # CPU 不阻塞（probe 实测 0.000 s），CPU 侧区间恒为 0；真正的等待在 GPU 时间线上。
+        # NVTX: no range here - the block is nothing but handle.wait(), which does not block
+        # the CPU, so a CPU-side range would always be empty.
         for handles in boundary_grad_send_handles.values():
             for handle in handles:
                 handle.wait()
@@ -1184,12 +1421,18 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
     # 4.6e：交回给 phase ④ 的 token 数——**必须在 backbone 的 finalize 之前克隆**：
     # finalize_model_grads 在 per-token 模式下会就地把这个张量规约成全局值
     # （broadcast + all_reduce，finalize_model_grads.py:494-497），而 encoder 需要的是
-    # 未规约的原始值（它自己按 inner + dp_cp 两级求和，见 finalize_colocated_encoder_grads）。
+    # 未规约的原始值（它自己带 encoder 的 pg_collection 再走一遍 finalize_model_grads，
+    # 在 colocated dp 组上求和得到同一个全局 token 数）。
     # 4.6e: clone the token count for phase ④ *before* the backbone finalize, which reduces
     # the tensor in place; the encoder needs the raw per-rank value.
     num_tokens_for_encoder = total_num_tokens.clone()
 
     if config.finalize_model_grads_func is not None and not forward_only:
+        # NVTX：backbone 的梯度收尾（DP 归约 / layernorm / embedding 归约）与 encoder 的
+        # 收尾分开打区间，两者是不同参数集上的两段通信。
+        # NVTX: the backbone grad finalize, kept as a separate range from the encoder's -
+        # they are two communication bursts over two different parameter sets.
+        nvtx_range_push("colocated-backbone-grad-finalize")
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
         # 若开启 defer_embedding_wgrad_compute，这里补齐 LM Head 的 wgrad 计算。
@@ -1207,6 +1450,7 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
             pg_collection=pg_collection,
             force_all_reduce=force_all_reduce,
         )
+        nvtx_range_pop("colocated-backbone-grad-finalize")
 
     if getattr(config, 'fine_grained_activation_offloading', False):
         off_interface.reset()

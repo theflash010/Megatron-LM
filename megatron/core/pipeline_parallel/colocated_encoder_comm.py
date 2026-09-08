@@ -36,6 +36,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.utils import nvtx_decorator
 
 # shape 头每字段长度 = 1(ndim) + 3(最多 3 维，0 填充)。字段最多 3 维：
 # image_embeddings [seq, num_tiles, h] 是 3D，文本字段都是 1D，无需预留 4D。
@@ -309,13 +310,16 @@ class BackwardPacket:
 class _ForwardRecvRequest:
     """In-flight async receive of a forward packet (shape header already submitted).
 
-    异步前向接收请求：构造时已提交 shape 头的 irecv（未等待），数据尚未接收。
-    **两段式生命周期（start/finish）**：
-    - ``start()``：等 shape 头 → 解析 → 分配数据 buffer → **异步提交数据 irecv**
-      （不等待，拿到数据 handle）——放在"数据被需要之前"（consumer prefetch 时 /
-      producer 补发 step 时），让数据传输与后续计算重叠；
-    - ``finish()``：等数据 handle（start 之后已后台传输一整步，通常早已完成）→
-      组装 ``ForwardPacket``——在真正需要数据时调用（consumer take / producer phase ④）。
+    异步前向接收请求：构造时已提交 shape 头的 irecv，并由通信器在返回前立即
+    ``start()``（等 shape 头 → 解析 → 分配数据 buffer → 异步提交数据 irecv），
+    因此**拿到 request 时数据传输已在后台进行**。调用方只需在真正需要数据时调
+    ``finish()``（等数据 handle → 组装 ``ForwardPacket``）——数据在这两者之间的
+    计算窗口里传输，窗口越长藏得越干净。
+    ``start()`` 不是调用方的职责：它与"提交头"之间没有任何使用者需要的自由度
+    （三个调用点原本都紧跟着调用它），拆成两步只会让"异步接收"看起来像两件事。
+    A request is fully started by the communicator before it is handed out: the data
+    irecv is already in flight, so the caller only calls ``finish()`` when it needs the
+    data. ``start()`` is an internal step, not a caller responsibility.
     """
 
     def __init__(
@@ -333,20 +337,31 @@ class _ForwardRecvRequest:
         self._src_rank = src_rank
         self.producer = producer
         self.expected_microbatch_id = expected_microbatch_id
-        self._flat = None  # data buffer allocated by start(); read by finish()
-        self._data_handle = None  # data irecv handle posted by start()
+        self._flat = None  # data buffer allocated by _start(); read by finish()
+        self._data_handle = None  # data irecv handle posted by _start()
         self._packet = None
 
-    def start(self) -> "_ForwardRecvRequest":
-        """Start phase: wait the shape header, allocate the data buffer, post the data irecv.
+    # NVTX：start/finish 是异步收的两段——start 标"何时把等待插进流"，finish 标"何时
+    # 真正等到数据"，两者的间隔就是传输藏进计算的程度。两个 request 类的方法同名
+    # （start/finish），默认区间名（模块路径.函数名）会撞名，故必须显式 message。
+    # NVTX: start/finish are the two halves of an async receive - start marks when the
+    # wait is enqueued, finish marks when the data actually arrives. The two request
+    # classes have same-named methods, so explicit messages are required.
+    @nvtx_decorator(message="colocated-boundary-forward-recv-start")
+    def _start(self) -> "_ForwardRecvRequest":
+        """Wait the shape header, allocate the data buffer, post the data irecv.
 
-        **开始阶段**：等 shape 头（prefetch 时提交、此刻几乎已到达）→ 解析 shape →
-        分配数据 buffer → 异步提交数据 irecv（不等待）。返回 self 便于链式调用。
+        等 shape 头（构造时已提交）→ 解析 shape → 分配数据 buffer → 异步提交数据
+        irecv（不等待）。**由通信器在交出 request 之前调用**（``_async_recv_forward``），
+        不是公开接口；返回 self 便于在那里链式书写。
+        重复调用是幂等的（``_data_handle`` 已存在则跳过）。
+        Called by the communicator before the request is handed out, not by callers.
         """
         if self._data_handle is None:
             self._data_handle = self._comm._start_recv_forward(self)
         return self
 
+    @nvtx_decorator(message="colocated-boundary-forward-recv-finish")
     def finish(self) -> "ForwardPacket":
         """Finish phase: wait the data and assemble the ForwardPacket.
 
@@ -361,10 +376,12 @@ class _ForwardRecvRequest:
 class _GradRecvRequest:
     """In-flight async receive of the backward grad (shape header already submitted).
 
-    异步梯度接收请求：构造时已提交 shape 头的 irecv（未等待），数据尚未接收。
-    **两段式生命周期（start/finish）**：``start()`` 等 shape 头 → 分配梯度 buffer →
-    异步提交数据 irecv（producer 补发 step 的 forward 前做，与计算重叠）；``finish()``
-    等数据 handle → 组装 ``BackwardPacket``（phase ④ 统一反传前做）。
+    异步梯度接收请求：构造时已提交 shape 头的 irecv，并由通信器在返回前立即
+    ``_start()``（等 shape 头 → 分配梯度 buffer → 异步提交数据 irecv），因此拿到
+    request 时梯度传输已在后台进行。调用方只需在真正需要梯度时调 ``finish()``
+    （等数据 handle → 组装 ``BackwardPacket``，phase ④ 统一反传前做）。
+    与 ``_ForwardRecvRequest`` 同构，理由见那里的说明。
+    Symmetric with ``_ForwardRecvRequest``: fully started before being handed out.
     """
 
     def __init__(
@@ -378,20 +395,23 @@ class _GradRecvRequest:
         self._header_handle = header_handle
         self._header = header
         self._src_rank = src_rank
-        self._buf = None  # grad buffer allocated by start(); read by finish()
-        self._data_handle = None  # data irecv handle posted by start()
+        self._buf = None  # grad buffer allocated by _start(); read by finish()
+        self._data_handle = None  # data irecv handle posted by _start()
         self._packet = None
 
-    def start(self) -> "_GradRecvRequest":
-        """Start phase: wait the shape header, allocate the grad buffer, post the data irecv.
+    @nvtx_decorator(message="colocated-boundary-grad-recv-start")
+    def _start(self) -> "_GradRecvRequest":
+        """Wait the shape header, allocate the grad buffer, post the data irecv.
 
-        **开始阶段**：等 shape 头 → 分配梯度 buffer → 异步提交数据 irecv（不等待）。
-        返回 self 便于链式调用。
+        等 shape 头 → 分配梯度 buffer → 异步提交数据 irecv（不等待）。**由通信器在交出
+        request 之前调用**（``_async_recv_grad``），不是公开接口；幂等。
+        Called by the communicator before the request is handed out, not by callers.
         """
         if self._data_handle is None:
             self._data_handle = self._comm._start_recv_grad(self)
         return self
 
+    @nvtx_decorator(message="colocated-boundary-grad-recv-finish")
     def finish(self) -> "BackwardPacket":
         """Finish phase: wait the data and assemble the BackwardPacket.
 
@@ -415,8 +435,8 @@ class EncoderBackboneBoundaryCommunicator:
       encoder 输出梯度（``BackwardPacket``）发回各生产者（仅 producer > 0；文本字段
       的梯度不回传）。
     收发均有 ``wait`` 参数：``wait=True``（默认）同步阻塞；``wait=False`` 异步提交
-    （send 返回 handle 列表，recv 返回 request 对象，稍后 ``wait()`` / ``start()`` /
-    ``finish()``）
+    （send 返回 handle 列表，稍后 ``wait()``；recv 返回**已启动**的 request 对象，
+    数据传输已在后台进行，稍后 ``finish()`` 取数）
     ——producer replenish / consumer prefetch / 补发 step 收梯度用异步路径与计算重叠。
     前向包 shape 头含 **microbatch id** 行（消费者按序 take 时校验，防乱序错配）。
     **本地直传短路（producer 0 = 消费者自己）由调用方（wrapper）分支处理**：producer 0
@@ -464,6 +484,7 @@ class EncoderBackboneBoundaryCommunicator:
         """
         return self.producer_id == 0
 
+    @nvtx_decorator(message="colocated-boundary-warmup")
     def warmup_boundary_communicators(self) -> None:
         """Create the per-pair communicator and both transport directions up-front.
 
@@ -557,23 +578,28 @@ class EncoderBackboneBoundaryCommunicator:
         return BackwardPacket.deserialize(header, buf)
 
     def _async_recv_grad(self, src_rank: int) -> _GradRecvRequest:
-        """Asynchronously submit a receive of the backward grad: only the shape-header irecv.
+        """Asynchronously submit a receive of the backward grad: header irecv, then start it.
 
-        异步发起梯度接收：只提交 shape 头的 irecv（不等待），返回
-        ``_GradRecvRequest``。生产者侧用它把接收提前挂到 NCCL 后台；需要梯度时先
-        ``request.start()`` 再 ``request.finish()``。梯度 dtype 在完成时用通信器 dtype
-        解析。
+        异步发起梯度接收：提交 shape 头的 irecv → 立即 ``_start()``（等头 → 分配梯度
+        buffer → 提交数据 irecv），返回**已启动**的 ``_GradRecvRequest``。生产者侧用它
+        把接收提前挂到 NCCL 后台，需要梯度时只调 ``request.finish()``。梯度 dtype 在
+        完成时用通信器 dtype 解析。
+        注意 ``_start()`` 内含"等 shape 头"这一次与对端的会合：本方法因此**不是**纯粹
+        的非阻塞提交，调用点必须确保对端确实会发（``forward_only`` 下 consumer 不派发
+        梯度，故 schedule 侧有守卫，见 colocated_schedule.py 的 _start_boundary_grad_recv）。
+        The returned request is already started; note ``_start()`` contains one rendezvous
+        with the peer (waiting the shape header), so the caller must ensure the peer sends.
         """
         header = torch.empty(_SHAPE_HEADER_LEN, dtype=torch.int64, device="cuda")
         header_handle = dist.irecv(header, src=src_rank, group=self.colocated_boundary_group)
-        return _GradRecvRequest(self, header_handle, header, src_rank)
+        return _GradRecvRequest(self, header_handle, header, src_rank)._start()
 
     def _start_recv_grad(self, request: _GradRecvRequest) -> object:
-        """Start phase of an async grad receive: wait header, allocate, post data irecv.
+        """Wait the header, allocate the grad buffer, post the data irecv.
 
-        梯度异步接收的**开始阶段**：等 shape 头 → 解析形状 → 分配梯度 buffer → **异步
-        提交数据 irecv（不等待）**，返回数据 handle。数据在 start 到 finish 之间的计算
-        窗口后台传输。
+        梯度异步接收的**启动步骤**（由 ``_GradRecvRequest._start()`` 调用）：等 shape 头
+        → 解析形状 → 分配梯度 buffer → **异步提交数据 irecv（不等待）**，返回数据
+        handle。数据在此到 ``finish()`` 之间的计算窗口后台传输。
         """
         request._header_handle.wait()
         shape = BackwardPacket.parse_shape_header(request._header)
@@ -682,12 +708,17 @@ class EncoderBackboneBoundaryCommunicator:
     def _async_recv_forward(
         self, src_rank: int, producer: int, expected_microbatch_id: Optional[int] = None
     ) -> "_ForwardRecvRequest":
-        """Asynchronously submit a receive of a forward packet: only the shape-header irecv.
+        """Asynchronously submit a receive of a forward packet: header irecv, then start it.
 
-        异步发起前向包接收：只提交 shape 头的 irecv（不等待），返回
-        ``_ForwardRecvRequest``。消费者在 prefetch 时用它把接收提前挂到 NCCL 后台；
-        需要数据时先 ``request.start()``（等 shape → 分配 → 提交数据接收）再
+        异步发起前向包接收：提交 shape 头的 irecv → 立即 ``_start()``（等头 → 解析 shape
+        → 分配数据 buffer → 提交数据 irecv），返回**已启动**的 ``_ForwardRecvRequest``。
+        消费者 prefetch 时用它把接收提前挂到 NCCL 后台，需要数据时只调
         ``request.finish()``（取数据）。
+        注意 ``_start()`` 内含"等 shape 头"这一次与对端的会合：本方法因此**不是**纯粹的
+        非阻塞提交，调用点必须确保对端确实会发（prefetch 与 producer 的补货 isend 配对，
+        见 colocated_schedule.py 的 4.5b 说明）。
+        The returned request is already started; note ``_start()`` contains one rendezvous
+        with the peer (waiting the shape header), so the caller must ensure the peer sends.
         """
         header = torch.empty(
             (_NUM_FORWARD_FIELDS, _SHAPE_HEADER_LEN), dtype=torch.int64, device="cuda"
@@ -697,14 +728,14 @@ class EncoderBackboneBoundaryCommunicator:
         )
         return _ForwardRecvRequest(
             self, header_handle, header, src_rank, producer, expected_microbatch_id
-        )
+        )._start()
 
     def _start_recv_forward(self, request: "_ForwardRecvRequest") -> object:
-        """Start phase of an async forward receive: wait header, allocate, post data irecv.
+        """Wait the header, allocate the data buffer, post the data irecv.
 
-        前向异步接收的**开始阶段**：等 shape 头（prefetch 时已提交、此刻几乎已到达）→
-        解析 shape 算出总字节数 → 分配数据 buffer → **异步提交数据 irecv（不等待）**，
-        返回数据 handle。数据在 start 到 finish 之间的计算窗口后台传输。
+        前向异步接收的**启动步骤**（由 ``_ForwardRecvRequest._start()`` 调用）：等 shape
+        头 → 解析 shape 算出总字节数 → 分配数据 buffer → **异步提交数据 irecv（不等待）**，
+        返回数据 handle。数据在此到 ``finish()`` 之间的计算窗口后台传输。
         """
         request._header_handle.wait()
         _, total_bytes = ForwardPacket.parse_shape_header(request._header, self.dtype)
@@ -729,6 +760,14 @@ class EncoderBackboneBoundaryCommunicator:
     # 前向：encoder 输出 + 文本数据包从生产者发往消费者。
     # ------------------------------------------------------------------
 
+    # NVTX：四个公开收发方法 + 预热各打一个区间（nsys 时间线上 boundary 收发的位置、
+    # 与计算区间的重叠一眼可见；backbone 1F1B 的 P2P 已由 p2p_communication.py 的
+    # @nvtx_decorator 覆盖，这里补的是共置边界组上的一段）。显式 message 而非默认
+    # 函数路径，与 colocated_schedule.py 的 "colocated-*" 命名一致。
+    # NVTX: one range per public boundary op plus the per-iteration warmup; the backbone
+    # 1F1B P2P is already covered by p2p_communication.py's decorators, this covers the
+    # colocated boundary group. Explicit messages keep the "colocated-*" naming.
+    @nvtx_decorator(message="colocated-boundary-send-forward")
     def colocated_send_forward(
         self,
         packet: ForwardPacket,
@@ -751,6 +790,7 @@ class EncoderBackboneBoundaryCommunicator:
         )
         return self._send_forward_packet(packet, self.consumer_global_rank, wait=wait)
 
+    @nvtx_decorator(message="colocated-boundary-recv-forward")
     def colocated_recv_forward(
         self,
         producer: int,
@@ -761,8 +801,9 @@ class EncoderBackboneBoundaryCommunicator:
 
         消费者：接收生产者 ``producer``（>0）的完整前向数据包（``ForwardPacket``：
         encoder 输出 + 文本字段）。``wait=True``（默认）同步阻塞返回 ``ForwardPacket``；
-        ``wait=False`` 异步提交（只挂 shape 头 irecv），返回 ``_ForwardRecvRequest``
-        （consumer prefetch 用，需要数据时先 ``request.start()`` 再 ``request.finish()``）。
+        ``wait=False`` 异步提交（挂 shape 头 irecv 并立即启动数据 irecv），返回**已启动**
+        的 ``_ForwardRecvRequest``（consumer prefetch 用，需要数据时只调
+        ``request.finish()``）。
         ``expected_microbatch_id`` 与包自带的 microbatch id 校验（按序 take 时用）。
         **producer 0（消费者自己）的包由调用方在本地直接组装（直接构造
         ``ForwardPacket``），
@@ -787,6 +828,7 @@ class EncoderBackboneBoundaryCommunicator:
     # 反向：encoder 输出梯度从消费者发回各生产者（仅梯度一个张量）。
     # ------------------------------------------------------------------
 
+    @nvtx_decorator(message="colocated-boundary-send-backward")
     def colocated_send_backward(
         self, packet: BackwardPacket, producer: int, wait: bool = True
     ) -> Optional[list]:
@@ -809,6 +851,7 @@ class EncoderBackboneBoundaryCommunicator:
         )
         return self._send_backward_packet(packet, self.group_ranks[producer], wait=wait)
 
+    @nvtx_decorator(message="colocated-boundary-recv-backward")
     def colocated_recv_backward(
         self, producer: Optional[int] = None, wait: bool = True
     ) -> Union[BackwardPacket, _GradRecvRequest]:
@@ -817,8 +860,8 @@ class EncoderBackboneBoundaryCommunicator:
         生产者（producer id>0）：从消费者接收本生产者的 encoder 输出梯度
         （``BackwardPacket``，与 colocated_send_forward 对应）。``producer`` 默认取本
         rank 的 producer id。``wait=True``（默认）同步阻塞返回 ``BackwardPacket``；
-        ``wait=False`` 异步提交返回 ``_GradRecvRequest``（producer 补发 step 的
-        forward 前用，需要梯度时先 ``request.start()`` 再 ``request.finish()``）。
+        ``wait=False`` 异步提交返回**已启动**的 ``_GradRecvRequest``（producer 补发 step 的
+        forward 前用，需要梯度时只调 ``request.finish()``）。
         **producer 0（消费者自己）由调用方（wrapper）在调用处分支短路**：其梯度直接
         取本地保留的（反传时已在本 rank），不调用本方法——不发起任何 P2P，网络侧
         配对计数不受影响。

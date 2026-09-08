@@ -631,6 +631,38 @@ def get_model_config(model):
     return get_attr_wrapped_model(model, "config", allow_none=False)
 
 
+# Canonical order of the colocated components. It fixes both the order of the
+# ``model`` list built by the training entry and the order the optimizers are
+# chained in, which the checkpoint ``model{i}`` naming and
+# ``ChainedOptimizer._split_state_dict`` (optimizer.py:1197) rely on. The names
+# themselves are declared as the ``colocated_module_name`` class attribute on the
+# chunks (colocated_llava_model.py:58, :240) - this tuple only pins their order.
+# 共置组件的规范顺序。它同时固定了训练入口构建 ``model`` 列表的顺序与优化器串接的顺序，
+# 而 checkpoint 的 ``model{i}`` 命名与 ``ChainedOptimizer._split_state_dict``
+# （optimizer.py:1197）依赖这个顺序。名字本身由 chunk 的 ``colocated_module_name`` 类属性
+# 声明（colocated_llava_model.py:58、:240），本元组只固定它们的先后。
+COLOCATED_MODULE_NAMES = ("encoder", "language_model")
+
+
+def group_colocated_model_chunks(model):
+    """Group the colocated model chunks by the component they belong to.
+
+    The grouping is read off each chunk's own ``colocated_module_name`` instead of
+    its position in the list, so nothing depends on the concatenation order.
+    Returns a dict keyed by ``COLOCATED_MODULE_NAMES``; every key is present, so
+    callers can index it unconditionally.
+
+    按 chunk 自身声明的 ``colocated_module_name`` 分组，而不是按它在列表中的位置，
+    因此不依赖拼接顺序。返回以 ``COLOCATED_MODULE_NAMES`` 为键的字典，每个键都存在，
+    调用方可以无条件索引。
+    """
+    chunks_per_module = {module_name: [] for module_name in COLOCATED_MODULE_NAMES}
+    for model_chunk in model:
+        module_name = get_attr_wrapped_model(model_chunk, "colocated_module_name")
+        chunks_per_module[module_name].append(model_chunk)
+    return chunks_per_module
+
+
 class GlobalMemoryBuffer:
     """Global buffer to avoid dynamic memory allocations.
     Caller should ensure that buffers of the same name

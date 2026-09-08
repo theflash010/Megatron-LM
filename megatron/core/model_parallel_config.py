@@ -320,6 +320,20 @@ class ModelParallelConfig:
        Helps with saving memory, does nothing when pipeline parallel is not used.
     """
 
+    deallocate_encoder_outputs: bool = False
+    """Colocated encoder training only (Task 4.9): if True, the encoder output of a microbatch is
+       pseudo-deallocated (``.data`` set to a scalar, the autograd graph kept) once the boundary
+       packet has been serialized into the send buffer, so only the flat send buffer holds the
+       values until phase ④ backpropagates through the graph. Requires the phase-④ backward to go
+       through ``custom_backward``. Does nothing without ``use_colocated_encoder``.
+       共置训练专用（Task 4.9）：置 True 时，边界包序列化进发送缓冲后即伪释放 encoder 输出的
+       ``.data``（保留 autograd 图），phase ④ 反传只需要图不需要数据。
+       **参数设置**：与 ``deallocate_pipeline_outputs`` 同款——dataclass 默认 False 只对直接
+       手搓 config 的场景（单测）生效；走 ``megatron.training`` 入口时由
+       ``core_transformer_config_from_args`` 硬编码为 True（arguments.py，yaml 入口同），
+       **没有对应的 CLI 参数**（字段已加进 ``_add_network_size_args`` 的 exclude 名单）。
+    """
+
     defer_embedding_wgrad_compute: bool = False
     """If true, defers the embedding WGRAD GEMMs while pipeline flush is
        taking place enabling us to hide pipeline flush latency. Defaults to False.

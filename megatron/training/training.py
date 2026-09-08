@@ -134,14 +134,20 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     configure_nvtx_profiling,
+    COLOCATED_MODULE_NAMES,
     get_attr_wrapped_model,
     get_model_config,
     get_pg_size,
     get_pg_rank,
+    group_colocated_model_chunks,
     StragglerDetector,
 )
 from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import snapshot_colocated_encoder_rng_tracker
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -176,6 +182,7 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import (
     get_megatron_optimizer,
+    ChainedOptimizer,
     OptimizerConfig,
     ParamKey,
 )
@@ -186,6 +193,7 @@ from megatron.core.rerun_state_machine import (
     RerunMode,
 )
 from megatron.training.initialize import initialize_megatron
+from megatron.training.initialize import _set_random_seed
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
@@ -1036,7 +1044,7 @@ def pretrain(
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
-    model_cfg = get_model_config(model[0]) #获取模型配置
+    model_cfg = get_model_config(get_representative_model_chunk(model)) #获取模型配置（共置下取 backbone 那份，见 get_representative_model_chunk）
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -1308,11 +1316,21 @@ def update_train_iters(args): #将 sample 数反算为 iteration 数
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
-def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
-    """Build the model."""
+def get_model(
+    model_provider_func,
+    model_type=ModelType.encoder_or_decoder,
+    wrap_with_ddp=True,
+    config=None,
+    pg_collection=None,
+    num_distributed_optimizer_instances=None,
+):
+    """Build one model component with its own process groups and DDP settings.
+
+    构建单个模型组件，并使用该组件自己的通信组与 DDP 配置。
+    """
     args = get_args()
     args.model_type = model_type
-    if pg_collection is None:
+    if pg_collection is None: #pg_collection代表本模块的通信组信息
         pg_collection = ProcessGroupCollection.use_mpu_process_groups() #创建pg_collection对象
 
         if args.create_all_gather_group: #是否创建all-gather组（用于通信-通信重叠场景，讲RS和AG流水重叠起来）
@@ -1436,8 +1454,16 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Fp16 conversion.
     if args.fp16 or args.bf16: #对model嵌套fp16/bf16逻辑，混合精度训练
-        config = get_model_config(model[0]) #transformer config
-        model = [Float16Module(config, model_module) for model_module in model]
+        # Every chunk carries its own transformer config (the colocated encoder
+        # chunk holds vision_config while the backbone chunk holds
+        # language_config), so wrap each chunk with its own config instead of
+        # reusing model[0]'s for all of them.
+        # 每个 chunk 自带 transformer config（共置 encoder chunk 持 vision_config、
+        # backbone chunk 持 language_config），因此逐 chunk 用各自的 config 包装，
+        # 不再用 model[0] 的 config 套住所有 chunk。
+        model = [
+            Float16Module(get_model_config(model_module), model_module) for model_module in model
+        ]
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
@@ -1459,8 +1485,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         else: #Megatron 自实现的分布式数据并行，可选分布式优化器use_distributed_optimizer，对应ZeRO-1
             DP = DDP
 
-        config = get_model_config(model[0])
-
         if getattr(args, "use_torch_fsdp2", False):
             reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
             ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
@@ -1475,7 +1499,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 bucket_size = args.ddp_bucket_size #计算桶大小
 
             # Initialize DDPConfig.
-            ddp_config = get_megatron_ddp_config(args) #获取ddp相关配置
+            ddp_config = get_megatron_ddp_config(args) #获取ddp相关配置。除了bucket_size之外，ddp_config其他属性都与模块无关。bucket_size不允许用户指定，只允许计算指定（对于共置多模态，如果通过ddp_num_buckets计算会有问题，因为这个计算是按照参数量来均分的，backbone的参数量可能由于PP存在不一致，这对backbone本身的bucket size没影响，因为同DP组的其他rank也是一样的情况。但是对rank上的encoder会有问题，因为encoder的DP组是所有rank，这会导致encoder的DP组内rank的bucket size不一致，后续如果overlap梯度reduce/参数gather通信会出错）。
+            # The distributed optimizer switch is shared, but each component can divide
+            # its own data-parallel domain into a different number of instances.
+            # DistOpt 总开关由两个组件共享，但每个组件可以用不同的实例数划分自己的 DP 域。
+            if num_distributed_optimizer_instances is not None:
+                ddp_config.num_distributed_optimizer_instances = (
+                    num_distributed_optimizer_instances
+                )
             ddp_config.bucket_size = bucket_size #设置桶大小
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
@@ -1483,9 +1514,23 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
             # ring-reduce implementations are large enough to remain bandwidth-bound rather than
             # latency-bound.
+            # The default bucket size is a function of the data-parallel size, and
+            # that size must come from THIS call's process group collection rather
+            # than from the global mpu state: under colocated encoder training
+            # get_model is called once per component, and the encoder component
+            # reduces over all W ranks while the backbone reduces over the job's
+            # regular dp group. For every other configuration
+            # pg_collection.dp_cp IS the job's regular dp-cp group, so this is an
+            # equivalent rewrite of mpu.get_data_parallel_world_size(
+            # with_context_parallel=True).
+            # 默认桶大小是数据并行 size 的函数，而该 size 必须取自**本次调用**的进程
+            # 组集合，而不是全局 mpu 状态：共置 encoder 训练下 get_model 按组件各调
+            # 一次，encoder 组件的归约域是全部 W 个 rank，backbone 则是作业常规 dp
+            # 组。其余所有配置下 pg_collection.dp_cp 就是作业常规 dp-cp 组，故这是对
+            # mpu.get_data_parallel_world_size(with_context_parallel=True) 的等价改写。
             if ddp_config.bucket_size is None:
                 ddp_config.bucket_size = max(
-                    40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
+                    40000000, 1000000 * get_pg_size(pg_collection.dp_cp)
                 )#如果没有设置，就设置默认值
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce: #不用通算并行，就不做桶的拆分，整批梯度合为一个大桶
@@ -1499,8 +1544,16 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
             # Megatron-FSDP reads dtypes from ddp_config; pass pg_collection for AG/RS overlap.
+            # Standard DDP needs it as well: without it DDP falls back to the
+            # global parallel_state groups (param_and_grad_buffer.py:903-911),
+            # which is wrong for any component whose reduction domain differs
+            # from the job's regular dp group (the colocated encoder replica).
+            # Torch FSDP2 does not accept the argument.
+            # 标准 DDP 也必须收到 pg_collection：不传时 DDP 会回落到 parallel_state
+            # 的全局组（param_and_grad_buffer.py:903-911），对归约域与作业常规 dp 组
+            # 不同的组件（共置 encoder 副本）就是错的。Torch FSDP2 不接受该参数。
             dp_init_kwargs = {}
-            if args.use_megatron_fsdp:
+            if args.use_megatron_fsdp or DP is DDP:
                 dp_init_kwargs["pg_collection"] = pg_collection
 
             wrapped_model = []
@@ -1513,11 +1566,20 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
                 # Pre-compute parameter layouts for the distributed optimizer.
                 # Only pass to DDP; FSDP variants don't accept full_param_layout.
-                if args.use_distributed_optimizer and DP is DDP:
+                if ddp_config.use_distributed_optimizer and DP is DDP:
                     all_params = [
                         p for p in model_chunk.parameters() if p.requires_grad
                     ] #torch.nn.Parameter的集合，代表这个chunk中所有需要优化的参数
-                    pp_rank = mpu.get_pipeline_model_parallel_rank() #获取pp rank
+                    # The layout must use the groups that shard each buffer, rather than
+                    # the full data-parallel groups. With multiple distributed optimizer
+                    # instances, DDP and the optimizer shard dense and expert buffers over
+                    # their respective intra-instance groups.
+                    # layout 必须使用实际切分各 buffer 的通信组，而不是完整数据并行组。
+                    # 多个分布式优化器实例时，DDP 和 optimizer 分别使用各自的 intra
+                    # instance group 对 dense 与 expert buffer 进行切分。
+                    pp_rank = get_pg_rank(pg_collection.pp)
+                    data_parallel_world_size = get_pg_size(pg_collection.intra_dp_cp)
+                    expert_data_parallel_world_size = get_pg_size(pg_collection.intra_expt_dp)
                     effective_bucket_size = (
                         None
                         if disable_bucketing or pp_rank > 0
@@ -1527,23 +1589,28 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                         DistributedOptimizer.compute_full_param_layout(
                             all_params,
                             effective_bucket_size,
-                            mpu.get_data_parallel_world_size(with_context_parallel=True),
+                            data_parallel_world_size,
                             ddp_config,
-                            expert_data_parallel_world_size=(
-                                mpu.get_expert_data_parallel_world_size()
-                            ),
+                            expert_data_parallel_world_size=expert_data_parallel_world_size,
                         )#将param按照BufferKey进行分组，然后对每组param进行确定layout（多少param组成一个bucket），所有layout组成一个完整的param layout方案
                     )
 
                 wrapped_model.append( #对每个model_chunk进行DP封装
                     DP(
-                        config=config,
+                        # Each chunk is wrapped with its own transformer config:
+                        # DDP reads calculate_per_token_loss (for the gradient
+                        # scaling factor) and context_parallel_size from it.
+                        # 逐 chunk 传各自的 transformer config：DDP 会从 config 读
+                        # calculate_per_token_loss（决定梯度缩放因子）与
+                        # context_parallel_size。
+                        config=get_model_config(model_chunk),
                         ddp_config=ddp_config,
                         module=model_chunk,
                         disable_bucketing=disable_bucketing, #是否允许bucket分桶
                         **chunk_kwargs,
                     )#封装DP逻辑
                 )
+
             model = wrapped_model #将DP封装好的model列表返回
         # End of setup_stream
         # Critical: ensure side-stream work completes before touching params on default stream
@@ -1555,6 +1622,219 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 model_module.broadcast_params() #broadcast_params 是 DistributedDataParallel 类的成员方法（distributed_data_parallel.py@L582-597），用于在训练开始时将 rank 0 的参数广播到所有 DP rank。
 
     return model
+
+
+def build_colocated_module_process_groups():
+    """Build the per-module process group collections for colocated training.
+
+    The two components own SEPARATE process groups: the encoder replica reduces
+    its gradients over all W ranks and is neither pipeline- nor context-parallel,
+    while the backbone keeps the job's regular topology.
+
+    Built once per job and passed down to both the model and the optimizer: the
+    calls below only collect or alias existing groups (no new NCCL communicator),
+    but calling this twice would yield two distinct collection objects and make it
+    impossible to assert that DDP and the optimizer were handed the same groups.
+
+    为共置训练构建按模块划分的进程组集合。两个组件拥有**各自独立**的进程组：encoder
+    副本在全部 W 个 rank 上归约梯度、既不做 PP 也不做 CP；backbone 保持作业常规拓扑。
+    整个作业只构造一次，再往下传给建模与建优化器两处：下面的调用只是收集或别名已有的
+    组（不新建 NCCL 通信器），但调两次会得到两个不同的集合对象，导致无法断言 DDP 与
+    优化器拿到的是同一批组。
+    """
+    return MultiModuleProcessGroupCollection(
+        module_pgs={
+            "encoder": mpu.build_colocated_encoder_process_groups(),
+            "language_model": ProcessGroupCollection.use_mpu_process_groups(),
+        },
+        language_model_module_name="language_model",
+    )
+
+def get_colocated_model(model_provider_func, model_type, wrap_with_ddp, module_pg_collection):
+    """Build the colocated model by calling get_model once per component.
+
+    Each component has its own parallel topology, so it gets its own get_model
+    call with its own single-module process group collection. Everything inside
+    get_model (pre/post_process, virtual pipeline handling, bucket size, the
+    distributed-optimizer layout) is then derived from one consistent topology,
+    and the returned chunk lists are simply concatenated - the encoder component
+    contributes exactly one chunk while the backbone contributes one chunk per
+    virtual pipeline stage.
+
+    按组件各调一次 get_model 来构建共置模型。每个组件有自己的并行拓扑，因此各自一次
+    调用、各自传入自己的单模块进程组集合；这样 get_model 内部的一切（pre/post_process、
+    虚拟流水线处理、桶大小、分布式优化器布局）都由**同一份拓扑**推导，两次返回的 chunk
+    列表直接拼接即可——encoder 组件恰好贡献 1 个 chunk，backbone 组件按虚拟流水线
+    stage 数贡献 chunk。
+
+    The concatenation order (encoder first, backbone second) is the convention the
+    checkpoint's per-chunk keys and the optimizer's chunk order rely on, so it
+    must stay stable.
+    拼接顺序（encoder 在前、backbone 在后）是 checkpoint 按 chunk 命名、以及优化器
+    chunk 顺序所依赖的约定，必须保持稳定。
+
+    Each component is also built under ITS OWN random seed. ``_set_random_seed`` offsets
+    the seed by the pipeline rank (initialize.py) so that different pipeline stages -
+    different model shards - do not share a random stream, and ``initialize_megatron``
+    calls it once with the JOB-WIDE (backbone) coordinates before any model exists.
+    That offset is wrong for the encoder: the encoder is REPLICATED over the pipeline
+    dimension, so all P ranks must initialize it identically, and its own pipeline rank
+    (single-member group) is 0 on every rank. Without re-seeding, the P copies of every
+    randomly initialized encoder parameter diverge; the ones the checkpoint provides are
+    then overwritten with identical values and hide the problem, while the ones it does
+    not (``vision_projection``, which only LLaVA's first training stage produces) stay
+    divergent - the encoder replicas drift apart from step 0 and gradient reduction
+    never fixes it, because it synchronizes gradients, not parameters.
+    每个组件还要在**自己的种子**下构建。``_set_random_seed`` 按 pipeline rank 偏移种子
+    （initialize.py），目的是让不同 stage——即不同模型分片——不共用同一条随机流；而
+    ``initialize_megatron`` 在任何模型存在之前就用**作业级（backbone）坐标**调了一次。
+    这个偏移对 encoder 是错的：encoder 在 pipeline 维上是**副本**，P 个 rank 必须初始化
+    出完全相同的参数，而它自己的 pipeline rank（单成员组）在每个 rank 上都是 0。不重设
+    种子的话，encoder 里每个随机初始化的参数都会有 P 份互不相同的拷贝；其中 checkpoint
+    提供的那些随后被同一份数值覆盖、把问题藏起来，checkpoint 没有的那些（``vision_projection``，
+    只有 LLaVA 第一阶段训练才产出它）则保持分叉——各 encoder 副本从第 0 步就开始漂移，
+    而梯度归约只同步梯度、不同步参数，永远纠不回来。
+    """
+    args = get_args()
+    model = []
+    # Task 5.12: each component is seeded under ITS OWN topology. The encoder component
+    # passes is_colocated_encoder=True so ``_set_random_seed`` derives the encoder's own
+    # ranks from the parallel_state getters (its pipeline/expert groups are single-member,
+    # rank 0 everywhere); the backbone passes False and falls back to the job-wide
+    # coordinates, which are exactly its own. That is what keeps the randomly initialized
+    # encoder parameters identical across the P pipeline replicas.
+    # Task 5.12：每个组件都在**自己的拓扑**下设种子。encoder 组件传 is_colocated_encoder=True，
+    # ``_set_random_seed`` 用 parallel_state 的 getter 推导 encoder 自身坐标（其 pipeline /
+    # 专家并行组都是单成员组、处处 rank 0）；backbone 传 False、回落作业级坐标——那恰是它
+    # 自己的。这正是让随机初始化的 encoder 参数在 P 个 pipeline 副本间完全一致的原因。
+    for module_name in COLOCATED_MODULE_NAMES:
+        module_pg = module_pg_collection[module_name]
+        # ``data_parallel_random_init`` stays an option, but each component derives the
+        # dp offset from ITS OWN dp group (the encoder's is the colocated dp group).
+        # ``data_parallel_random_init`` 保留为选项，但每个组件从**自己的** dp 组取偏移
+        # （encoder 取的是共置数据并行组）。
+        _set_random_seed(
+            args.seed,
+            args.data_parallel_random_init,
+            args.te_rng_tracker,
+            args.inference_rng_tracker,
+            use_cudagraphable_rng=args.cuda_graph_impl != "none",
+            is_colocated_encoder=(module_name == "encoder"),
+        )
+        if module_name == "encoder":
+            num_distributed_optimizer_instances = (
+                args.colocated_encoder_num_distributed_optimizer_instances
+            )
+        else:
+            num_distributed_optimizer_instances = args.num_distributed_optimizer_instances
+        model += get_model(
+            functools.partial(model_provider_func, colocated_module=module_name),
+            model_type,
+            wrap_with_ddp=wrap_with_ddp,
+            pg_collection=module_pg,
+            num_distributed_optimizer_instances=num_distributed_optimizer_instances,
+        )
+        if module_name == "encoder":
+            # Freeze the encoder's whole RNG tracker while it still holds the states
+            # seeded from the ENCODER's coordinates. It must happen here, inside the
+            # loop: the backbone's ``_set_random_seed`` below resets the tracker and
+            # re-seeds every named state from the backbone's coordinates, so after the
+            # loop the encoder's version is gone. The snapshot is swapped back in around
+            # the encoder forward (colocated_schedule.py), which is the only way to make
+            # the default-name forks inside the encoder - attention dropout above all
+            # (dot_product_attention.py:217) - resolve to the encoder's stream instead of
+            # the backbone's.
+            # 在 tracker 里还装着按 **encoder 坐标**播下的状态时，把它整体冻结。必须放在
+            # 循环内：下面 backbone 的 ``_set_random_seed`` 会 reset tracker 并按 backbone
+            # 坐标重播所有命名状态，循环结束后 encoder 那份就没了。该快照在 encoder 前传
+            # 期间被换回（colocated_schedule.py）——这是让 encoder 内部那些用默认名 fork 的
+            # 地方（首先是 attention dropout，dot_product_attention.py:217）解析到 encoder
+            # 的流而非 backbone 的流的唯一办法。
+            snapshot_colocated_encoder_rng_tracker()
+    # The backbone is built last, so the random state left behind is the one the
+    # non-colocated path would leave (seed offset by the backbone's pipeline rank).
+    # Anything seeded after model construction therefore matches the baseline.
+    # backbone 最后构建，因此循环结束时残留的随机状态与非共置路径一致（按 backbone 的
+    # pipeline rank 偏移），构建之后再取随机数的地方与基线对齐。
+    return model
+
+
+def get_colocated_optimizer(
+    config,
+    config_overrides,
+    model,
+    module_pg_collection,
+    use_gloo_process_groups,
+    dump_param_to_param_group_map,
+):
+    """Build one optimizer per component and flatten them into ONE ChainedOptimizer.
+
+    A single optimizer covering both components would be wrong, and not because of
+    the distributed optimizer: the only process group a non-distributed optimizer
+    actually uses is the gradient-statistics group (optimizer.py:181-199), which is
+    the ``mp`` group it is handed, and the gradient norm is all-reduced over it
+    (clip_grads.py:133-137). That group must cover exactly the ranks the parameters
+    are partitioned over and none of the ranks holding replicas. The backbone is
+    partitioned over tp x pp, but the ENCODER IS REPLICATED across the pipeline
+    dimension, so its squared norm would be summed P times and the encoder
+    gradients would be over-clipped. Per-component collections give each optimizer
+    the right group (the encoder's ``mp`` is the tp group alone).
+
+    按组件各建一个优化器，再展平成**一层** ChainedOptimizer。单个优化器覆盖两个组件
+    是错的，原因不是分布式优化器：非分布式优化器唯一真正使用的进程组是梯度统计组
+    （optimizer.py:181-199），也就是传给它的 ``mp`` 组，梯度范数就在其上 all-reduce
+    （clip_grads.py:133-137）。该组必须恰好覆盖参数被切分的 rank、不含持有副本的
+    rank。backbone 按 tp x pp 切分，而 **encoder 在 pipeline 维上是副本**，其范数平方
+    会被加 P 次、导致 encoder 梯度被过度裁剪。按组件分开的进程组集合让每个优化器拿到
+    正确的组（encoder 的 ``mp`` 就是 tp 组本身）。
+
+    Both calls share the SAME config object: OptimizerConfig carries no rank or
+    process group fields, and ChainedOptimizer asserts that all sub-optimizers
+    compare equal on it (optimizer.py:1125) - separate deep copies would break on
+    the non-comparable ``timers`` field.
+    两次调用共享**同一个** config 对象：OptimizerConfig 不含任何 rank/进程组字段，且
+    ChainedOptimizer 断言所有子优化器的 config 相等（optimizer.py:1125）——分别
+    deepcopy 会因不可比较的 ``timers`` 字段而断言失败。
+    """
+    chunks_per_module = group_colocated_model_chunks(model)
+    chained_optimizers = []
+    for module_name in COLOCATED_MODULE_NAMES:
+        module_optimizer = get_megatron_optimizer(
+            config,
+            chunks_per_module[module_name],
+            config_overrides=config_overrides,
+            use_gloo_process_groups=use_gloo_process_groups,
+            dump_param_to_param_group_map=dump_param_to_param_group_map,
+            pg_collection=module_pg_collection[module_name],
+        )
+        # Unpack before re-archiving: get_megatron_optimizer always wraps its dense
+        # path in a ChainedOptimizer (optimizer/__init__.py:1075) even for a single
+        # element, and nesting one ChainedOptimizer inside another breaks three
+        # upstream paths: _synchronize_steps reads `optimizer.optimizer`, whose
+        # property asserts a single sub-optimizer (optimizer.py:1140-1142, reached
+        # from sharded_state_dict/load_state_dict); save/load_parameter_state read
+        # `optimizer.data_parallel_group`, which an inner ChainedOptimizer does not
+        # have - and the save side is gated on a hasattr check, so it would SILENTLY
+        # skip the distributed optimizer's parameter state (optimizer.py:1404-1414);
+        # and _split_state_dict would renumber the model{i} keys twice
+        # (optimizer.py:1179-1213). The flattened shape is identical to upstream's
+        # "dense + moe" and "one chunk per virtual pipeline stage" cases.
+        # The iteration order matches COLOCATED_MODULE_NAMES, i.e. the order of the
+        # model list, which _split_state_dict relies on to map chunks to model{i}.
+        # 先解包再归档：get_megatron_optimizer 的 dense 路径恒把结果包进
+        # ChainedOptimizer（optimizer/__init__.py:1075），即使只有一个元素；而把
+        # ChainedOptimizer 嵌套进 ChainedOptimizer 会破坏上游三条路径——
+        # _synchronize_steps 读 `optimizer.optimizer`，该 property 断言只有一个子
+        # 优化器（optimizer.py:1140-1142，经 sharded_state_dict/load_state_dict 到达）；
+        # save/load_parameter_state 读 `optimizer.data_parallel_group`，内层
+        # ChainedOptimizer 没有该属性，而 save 侧以 hasattr 为门 ⇒ 会**静默漏存**
+        # 分布式优化器的参数状态（optimizer.py:1404-1414）；_split_state_dict 会把
+        # model{i} 键重编号两次（optimizer.py:1179-1213）。展平后的形状与上游
+        # "dense + moe"、"每个虚拟流水线 stage 一个 chunk" 完全一致。
+        # 遍历顺序与 COLOCATED_MODULE_NAMES 一致，即与 model 列表顺序一致，
+        # _split_state_dict 正是依赖该顺序把 chunk 映射到 model{i}。
+        chained_optimizers += module_optimizer.chained_optimizers
+    return ChainedOptimizer(chained_optimizers)
 
 
 def get_optimizer_param_scheduler(optimizer):
@@ -1652,6 +1932,54 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
     return DistributedDataParallelConfig(**kwargs) #创建并返回DistributedDataParallelConfig对象
 
 
+def verify_colocated_encoder_replicas(model):
+    """Assert the encoder replicas are bit-identical across the colocated data-parallel group.
+
+    The encoder is a full replica on every rank and lives in P separate files on disk (one
+    per pipeline stage), so a checkpoint whose ViT copies differ - or a random
+    initialization that was not broadcast - makes the replicas diverge from step one.
+    Gradient reduction only synchronizes GRADIENTS, never parameters, so nothing downstream
+    would notice: training runs, the loss looks plausible, and the replicas silently drift.
+
+    断言 encoder 的各副本在共置数据并行组内逐位相同。encoder 在每个 rank 上都是完整副本，
+    而它在磁盘上分散在 P 个文件里（每个 pipeline stage 一份），因此"各份 ViT 拷贝不一致"或
+    "随机初始化没有广播"都会让副本从第一步就分叉。梯度归约只同步**梯度**、从不同步参数，
+    所以后续没有任何环节会发现：训练照跑、loss 看着也正常，副本却在静默漂移。
+
+    The digest is a float64 (sum, sum of squares) pair accumulated in sorted parameter-name
+    order, so identical data yields a bitwise identical digest; comparing MIN against MAX
+    over the group flags any disagreement.
+    摘要是按参数名排序累加出的 float64 (和, 平方和) 对——数据相同则摘要逐位相同；在组内
+    对比 MIN 与 MAX 即可发现任何不一致。
+    """
+    encoder_chunks = group_colocated_model_chunks(model)["encoder"]
+    digest = torch.zeros(2, dtype=torch.float64, device=torch.cuda.current_device())
+    for model_chunk in encoder_chunks:
+        parameters = dict(model_chunk.named_parameters())
+        for name in sorted(parameters):
+            values = parameters[name].detach().double()
+            digest[0] += values.sum()
+            digest[1] += (values * values).sum()
+
+    colocated_data_parallel_group = mpu.get_colocated_data_parallel_group()
+    minimum, maximum = digest.clone(), digest.clone()
+    torch.distributed.all_reduce(
+        minimum, op=torch.distributed.ReduceOp.MIN, group=colocated_data_parallel_group
+    )
+    torch.distributed.all_reduce(
+        maximum, op=torch.distributed.ReduceOp.MAX, group=colocated_data_parallel_group
+    )
+    assert torch.equal(minimum, maximum), (
+        "colocated encoder replicas differ across the colocated data-parallel group: "
+        f"digest (sum, sum of squares) ranges from {minimum.tolist()} to {maximum.tolist()}; "
+        "the per-stage ViT copies in the checkpoint are not identical, or the random "
+        "initialization was not broadcast over this group"
+    )
+    print_rank_0(
+        f" > verified colocated encoder replicas are identical (digest {digest.tolist()})"
+    )
+
+
 def setup_model_and_optimizer(
     model_provider_func,
     model_type,
@@ -1668,7 +1996,18 @@ def setup_model_and_optimizer(
     has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer) #判断是否需要optimizer
     wrap_with_ddp = not skip_optimizer #是否对模型嵌套数据并行逻辑
-    model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp) #获取模型，model会进行混合精度还有数据并行DDP的封装
+    # Colocated encoder training: build the per-component process group collections
+    # once here and hand the same object to both the model and the optimizer.
+    # 共置 encoder 训练：在此处一次性构建按组件划分的进程组集合，并把**同一个对象**
+    # 同时交给建模与建优化器两处。
+    module_pg_collection = None
+    if mpu.is_colocated_encoder_enabled():
+        module_pg_collection = build_colocated_module_process_groups()
+        model = get_colocated_model(
+            model_provider_func, model_type, wrap_with_ddp, module_pg_collection
+        )
+    else:
+        model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp) #获取模型，model会进行混合精度还有数据并行DDP的封装
     unwrapped_model = unwrap_model(model) #剥离模型的wrapper，获取最原始的模型
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
@@ -1693,13 +2032,23 @@ def setup_model_and_optimizer(
             if mup_overrides:
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
 
-        optimizer = get_megatron_optimizer(
-            config,
-            model, #这里传入的是model_chunk列表
-            config_overrides=config_overrides,
-            use_gloo_process_groups=args.use_gloo_process_groups,
-            dump_param_to_param_group_map=args.dump_param_to_param_group_map,
-        )#优化器构建，实际更新参数的组件
+        if module_pg_collection is not None:
+            optimizer = get_colocated_optimizer(
+                config,
+                config_overrides,
+                model,
+                module_pg_collection,
+                use_gloo_process_groups=args.use_gloo_process_groups,
+                dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+            )
+        else:
+            optimizer = get_megatron_optimizer(
+                config,
+                model, #这里传入的是model_chunk列表
+                config_overrides=config_overrides,
+                use_gloo_process_groups=args.use_gloo_process_groups,
+                dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+            )#优化器构建，实际更新参数的组件
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer) #优化器的配套组件，scheduler用于调节学习率 LR 和权重衰减Weight Decay
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
@@ -1770,6 +2119,13 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
+        # The per-chunk key checks happen inside load_checkpoint (it is the only place that
+        # holds the state dict); the cross-replica check needs the model and the colocated
+        # groups, so it belongs here (Task 7.7).
+        # 分 chunk 的键校验在 load_checkpoint 内部完成（只有那里持有 state dict）；跨副本
+        # 校验需要模型与共置进程组，因此放在这里（Task 7.7）。
+        if mpu.is_colocated_encoder_enabled():
+            verify_colocated_encoder_replicas(model)
         one_logger and one_logger.log_metrics(
             {
                 'load_checkpoint_finish_time': one_logger_utils.get_timestamp_in_ms(),
@@ -1838,6 +2194,83 @@ def dummy_train_step(data_iterator):
             # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
             batch = get_batch_on_this_tp_rank(data_iterator)
             batch = get_batch_on_this_cp_rank(batch)
+
+
+def group_model_chunks_by_config(model):
+    """Group model chunks by the config object they share, preserving order.
+
+    ``get_model_config`` returns a REFERENCE to the chunk's own config
+    (core/utils.py:629-631), so writing a runtime callback onto it mutates that
+    chunk's configuration in place. Upstream relies on that implicitly: the
+    writer (``train``) and the reader (the schedules) both go through
+    ``model[0]``, hence necessarily the same object. Colocated training breaks
+    the coincidence - the encoder and the language model deliberately carry
+    different configs (different pipeline / context parallel sizes) and the
+    backbone phase reads its own one - so every runtime callback has to be
+    written onto each distinct config, with the chunk-scoped ones (no_sync /
+    grad_sync / param_sync) restricted to the chunks that config belongs to.
+
+    Grouped by object identity, not equality: configs are dataclasses whose
+    ``__eq__`` compares fields, so two components could compare equal by
+    accident and be collapsed into one group.
+
+    按 chunk 所共享的 config 对象分组，保持原有顺序。
+    ``get_model_config`` 返回的是该 chunk 自己那份 config 的**引用**
+    （core/utils.py:629-631），所以往它上面写运行期回调就是原地改那个 chunk 的配置。
+    上游隐式依赖这一点：写入方（``train``）与读取方（各 schedule）都经由 ``model[0]``，
+    必然是同一个对象。共置训练打破了这个巧合——encoder 与 language model 刻意各带一份
+    config（pipeline / context 并行度不同），而 backbone 相位读的是它自己那份——因此每
+    一份不同的 config 都必须被写入，其中 chunk 粒度的回调（no_sync / grad_sync /
+    param_sync）只挂属于该 config 的 chunk。
+    按**对象身份**而非相等性分组：config 是 dataclass，``__eq__`` 比较各字段，两个组件
+    可能恰好字段全同而被误并成一组。
+    """
+    # {id(config): (config, [chunks that carry that very config])}. Keyed by identity
+    # because a config is a dataclass: it is unhashable (mutable fields) and its __eq__
+    # compares field values, so two components could be collapsed by accident.
+    # {id(config): (config, [持有这份 config 的 chunk 列表])}。用对象身份做键：config 是
+    # dataclass，既不可哈希（有可变字段），其 __eq__ 又是逐字段比较，两个组件可能被误并。
+    chunks_by_config_id = {}
+    for model_chunk in model:
+        chunk_config = get_model_config(model_chunk) #返回的是该 chunk 自己 config 的引用，非拷贝
+        config_id = id(chunk_config)
+        if config_id not in chunks_by_config_id:
+            chunks_by_config_id[config_id] = (chunk_config, []) #首次见到这份 config，建空分组
+        _, config_model_chunks = chunks_by_config_id[config_id] #取出该 config 的 chunk 列表
+        config_model_chunks.append(model_chunk)
+    # VPP 的多个 chunk 共享同一个 config 对象（build_model 逐 chunk 传同一个 config，
+    # training.py:1366），故会归成一组、列表覆盖全部 chunk —— 与改动前逐字节一致。
+    # VPP chunks share one config object (build_model passes the same one, :1366), so they
+    # form a single group whose list spans all chunks - identical to the previous behaviour.
+    return list(chunks_by_config_id.values()) #dict 保持插入序，故分组顺序 = chunk 在 model 里的出现顺序
+
+
+def get_representative_model_chunk(model):
+    """Return the chunk that stands for the whole model (config, process groups).
+
+    Upstream takes ``model[0]`` wherever a single chunk has to represent the job's
+    parallel layout: with virtual pipeline parallelism every chunk carries the same
+    config object and the same process groups, so the position is irrelevant. Under
+    colocated encoder training ``model[0]`` is the encoder chunk, whose config and
+    process groups describe one replica (no pipeline, no context parallelism), so the
+    language model chunk is the only faithful representative. Selecting by the chunk's
+    declared ``colocated_module_name`` rather than by position is what keeps this
+    correct no matter how the model list is ordered (Task 5.7).
+
+    返回代表整个模型（config、进程组）的那个 chunk。上游凡是需要"一个 chunk 代表全局
+    并行布局"的地方都取 ``model[0]``：VPP 下各 chunk 共享同一份 config 与同一组进程组，
+    取哪个都一样。共置 encoder 训练下 ``model[0]`` 是 encoder chunk，它的 config 与进程组
+    描述的是一个副本（无 PP、无 CP），只有 language model chunk 才是忠实的代表。按 chunk
+    自己声明的 ``colocated_module_name`` 取而不是按下标取，才与 model 列表顺序无关（Task 5.7）。
+    """
+    if not mpu.is_colocated_encoder_enabled():
+        return model[0]
+    language_model_chunks = group_colocated_model_chunks(model)["language_model"]
+    assert len(language_model_chunks) > 0, (
+        "colocated training must provide at least one language_model chunk, got "
+        f"{len(model)} chunks with no language_model among them"
+    )
+    return language_model_chunks[0]
 
 
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
@@ -2811,7 +3244,13 @@ def train(
     for model_module in model: #把每个模型分片设置为训练模式
         model_module.train()
 
-    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection") #获取模型的通信组信息
+    # 用于日志的代表性进程组集合：共置下必须取 language model chunk 那份（encoder 的
+    # 进程组描述的是一个副本，无 PP、无 CP），取法见 get_representative_model_chunk。
+    # The representative collection used for logging: under colocated training it must come
+    # from the language model chunk, see get_representative_model_chunk.
+    model_pg_collection = get_attr_wrapped_model(
+        get_representative_model_chunk(model), "pg_collection"
+    ) #获取模型的通信组信息
 
     # Tracking loss.
     total_loss_dict = {} #累计 loss 容器
@@ -2841,25 +3280,47 @@ def train(
     num_floating_point_operations_so_far = args.num_floating_point_operations_so_far #FLOPs 计数器
 
     # Setup some training config params.
-    config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None #将config的梯度缩放函数（混合精度的 loss scale 相关）设置为optimizer.scale_loss
-    config.timers = timers
-    if isinstance(model[0], (megatron_FSDP, DDP)) and args.overlap_grad_reduce: #overlap_grad_reduce（梯度规约与反向重叠）
-        assert config.no_sync_func is None, (
-            'When overlap_grad_reduce is True, config.no_sync_func must be None; '
-            'a custom no_sync_func is not supported when overlapping grad-reduce'
+    # 运行期回调必须写到**每一份**不同的 chunk config 上（原理见
+    # group_model_chunks_by_config 的 docstring）：非共置下只有一份，行为与上游逐字节相同；
+    # 共置下 encoder 与 backbone 各一份，漏掉 backbone 那份会让它的梯度收尾（DP 归约 +
+    # per-token 归一化）整段被跳过（colocated_schedule.py 的 finalize 门），且
+    # overlap_grad_reduce 下拿不到 no_sync。
+    # Runtime callbacks must be written onto EVERY distinct chunk config; with a single
+    # config this is byte-for-byte the upstream behaviour.
+    for chunk_config, config_model_chunks in group_model_chunks_by_config(model):
+        chunk_config.grad_scale_func = ( #梯度缩放函数（混合精度的 loss scale 相关）
+            optimizer.scale_loss if optimizer is not None else None
         )
-        config.no_sync_func = [model_chunk.no_sync for model_chunk in model] #把每个 model chunk 的 no_sync 上下文管理器收集成 list 挂到 config.no_sync_func
-        if len(model) == 1:
-            config.no_sync_func = config.no_sync_func[0] #如果只有一个 model chunk，就直接挂到 config.no_sync_func 上
-        if args.align_grad_reduce:
-            config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model] #把每个 chunk 的 start_grad_sync（主动发起所有 bucket 的梯度规约，param_and_grad_buffer.py:517）挂为 config.grad_sync_func
-            if len(model) == 1:
-                config.grad_sync_func = config.grad_sync_func[0] #如果只有一个 model chunk，就直接挂到 config.grad_sync_func 上
-    if args.overlap_param_gather and args.align_param_gather: #overlap_param_gather（参数聚合与前向重叠），align_param_gather只在interleave里使用
-        config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model] #把每个 chunk 的 start_param_sync（主动发起所有 bucket 的参数聚合）挂为 config.param_sync_func
-        if len(model) == 1:
-            config.param_sync_func = config.param_sync_func[0] #如果只有一个 model chunk，就直接挂到 config.param_sync_func 上
-    config.finalize_model_grads_func = finalize_model_grads #设置梯度收尾函数
+        chunk_config.timers = timers
+        if (
+            isinstance(config_model_chunks[0], (megatron_FSDP, DDP))
+            and args.overlap_grad_reduce
+        ): #overlap_grad_reduce（梯度规约与反向重叠）
+            assert chunk_config.no_sync_func is None, (
+                'When overlap_grad_reduce is True, config.no_sync_func must be None; '
+                'a custom no_sync_func is not supported when overlapping grad-reduce'
+            )
+            # chunk 粒度的回调只挂属于本 config 的 chunk：共置下 backbone 相位只管自己那个
+            # chunk，把 encoder 的也挂上会让它在错误的 chunk 上开关梯度同步。
+            # Chunk-scoped callbacks cover only the chunks of this very config.
+            chunk_config.no_sync_func = [
+                model_chunk.no_sync for model_chunk in config_model_chunks
+            ]
+            if len(config_model_chunks) == 1:
+                chunk_config.no_sync_func = chunk_config.no_sync_func[0] #单 chunk 则直接挂函数本身
+            if args.align_grad_reduce:
+                chunk_config.grad_sync_func = [
+                    model_chunk.start_grad_sync for model_chunk in config_model_chunks
+                ]
+                if len(config_model_chunks) == 1:
+                    chunk_config.grad_sync_func = chunk_config.grad_sync_func[0]
+        if args.overlap_param_gather and args.align_param_gather: #align_param_gather 只在 interleaved 里使用
+            chunk_config.param_sync_func = [
+                model_chunk.start_param_sync for model_chunk in config_model_chunks
+            ]
+            if len(config_model_chunks) == 1:
+                chunk_config.param_sync_func = chunk_config.param_sync_func[0]
+        chunk_config.finalize_model_grads_func = finalize_model_grads #设置梯度收尾函数
 
     if args.log_energy:
         energy_monitor.setup()
@@ -2969,8 +3430,14 @@ def train(
         disable_forward_pre_hook(model, param_sync=False) #移除模型上的 forward pre-hook
         # Also remove param_sync_func temporarily so that sync calls made in
         # `forward_backward_func` are no-ops.
-        param_sync_func = config.param_sync_func #把原回调存到局部变量，再置 None
-        config.param_sync_func = None
+        # 逐份 config 暂存再置空（共置下有两份，见 group_model_chunks_by_config）。
+        # Stash and clear per config (colocated training carries one per component).
+        saved_param_sync_func_per_config = [
+            (chunk_config, chunk_config.param_sync_func)
+            for chunk_config, _ in group_model_chunks_by_config(model)
+        ]
+        for chunk_config, _ in saved_param_sync_func_per_config:
+            chunk_config.param_sync_func = None
         pre_hook_enabled = False #更新追踪标志
     # Also, check weight hash across DP replicas to be very pedantic.
     if args.check_weight_hash_across_dp_replicas_interval is not None: #DP 副本间权重哈希校验（防御性检查）
@@ -3155,7 +3622,8 @@ def train(
                 # `forward_backward_func`.
                 if should_disable_forward_pre_hook(args):
                     enable_forward_pre_hook(model) #注册 forward pre-hook
-                    config.param_sync_func = param_sync_func #恢复 L2972 暂存的 param_sync_func
+                    for chunk_config, saved_param_sync_func in saved_param_sync_func_per_config:
+                        chunk_config.param_sync_func = saved_param_sync_func #恢复上面暂存的 param_sync_func
                     pre_hook_enabled = True #更新追踪标志
                     # Set the manual hooks here since it's not set right after the capturing.
                     if (
@@ -3402,6 +3870,14 @@ def evaluate(
 
     total_loss_dict = {}
 
+    # 共置下 model chunk 有两份 config，下面的计时开关要逐份操作（否则 backbone 相位会在
+    # eval 期间继续计时）。非共置下这个列表只有一个元素，等价于原来直接用单个 config。
+    # With colocated training the chunks carry one config per component, so the timer
+    # switch below has to touch every one of them.
+    model_chunk_configs = [
+        chunk_config for chunk_config, _ in group_model_chunks_by_config(model)
+    ]
+
     # make validation batch size independent from training batch size
     eval_batch_size = args.eval_global_batch_size
     eval_micro_batch_size = args.eval_micro_batch_size
@@ -3434,7 +3910,8 @@ def evaluate(
                 print_rank_0(f'Evaluating iter {iteration}/{eval_iters}')
 
             # Don't care about timing during evaluation
-            config.timers = None
+            for chunk_config in model_chunk_configs:
+                chunk_config.timers = None
             ft_integration.on_eval_step_start()
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
@@ -3448,7 +3925,8 @@ def evaluate(
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             )
             ft_integration.on_eval_step_end()
-            config.timers = get_timers()
+            for chunk_config in model_chunk_configs:
+                chunk_config.timers = get_timers()
 
             # Empty unused memory
             if args.empty_unused_memory_level >= 1:

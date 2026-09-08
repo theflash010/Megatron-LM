@@ -40,6 +40,7 @@ from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
+    group_colocated_model_chunks,
     to_local_if_dtensor,
     unwrap_model,
 )
@@ -69,13 +70,96 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
         return calc_dtensor_params_l2_norm(params)
 
-    # Seperate moe and dense params
+    # The collection and the reduction are done PER COMPONENT, because the process group
+    # a component's squared norm must be summed over is a property of that component:
+    # it has to cover exactly the ranks the parameters are partitioned over and none of
+    # the ranks holding replicas. Under colocated training the encoder is replicated
+    # across the pipeline dimension (and across the whole colocated data-parallel group),
+    # so summing it over the job's tensor x pipeline group would count it P times.
+    # This mirrors how the optimizer already handles the gradient norm: one optimizer per
+    # component, each with its own gradient-statistics group, combined by
+    # sqrt(sum of squares) in ChainedOptimizer.get_grad_norm (optimizer.py:1322-1327).
+    #
+    # 收集与归约都**按组件**进行：一个组件的范数平方该在哪个组上求和，是该组件自身的属性
+    # ——组必须恰好覆盖参数被**切分**的 rank、不含持有副本的 rank。共置训练下 encoder 在
+    # pipeline 维（以及整个共置数据并行组）上是副本，若按作业的 tp × pp 组求和会把它算 P 次。
+    # 这与优化器对梯度范数的处理同构：按组件各建一个优化器、各带自己的梯度统计组，最后由
+    # ChainedOptimizer.get_grad_norm（optimizer.py:1322-1327）以 sqrt(平方和) 合并。
+    if mpu.is_colocated_encoder_enabled():
+        chunks_per_module = group_colocated_model_chunks(model)
+        # encoder: partitioned over its tensor-parallel group only; its distributed-optimizer
+        # sharding domain is the colocated data-parallel group (all W ranks). It never holds
+        # expert parameters, so the expert group is passed as the dense one - the "groups are
+        # equal" branch then adds a zero and issues a single all-reduce.
+        # encoder：只沿自身张量并行组切分；分布式优化器变体下的分片域是共置数据并行组（全 W）。
+        # 它不含专家参数，故专家组直接传 dense 组——"两组相同"分支会加一个 0 并只做一次 all_reduce。
+        encoder_tensor_group = mpu.get_colocated_encoder_tensor_model_parallel_group()
+        norm_2 = _component_params_norm_squared(
+            chunks_per_module["encoder"],
+            args,
+            force_create_fp32_copy,
+            dense_reduce_group=encoder_tensor_group,
+            expert_reduce_group=encoder_tensor_group,
+            sharded_reduce_group=mpu.get_colocated_data_parallel_group(),
+        )
+        # backbone: the regular partitioning, i.e. the job's own groups.
+        # backbone：常规切分，用作业自身的组。
+        norm_2 = norm_2 + _component_params_norm_squared(
+            chunks_per_module["language_model"],
+            args,
+            force_create_fp32_copy,
+            dense_reduce_group=mpu.get_model_parallel_group(),
+            expert_reduce_group=mpu.get_expert_tensor_model_pipeline_parallel_group(),
+            sharded_reduce_group=mpu.get_data_parallel_group(with_context_parallel=True),
+        )
+        return norm_2.item() ** 0.5
+
+    norm_2 = _component_params_norm_squared(
+        model,
+        args,
+        force_create_fp32_copy,
+        dense_reduce_group=mpu.get_model_parallel_group(),
+        expert_reduce_group=mpu.get_expert_tensor_model_pipeline_parallel_group(),
+        sharded_reduce_group=mpu.get_data_parallel_group(with_context_parallel=True),
+    )
+    return norm_2.item() ** 0.5
+
+
+def _component_params_norm_squared(
+    model_chunks,
+    args,
+    force_create_fp32_copy,
+    dense_reduce_group,
+    expert_reduce_group,
+    sharded_reduce_group,
+):
+    """Sum of squares of one component's parameters, reduced over that component's groups.
+
+    This is the body ``calc_params_l2_norm`` used to inline, with the three reduction
+    groups turned into arguments so that each component can be given the groups its own
+    parameters are partitioned over. The returned value is the SQUARED norm, so callers
+    can add several components up before taking the square root.
+
+    这是原先内联在 ``calc_params_l2_norm`` 里的函数体，只是把三个归约组提成参数，让每个组件
+    都能拿到"自己的参数被切分在哪些 rank 上"对应的组。返回的是范数的**平方**，便于调用方把
+    多个组件相加后再开方。
+
+    Three parameter kinds are kept apart because they are partitioned differently:
+      * dense - partitioned over ``dense_reduce_group``;
+      * expert (MoE) - partitioned over ``expert_reduce_group``;
+      * parameters whose fp32 main copy is sharded by the distributed optimizer
+        (``main_param_sharded``) - partitioned over ``sharded_reduce_group`` as well, so
+        they are summed there first and then enter the dense reduction.
+    三类参数分开处理，因为它们的切分方式不同：dense 沿 ``dense_reduce_group`` 切分；专家参数沿
+    ``expert_reduce_group`` 切分；fp32 主副本被分布式优化器切开的参数（``main_param_sharded``）
+    还额外沿 ``sharded_reduce_group`` 切分，故先在该组上求和、再并入 dense 的归约。
+    """
     params_data = []
     moe_params_data = []
     sharded_params_data = []
     data_parallel_group = None
 
-    for model_chunk in model:
+    for model_chunk in model_chunks:
         for param in model_chunk.parameters():
             data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
             is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
@@ -131,8 +215,8 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         )
 
     # Add norm contribution from params with sharded main_params. These norms need to be
-    # accumulated across the DP group since the main parameters are sharded because
-    # of distributed optimizer.
+    # accumulated across the sharding domain because the main parameters are sharded by
+    # the distributed optimizer.
     if len(sharded_params_data) > 0:
         dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
         sharded_norm, _ = multi_tensor_applier(
@@ -144,12 +228,11 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         sharded_norm_2 = sharded_norm * sharded_norm
     else:
         sharded_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
-    # Sum over all DP groups, including CP since distributed optimizer state is
-    # sharded jointly over DP+CP.
+    # Reduced unconditionally, including when this rank contributed nothing: skipping the
+    # collective on a subset of the ranks would hang.
+    # 无条件归约（即使本 rank 没有贡献）：只在部分 rank 上跳过集合操作会挂死。
     torch.distributed.all_reduce(
-        sharded_norm_2,
-        op=torch.distributed.ReduceOp.SUM,
-        group=mpu.get_data_parallel_group(with_context_parallel=True)
+        sharded_norm_2, op=torch.distributed.ReduceOp.SUM, group=sharded_reduce_group
     )
     norm_2 += sharded_norm_2
 
@@ -169,12 +252,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     else:
         moe_norm_2 = torch.zeros_like(norm_2)
 
-    # Reduce norm across model parallel groups (dense and expert).
-    # Dense params should sum across all model-parallel GPUs (tensor + pipeline).
-    dense_reduce_group = mpu.get_model_parallel_group()
     ranks_in_dense_reduce_group = torch.distributed.get_process_group_ranks(dense_reduce_group)
-    # Expert params should sum across all model-parallel GPUs (expert + tensor + pipeline).
-    expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
     ranks_in_expert_reduce_group = torch.distributed.get_process_group_ranks(expert_reduce_group)
 
     # If dense and expert reduce groups are the same, sum then reduce.
@@ -193,7 +271,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         )
         norm_2 += moe_norm_2
 
-    return norm_2.item() ** 0.5
+    return norm_2
 
 
 def calc_dtensor_params_l2_norm(params):

@@ -9,6 +9,7 @@ backbone 走 1F1B PP）。原 ``llava_model.py`` 保持不变，作为逻辑参�
 ``language_model``）与 LLaVAModel 保持一致，保证 checkpoint 直接兼容。
 """
 
+from functools import partial
 from typing import List, Optional
 
 import torch
@@ -18,6 +19,8 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.models.multimodal.llava_model import (
     DEFAULT_IMAGE_TOKEN_INDEX,
     IGNORE_INDEX,
+    _load_state_dict_hook_ignore_extra_state,
+    _load_state_dict_hook_ignore_param_names,
     pixel_shuffle,
 )
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel
@@ -49,6 +52,14 @@ class ColocatedViTEncoder(MegatronModule):
     combined_embeddings 组装都在 backbone 的 pp0 上完成（见 ColocatedGPTBackbone）。
     """
 
+    # Name this chunk is registered under in the MultiModuleProcessGroupCollection
+    # built for colocated training. The training entry looks the name up on the
+    # chunk itself so that nothing depends on the order in which the model
+    # provider returns the chunks.
+    # 本 chunk 在共置训练的 MultiModuleProcessGroupCollection 中登记的模块名。
+    # 训练入口从 chunk 自身读取该名字，因此不依赖 model provider 返回 chunk 的顺序。
+    colocated_module_name = "encoder"
+
     def __init__(
         self,
         vision_transformer_config: TransformerConfig,
@@ -57,6 +68,7 @@ class ColocatedViTEncoder(MegatronModule):
         vision_projection_config: TransformerConfig,
         vision_projection_layer_spec: ModuleSpec,
         vision_projection_type: str = "mlp",
+        allow_missing_vision_projection_checkpoint: bool = False,
         img_h: int = 336,
         img_w: int = 336,
         patch_dim: int = 14,
@@ -164,6 +176,46 @@ class ColocatedViTEncoder(MegatronModule):
             tp_group=self.pg_collection.tp,
         )
 
+        # Checkpoint-loading hooks, both registered on the chunk itself. A post hook
+        # receives the *shared* incompatible_keys of the whole load_state_dict call
+        # (torch runs each module's hooks with the same namedtuple), so registering on
+        # the chunk covers vision_model and vision_projection in one place - unlike
+        # LLaVAModel, which registers them on vision_projection (llava_model.py:354-369)
+        # because only that sub-module needed them there.
+        # 两个加载钩子都注册在 chunk 自身上。post hook 收到的是整次 load_state_dict
+        # **共享**的 incompatible_keys（torch 用同一个 namedtuple 调用每个 module 的钩子），
+        # 所以注册在 chunk 上即可同时覆盖 vision_model 与 vision_projection——而
+        # LLaVAModel 注册在 vision_projection 上（llava_model.py:354-369），是因为
+        # 那里只有该子模块需要。
+        #
+        # 1) _extra_state: mcore's own ColumnParallelLinear / RowParallelLinear define
+        #    get_extra_state() -> None to stay compatible with TE state dicts
+        #    (tensor_parallel/layers.py:1113-1118, :1375-1380), so every linear layer
+        #    expects a _extra_state key. The CLIP converter only writes those keys with
+        #    --use-te (clip_converter.py:118-127), and this project deliberately does not
+        #    use TE, so the ViT weights lack them and a strict load would report them as
+        #    missing keys.
+        # 1) _extra_state：mcore 自己的 ColumnParallelLinear / RowParallelLinear 定义了
+        #    get_extra_state() 返回 None 以兼容 TE 的 state dict（tensor_parallel/layers.py
+        #    :1113-1118、:1375-1380），于是每个线性层都期望有一个 _extra_state 键。而
+        #    clip_converter 只在 --use-te 时才写这组键（clip_converter.py:118-127），本项目
+        #    刻意不用 TE ⇒ ViT 权重里没有它们，strict 加载会把它们记成缺失键。
+        self.register_load_state_dict_post_hook(_load_state_dict_hook_ignore_extra_state)
+
+        # 2) vision_projection: absent from pretrained CLIP weights (LLaVA trains the
+        #    projection from scratch in its first stage). Off by default so that a real
+        #    missing-weight bug is not hidden.
+        # 2) vision_projection：预训练 CLIP 权重里没有它（LLaVA 第一阶段才训 projection）。
+        #    默认关闭，避免把"真的漏了权重"这类 bug 藏起来。
+        if allow_missing_vision_projection_checkpoint:
+            vision_projection_param_names = [
+                f"vision_projection.{name}"
+                for name in self.vision_projection.state_dict().keys()
+            ]
+            self.register_load_state_dict_post_hook(
+                partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
+            )
+
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """Encoder-only forward: images -> image_embeddings.
 
@@ -223,6 +275,14 @@ class ColocatedGPTBackbone(MegatronModule):
     组装逻辑在 2.4 迁入。中间/末 stage 走 GPTModel 既有路径（P2P 激活注入）。
     """
 
+    # Name this chunk is registered under in the MultiModuleProcessGroupCollection
+    # built for colocated training; it is also the collection's language model
+    # module, i.e. the one whose process groups represent the job's regular
+    # tp/pp/dp topology.
+    # 本 chunk 在共置训练的 MultiModuleProcessGroupCollection 中登记的模块名，同时
+    # 也是该集合的 language model 模块——它的进程组代表作业常规的 tp/pp/dp 拓扑。
+    colocated_module_name = "language_model"
+
     def __init__(
         self,
         language_transformer_config: TransformerConfig,
@@ -259,6 +319,14 @@ class ColocatedGPTBackbone(MegatronModule):
 
         self.pre_process = pre_process
         self.post_process = post_process
+
+        # This attribute is needed to check if an all-reduce is required
+        # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
+        # backbone 的 pg_collection 带着真实的 embedding 组（首/末 stage 两个成员），
+        # 所以 ``_allreduce_embedding_grad``（finalize_model_grads.py:226-246）一定会走进来、
+        # 在**本 chunk 顶层**取这个属性与下面那个方法；缺了就是 AttributeError。
+        # 与 LLaVAModel 的做法一致（llava_model.py:186-188 / :389-393）。
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
 
         self.language_model = GPTModel(
             config=language_transformer_config,
@@ -307,6 +375,15 @@ class ColocatedGPTBackbone(MegatronModule):
         # 交接属性——展开 labels/loss_mask 改由 forward 返回 3 元组，经
         # ``colocated_forward_step`` 的 ``intra_packet`` 载体与 schedule 交接（模型
         # 不再充当 schedule mailbox）。
+
+    def shared_embedding_or_output_weight(self):
+        """Surface the language model's word embeddings for grad all-reduce.
+
+        ``finalize_model_grads._get_shared_word_embedding_weight``（finalize_model_grads.py:146-147）
+        在 ``share_embeddings_and_output_weights`` 为真时调这个方法拿那个共享参数矩阵。
+        与 LLaVAModel.shared_embedding_or_output_weight（llava_model.py:389-393）一致。
+        """
+        return self.language_model.shared_embedding_or_output_weight()
 
     def set_input_tensor(self, input_tensor) -> None:
         """Set model chunk input tensor (PP schedule entry point).

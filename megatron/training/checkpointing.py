@@ -39,7 +39,13 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import get_pg_rank, get_pg_size, get_torch_version, is_torch_min_version
+from megatron.core.utils import (
+    get_attr_wrapped_model,
+    get_pg_rank,
+    get_pg_size,
+    get_torch_version,
+    is_torch_min_version,
+)
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -1610,6 +1616,97 @@ def load_args_from_checkpoint(
     return args, checkpoint_args
 
 
+def _check_colocated_chunk_keys(ddp_model, state_dict):
+    """Validate the per-chunk keys of a colocated checkpoint before loading them.
+
+    Three guards, all aimed at failures that are otherwise SILENT:
+
+
+    1. ``model{i}`` is positional, so a change in the chunk concatenation order
+       (``get_colocated_model`` builds ``[encoder] + backbone_chunks``) would load the
+       encoder weights into the backbone chunk and vice versa. The checkpoint therefore
+       carries ``colocated_chunk_modules`` - the component name per index - which is
+       compared here against what each chunk declares about itself
+       (``colocated_module_name``), i.e. by identity rather than by position.
+    2. The generic loop treats a missing ``model{i}`` as "an empty stage" and skips it
+       (see the caller). Under colocated training every chunk is non-empty, so a missing
+       key means the checkpoint was built wrong and the weights would stay at their
+       random initialization without any error.
+    3. Per-chunk key SETS must match, because a strict load failure is downgraded to
+       ``strict=False`` with only a printed line (see ``load_model_state_dict`` below), so
+       misnamed keys would also stay silent. ``_extra_state`` (and the vision projection
+       when ``--allow-missing-vision-projection-checkpoint`` is set) is allowed to differ.
+
+    加载共置 checkpoint 的分 chunk 权重前做校验，两条都针对"否则会静默发生"的失败：
+    ① ``model{i}`` 是**按位置**的，一旦 chunk 拼接顺序变化，encoder 的权重就会被塞进
+    backbone chunk（反之亦然）。因此 checkpoint 里带了 ``colocated_chunk_modules``
+    （下标 ↔ 组件名），这里与每个 chunk 自身声明的 ``colocated_module_name`` 比对，
+    即**按身份**而非按位置校验。
+    ② 通用循环把缺失的 ``model{i}`` 当成"空 stage"直接跳过（见调用方），而共置下每个
+    chunk 都非空，缺键意味着 checkpoint 造错了，且参数会留在随机初始化上、不报任何错。
+
+    Only runs for colocated training; a checkpoint without the metadata (e.g. one produced
+    before this guard existed) is reported instead of silently accepted.
+    仅在共置训练下执行；没有该元数据的 checkpoint 会被明确报出，而不是静默接受。
+    """
+    if not mpu.is_colocated_encoder_enabled():
+        return
+
+    chunk_modules = [
+        get_attr_wrapped_model(model_chunk, 'colocated_module_name')
+        for model_chunk in ddp_model
+    ]
+    expected_chunk_modules = state_dict.get('colocated_chunk_modules')
+    assert expected_chunk_modules is not None, (
+        'colocated checkpoint is missing the "colocated_chunk_modules" metadata, so the '
+        f'per-chunk keys cannot be validated against the model chunks {chunk_modules}; '
+        'regenerate it with colocated/combine_colocated_checkpoints.py'
+    )
+    assert list(expected_chunk_modules) == chunk_modules, (
+        f'colocated checkpoint chunk order {list(expected_chunk_modules)} does not match the '
+        f'model chunk order {chunk_modules}; loading it would put one component\'s weights '
+        'into the other component'
+    )
+
+    missing_chunk_keys = [
+        'model%d' % i for i in range(len(ddp_model)) if 'model%d' % i not in state_dict
+    ]
+    assert not missing_chunk_keys, (
+        f'colocated checkpoint is missing {missing_chunk_keys}; every colocated chunk is '
+        'non-empty, so those chunks would silently keep their random initialization'
+    )
+
+    # Guard 3: compare the key SETS per chunk. `load_model_state_dict` retries with
+    # strict=False and only prints when the strict load raises, so a name mismatch would
+    # leave those parameters at their random initialization without failing. Comparing key
+    # names (not tensors) is cheap and catches it before the load happens.
+    # 第三条：逐 chunk 比对**键集合**。`load_model_state_dict` 在 strict 加载抛异常时会改用
+    # strict=False 重试且只打印一行，于是名字不匹配的参数会留在随机初始化上而不失败。
+    # 只比键名（不比张量）代价极低，且能在加载发生之前就抓住。
+    args = get_args()
+    for i, model_chunk in enumerate(ddp_model):
+        expected_names = set(get_attr_wrapped_model(model_chunk, 'state_dict')().keys())
+        checkpoint_names = set(state_dict['model%d' % i].keys())
+        missing_names = expected_names - checkpoint_names
+        unexpected_names = checkpoint_names - expected_names
+        # `_extra_state` is a TE-compatibility placeholder whose value is always None
+        # (tensor_parallel/layers.py:1113-1118), so it is allowed to be absent.
+        # `_extra_state` 是兼容 TE 的占位键、值恒为 None（tensor_parallel/layers.py:1113-1118），
+        # 允许缺失。
+        missing_names = {name for name in missing_names if 'extra_state' not in name}
+        unexpected_names = {name for name in unexpected_names if 'extra_state' not in name}
+        if getattr(args, 'allow_missing_vision_projection_checkpoint', False):
+            missing_names = {
+                name for name in missing_names if not name.startswith('vision_projection.')
+            }
+        assert not missing_names and not unexpected_names, (
+            f'colocated chunk {i} ({chunk_modules[i]}) does not match "model{i}" in the '
+            f'checkpoint: {len(missing_names)} missing name(s) '
+            f'{sorted(missing_names)[:5]}, {len(unexpected_names)} unexpected name(s) '
+            f'{sorted(unexpected_names)[:5]}'
+        )
+
+
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
                     checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
     """Load a model checkpoint and return the iteration.
@@ -1904,6 +2001,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         if len(ddp_model) == 1: #只有一个模型分片
             load_model_state_dict(ddp_model[0], state_dict['model'], strict)
         else: #如果有多个模型分片
+            _check_colocated_chunk_keys(ddp_model, state_dict)
             for i in range(len(ddp_model)):
                 # If there is no corresponding model in the state_dict, it will be ignored.
                 # It means that this is an empty stage.

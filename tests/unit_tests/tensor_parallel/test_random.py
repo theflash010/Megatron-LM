@@ -7,9 +7,11 @@ from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CudaRNGStatesTracker,
     checkpoint,
+    colocated_encoder_rng_tracker,
     convert_cuda_rng_state,
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
+    snapshot_colocated_encoder_rng_tracker,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -184,6 +186,91 @@ def test_model_parallel_cuda_manual_seed():
     rng_tracker = get_cuda_rng_tracker()
     assert rng_tracker.get_states()['model-parallel-rng'] is not None
     Utils.destroy_model_parallel()
+
+
+def test_colocated_encoder_rng_tracker_isolation():
+    """Task 5.12: the encoder's snapshotted tracker survives a later re-seed.
+
+    This is the whole point of snapshotting a TRACKER instead of registering one extra
+    named state: ``model_parallel_cuda_manual_seed`` resets the tracker and re-seeds
+    every named state on each call, so the component seeded LAST (the backbone) owns
+    "model-parallel-rng". After the snapshot, the context manager must hand out the
+    ENCODER's version of that name - the one used by every default-name fork inside the
+    encoder forward, attention dropout above all.
+    Task 5.12：快照下来的 encoder tracker 必须扛得住之后的重新播种。这正是"快照整个
+    tracker"而非"多注册一个命名状态"的意义：``model_parallel_cuda_manual_seed`` 每次调用
+    都 reset tracker 并重播所有命名状态，因此**最后**播种的组件（backbone）占有
+    "model-parallel-rng"。快照之后，上下文管理器必须交出 **encoder** 那一版——它才是
+    encoder 前传里所有默认名 fork（首先是 attention dropout）实际使用的那条流。
+    """
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        # Seed as the encoder component would, then freeze the tracker.
+        # 先按 encoder 组件的方式播种，然后冻结 tracker。
+        model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+        with get_cuda_rng_tracker().fork():
+            encoder_reference_sample = torch.randn(64, device="cuda", dtype=torch.float32)
+        model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+        snapshot_colocated_encoder_rng_tracker()
+
+        # Re-seed as the backbone component would; this wipes and re-registers every
+        # named state, so the live tracker no longer holds the encoder's version.
+        # 再按 backbone 组件的方式重新播种：所有命名状态被清空并重播，活动 tracker 里
+        # 已经不是 encoder 那一版了。
+        model_parallel_cuda_manual_seed(456)
+        with get_cuda_rng_tracker().fork():
+            backbone_sample = torch.randn(64, device="cuda", dtype=torch.float32)
+        assert not torch.equal(backbone_sample, encoder_reference_sample), (
+            "the backbone re-seed must change the default-name stream; otherwise this "
+            "test cannot tell the two trackers apart"
+        )
+
+        # Inside the context the default-name fork must resolve to the ENCODER's stream.
+        # 在上下文内，默认名 fork 必须解析到 **encoder** 的流。
+        with colocated_encoder_rng_tracker():
+            with get_cuda_rng_tracker().fork():
+                encoder_sample = torch.randn(64, device="cuda", dtype=torch.float32)
+        assert torch.equal(encoder_sample, encoder_reference_sample), (
+            "the colocated encoder tracker must keep the states seeded from the "
+            "encoder's own coordinates, not the backbone's"
+        )
+
+        # The caller's tracker must be restored exactly on exit.
+        # 退出后调用方的 tracker 必须被精确还原。
+        with get_cuda_rng_tracker().fork():
+            backbone_sample_after = torch.randn(64, device="cuda", dtype=torch.float32)
+        assert not torch.equal(backbone_sample_after, encoder_sample), (
+            "leaving the context must restore the caller's tracker"
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_colocated_encoder_rng_tracker_advances_across_calls():
+    """Task 5.12: the encoder stream keeps advancing instead of restarting each step.
+
+    The context manager writes the advanced global CUDA RNG state back to the encoder
+    side on exit, so two successive encoder forwards must not draw the same numbers.
+    Task 5.12：encoder 的随机流必须持续前进，而不是每步都从快照重新开始。上下文管理器在
+    退出时把推进后的全局 CUDA RNG 状态写回 encoder 一侧，因此连续两次 encoder 前传不能
+    抽到相同的数。
+    """
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+        snapshot_colocated_encoder_rng_tracker()
+
+        # The global stream is what the fused hidden dropout consumes (it does not fork).
+        # 融合的 hidden dropout 消费的就是全局流（它不 fork）。
+        with colocated_encoder_rng_tracker():
+            first_step_sample = torch.randn(64, device="cuda", dtype=torch.float32)
+        with colocated_encoder_rng_tracker():
+            second_step_sample = torch.randn(64, device="cuda", dtype=torch.float32)
+        assert not torch.equal(first_step_sample, second_step_sample), (
+            "the encoder global RNG state must be carried over between forwards"
+        )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_checkpoint():

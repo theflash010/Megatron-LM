@@ -24,8 +24,16 @@ from megatron.training import get_args
 from megatron.training.checkpointing import get_checkpoint_name
 
 
-def datasets_provider(task_encoder,worker_config=None):
-    """Create multimodal train, validation and test datasets."""
+def datasets_provider(task_encoder,worker_config=None, build_validation=True):
+    """Create multimodal train, validation and test datasets.
+
+    ``build_validation=False`` builds the train dataset only. Colocated training does not
+    support evaluation (asserted in the colocated block of arguments.py), so building the
+    validation datasets there would be dead work and would additionally require the dataset
+    to declare a val split.
+    ``build_validation=False`` 时只建训练集：共置训练不支持评估（arguments.py 的共置校验块
+    已断言），建验证集既是白做，又会额外要求数据集必须声明 val split。
+    """
     args = get_args()
 
     dname = args.data_path[0] if type(args.data_path) is list else args.data_path #数据集路径
@@ -41,6 +49,9 @@ def datasets_provider(task_encoder,worker_config=None):
         handler=print_error_handler,
         image_decode="pil",
     )#创建Megatron Energon训练数据集
+
+    if not build_validation:
+        return train_dataset, None, None
 
     val_datasets = get_val_datasets(
         dname,

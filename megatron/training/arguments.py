@@ -1699,6 +1699,126 @@ def validate_args(args, defaults={}):
             "Use --tokenizer-hf-no-include-special-tokens if you want to disable `include_special_tokens`."
         )
 
+    # Colocated encoder training (--use-colocated-encoder, added by the multimodal
+    # extra args provider, hence the defensive getattr).
+    # 共置 encoder 训练（--use-colocated-encoder 由 multimodal 的 extra args 注入，
+    # 因此用 getattr 防御性读取）。
+    if getattr(args, "use_colocated_encoder", False):
+        # The encoder chunk gives DDP a data-parallel group spanning all W ranks
+        # (inner x outer), so one reduction covers both dimensions. That is only
+        # equivalent to "inner sum, then outer reduction" when the data-parallel
+        # reduction is a pure SUM, which is exactly what calculate_per_token_loss=True
+        # produces (gradient_scaling_factor == 1.0, distributed_data_parallel.py:169).
+        # Otherwise DDP scales by 1 / (D_outer * P) instead of the correct
+        # 1 / D_outer, i.e. P times too small, and the error is silent.
+        # encoder chunk 交给 DDP 的数据并行组横跨全部 W 个 rank（inner x outer），
+        # 一次归约同时覆盖两个维度；这与"先 inner 求和再 outer 归约"等价的前提是归约
+        # 为纯 SUM，也就是 calculate_per_token_loss=True 时的行为（缩放因子恒为 1.0，
+        # distributed_data_parallel.py:169）。否则 DDP 会按 1 / (D_outer * P) 缩放，
+        # 比正确的 1 / D_outer 小 P 倍，而且是静默算错。
+        assert args.calculate_per_token_loss, (
+            "Colocated encoder training requires --calculate-per-token-loss: the encoder "
+            "gradients are reduced over all ranks at once, which is only correct when the "
+            "data-parallel reduction is a pure sum"
+        )
+        # The colocated wiring targets the Megatron DDP path only; the FSDP paths
+        # consume the process group collection differently.
+        # 共置改造只针对 Megatron DDP 路径；FSDP 路径对进程组集合的消费方式不同。
+        assert not getattr(args, "use_megatron_fsdp", False) and not getattr(
+            args, "use_torch_fsdp2", False
+        ), "Colocated encoder training supports only the Megatron DDP path"
+        # get_model is called once per component under colocated training and each
+        # call skips the create_all_gather_group block (it only runs when
+        # pg_collection is None, training.py), so those groups would silently never
+        # be created. They are consumed by Megatron-FSDP only, which is already
+        # excluded above, but fail loudly rather than silently.
+        # 共置训练下 get_model 按组件各调一次，而 create_all_gather_group 那段只在
+        # pg_collection 为 None 时执行（training.py），因此那两个组会被静默跳过。它们
+        # 只被 Megatron-FSDP 消费（上面已排除），但仍然响亮报错而不是静默跳过。
+        assert not getattr(args, "create_all_gather_group", False), (
+            "Colocated encoder training does not support --create-all-gather-group"
+        )
+        # Both components use explicit process group collections, from which upstream cannot
+        # derive Gloo groups (process_groups_config.py:430-435). Gloo is only needed by the
+        # legacy distributed-optimizer parameter-state save/load path; colocated training uses
+        # pretrained model weights for a cold start and does not save or resume training state.
+        # 共置下两个组件都显式传入进程组集合，上游无法从集合派生 Gloo 组
+        #（process_groups_config.py:430-435）。Gloo 只服务 DistOpt 的 legacy 参数状态存取；
+        # 本项目仅冷启动加载预训练模型权重，不保存或恢复训练状态，因此继续要求关闭 Gloo。
+        assert not args.use_gloo_process_groups, (
+            "Colocated encoder training passes explicit per-component process group "
+            "collections, and Gloo process groups cannot be derived from a collection; "
+            "run with --disable-gloo-process-groups"
+        )
+        # Evaluation is NOT supported under colocated training, and refusing it at startup is
+        # the whole point: the roulette schedule requires num_microbatches % P == 0, while
+        # evaluate() computes its own eval_num_microbatches from the eval batch size
+        # (training.py:3862-3865), so an indivisible count would either trip the schedule
+        # assertion or - worse - misroute the boundary packets. Online evaluation is a
+        # different code path entirely (run_text_generation's inference engine), which has no
+        # notion of the two colocated components. The training loss is printed by the regular
+        # --log-interval logging and does not depend on evaluation, so this costs nothing.
+        # 共置训练**不支持评估**，在启动期拒绝正是目的所在：轮盘调度要求
+        # num_microbatches % P == 0，而 evaluate() 用自己那套 eval 批量口径推出
+        # eval_num_microbatches（training.py:3862-3865），不整除时要么撞调度断言、要么
+        # （更糟）把边界包路由错。online eval 更是另一套代码（run_text_generation 的推理
+        # 引擎），完全没有共置两组件的概念。训练 loss 由 --log-interval 的常规日志打印、
+        # 与评估无关，因此关掉评估没有代价。
+        assert not args.eval_iters and not args.full_validation, (
+            "Colocated encoder training does not support evaluation: the roulette schedule "
+            "requires num_microbatches to be a multiple of the pipeline size, which the "
+            "evaluation batch size does not guarantee; run with --eval-iters 0 and without "
+            "--full-validation (the training loss is still logged by --log-interval)"
+        )
+        assert not getattr(args, "online_evaluation_config", None), (
+            "Colocated encoder training does not support --online-evaluation-config: online "
+            "evaluation runs through the text-generation inference path, which does not know "
+            "about the encoder / backbone split"
+        )
+        # The roulette schedule gives microbatch s to pipeline stage s, so the number of
+        # microbatches must be a multiple of the pipeline size. That invariant is checked by
+        # validate_colocated_num_microbatches, but only from inside the schedule
+        # (colocated_schedule.py), i.e. after the model is built, the checkpoint is loaded and
+        # the first batch is fetched. Deriving the same number here turns a first-step failure
+        # into a startup failure. One divisibility covers both steps: global_batch_size must be
+        # divisible by micro_batch_size * data_parallel_size (that quotient IS the microbatch
+        # count) and the quotient must then be divisible by the pipeline size.
+        # 轮盘调度把 microbatch s 交给 stage s，因此 microbatch 数必须是 pipeline size 的整数
+        # 倍。这条不变量由 validate_colocated_num_microbatches 保证，但它只在 schedule 内部被
+        # 调用（colocated_schedule.py）——那已经是建完模型、加载完 checkpoint、取到第一个 batch
+        # 之后了。在这里把同一个数推一遍，就把"第一步才炸"变成"启动就炸"。一次整除覆盖两步：
+        # global_batch_size 必须能被 micro_batch_size * data_parallel_size 整除（这个商就是
+        # microbatch 数），且该商还要能被 pipeline size 整除。
+        microbatches_divisor = (
+            args.micro_batch_size * args.data_parallel_size * args.pipeline_model_parallel_size
+        )
+        assert args.global_batch_size % microbatches_divisor == 0, (
+            f"Colocated encoder training requires the number of microbatches to be a multiple "
+            f"of the pipeline model parallel size ({args.pipeline_model_parallel_size}), because "
+            f"the round-robin schedule assigns microbatch s to pipeline stage s. With "
+            f"--global-batch-size {args.global_batch_size}, --micro-batch-size "
+            f"{args.micro_batch_size} and data_parallel_size {args.data_parallel_size} the "
+            f"number of microbatches is "
+            f"{args.global_batch_size / (args.micro_batch_size * args.data_parallel_size)}; "
+            f"pick a global batch size that is a multiple of {microbatches_divisor}"
+        )
+        # A batch size that changes over time would have to satisfy the divisibility above at
+        # EVERY point of the schedule, and a value that does not would only surface mid-run.
+        # 随时间变化的批量必须在**每一个**取值上都满足上面的整除，不满足的那个取值要跑到中途
+        # 才暴露，因此直接拒绝。
+        assert args.step_batch_size_schedule is None and args.rampup_batch_size is None, (
+            "Colocated encoder training does not support a changing batch size "
+            "(--step-batch-size-schedule / --rampup-batch-size): every value of the schedule "
+            "would have to keep the number of microbatches a multiple of the pipeline size, and "
+            "a value that does not would only fail in the middle of training"
+        )
+        assert not args.decrease_batch_size_if_needed, (
+            "Colocated encoder training does not support --decrease-batch-size-if-needed: it "
+            "silently changes the global batch size, which can break the "
+            "num_microbatches % pipeline_model_parallel_size == 0 requirement of the "
+            "round-robin schedule"
+        )
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -1742,6 +1862,15 @@ def core_transformer_config_from_args(args, config_class=None):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = True
+    # Task 4.9: same treatment as deallocate_pipeline_outputs — hardcoded on, no CLI arg (the
+    # field is in _add_network_size_args' exclude list). Only the colocated schedule reads it,
+    # so it is a no-op for every other path.
+    # Task 4.9：与 deallocate_pipeline_outputs 同款处理——硬编码开启、不出 CLI 参数（字段已
+    # 加进 _add_network_size_args 的 exclude 名单）。只有共置 schedule 会读它，其余路径无影响。
+    # 前提是 encoder 输出自己持有存储（``_base is None``）；若某种 projector 返回 view，
+    # deallocate_output_tensor 会直接断言失败（响亮报错、不会静默算错），届时把本行去掉或
+    # 从 exclude 名单里移出改成可配。
+    kw_args['deallocate_encoder_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
@@ -2051,6 +2180,7 @@ def _add_network_size_args(parser):
         "batch_p2p_comm",
         "batch_p2p_sync",
         "deallocate_pipeline_outputs",
+        "deallocate_encoder_outputs",
         "cpu_offloading",
         "cpu_offloading_activations",
         "cpu_offloading_weights",

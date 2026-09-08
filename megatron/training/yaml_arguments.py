@@ -396,6 +396,9 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     
     # Hardcoded 
     kw_args['deallocate_pipeline_outputs'] = True
+    # Task 4.9: same treatment as deallocate_pipeline_outputs (hardcoded on, no CLI arg).
+    # Task 4.9：与 deallocate_pipeline_outputs 同款处理（硬编码开启、无 CLI 参数）。
+    kw_args['deallocate_encoder_outputs'] = True
     kw_args['pipeline_dtype'] = kw_args['params_dtype']
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm 
     

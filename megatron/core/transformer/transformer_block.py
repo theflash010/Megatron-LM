@@ -329,36 +329,36 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # if self.apply_query_key_layer_scaling:
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
-        def build_layer(layer_spec, layer_number):
+        def build_layer(layer_spec, layer_number): #闭包：按一个layer_spec实例化出一个TransformerLayer
             global_layer_number = layer_number + get_transformer_layer_offset(
                 self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
             )  # 1-based index #layer_number是这个block的layer编号，从1开始计数，get_transformer_layer_offset获取这个block的layer偏移量，加起来是全局的layer编号
-            if self.config.heterogeneous_block_specs:
-                layer_config = self.config.get_config_for_layer(global_layer_number)
+            if self.config.heterogeneous_block_specs: #异构模型：每层可以有各自不同的config
+                layer_config = self.config.get_config_for_layer(global_layer_number) #用全局层号取出该层专属config
             else:
-                layer_config = self.config
+                layer_config = self.config #同构模型：所有层共用同一份config
 
             # Get appropriate quantization context (FP8 and FP4 are mutually exclusive)
-            if layer_config.fp8:
+            if layer_config.fp8: #低精度量化上下文，fp8与fp4互斥
                 quantization_context = get_fp8_context(
                     layer_config, global_layer_number - 1, is_init=True
-                )
+                ) #传0-based全局层号选该层的量化recipe，is_init=True表示这是建权重阶段
             elif layer_config.fp4:
                 quantization_context = get_fp4_context(
                     layer_config, global_layer_number - 1, is_init=True
                 )
             else:
-                quantization_context = nullcontext()
+                quantization_context = nullcontext() #不量化时用空上下文，保持下面with写法统一
 
-            with quantization_context:
+            with quantization_context: #在量化上下文里创建模块，权重按对应recipe初始化
                 module = build_module(
                     layer_spec,
                     config=layer_config,
-                    layer_number=layer_number,
-                    pg_collection=self.pg_collection,
+                    layer_number=layer_number, #注意这里传的是block内的局部层号，不是global_layer_number
+                    pg_collection=self.pg_collection, #把并行组集合透传给attention/mlp等子模块
                     vp_stage=self.vp_stage,
                 )
-            return module
+            return module #返回建好的TransformerLayer实例
 
         # offset is implicit in TransformerLayer
         self.layers = torch.nn.ModuleList(

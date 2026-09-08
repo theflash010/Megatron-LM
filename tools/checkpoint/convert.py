@@ -152,12 +152,12 @@ def main():
     # Initialize queue
     queue = mp.Queue(maxsize=args.max_queue_size)
 
-    # Start saver process.
+    # Start saver process. saver把参数从Megatron legacy模型格式，转换为core模型格式（TE可选）
     print("Starting saver...")
     saver_proc = mp.Process(target=saver.save_checkpoint, args=(queue, args))
     saver_proc.start()
 
-    # Run loader.
+    # Run loader. loader加载hf模型，并把参数映射到Megatron legacy模型上
     print("Starting loader...")
     loader.load_checkpoint(queue, args)
 

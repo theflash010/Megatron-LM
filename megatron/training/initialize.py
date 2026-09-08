@@ -25,7 +25,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
-from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
+from megatron.core.utils import get_pg_rank, get_te_version, is_te_min_version, is_torch_min_version
 from megatron.training import (
     get_adlr_autoresume,
     get_args,
@@ -359,8 +359,19 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
                 # Colocated encoder training: creates the encoder inner dp group.
+                # The encoder's own tensor parallel size comes from the colocated
+                # arguments (colocated_args.py) and is absent for non-colocated
+                # entry points, hence getattr.
                 # 共置 encoder 训练：创建 encoder inner dp 组（仅在开启该开关时）。
+                # encoder 自己的 tp 并行度来自共置参数（colocated_args.py），非共置入口
+                # 没有这个字段，故用 getattr 取。
                 use_colocated_encoder=getattr(args, "use_colocated_encoder", False),
+                colocated_encoder_tensor_model_parallel_size=getattr(
+                    args, "colocated_encoder_tensor_model_parallel_size", None
+                ),
+                colocated_encoder_num_distributed_optimizer_instances=getattr(
+                    args, "colocated_encoder_num_distributed_optimizer_instances", 1
+                ),
             )
             print_rank_0(
                 f"> initialized tensor model parallel with size "
@@ -387,20 +398,77 @@ def _set_random_seed(
     te_rng_tracker: bool = False,
     inference_rng_tracker: bool = False,
     use_cudagraphable_rng: bool = False,
+    is_colocated_encoder: bool = False,
 ):
-    """Set random seed for reproducability."""
+    """Set random seed for reproducability.
+
+    The random streams are derived from the job-wide (mpu) coordinates by default.
+    For colocated encoder training the two components have DIFFERENT topologies and
+    therefore need different seeds: the seed offsets below decorrelate distinct model
+    SHARDS, so they must be computed from the coordinates of the component being built.
+    The encoder is replicated across the pipeline dimension (its own pipeline rank is
+    always 0), while the backbone is sharded over it - see get_colocated_model.
+    随机流默认按作业级（mpu）坐标推导。共置 encoder 训练时两个组件拓扑不同、种子也必须
+    不同：下面的偏移目的是让**不同的模型分片**互不相关，因此必须按"正在构建的那个组件"
+    的坐标来算——encoder 在 pipeline 维上是副本（它自己的 pipeline rank 恒为 0），backbone
+    才是按该维切分的，详见 get_colocated_model。
+
+    ``is_colocated_encoder``：True 时本次调用为共置 encoder 组件设种子。此时**所有**坐标
+    （pipeline / tensor / dp / 专家并行）都在函数内部从 parallel_state 的
+    ``get_colocated_encoder_*`` 系列 getter 推导——encoder 的 pipeline / 专家并行组都是
+    单成员组（处处 rank 0），dp 组是共置数据并行组，tp 组是它自己的通信子——无需调用方
+    传入 encoder_pg。False 时走正常流程、与 encoder 坐标无关（共置模式下的 backbone 组件
+    就落在这个分支）。
+
+    注意本函数每次调用都会 reset 整个 RNG tracker（``model_parallel_cuda_manual_seed``），
+    因此 encoder 播下的命名状态会被随后 backbone 那次调用冲掉。encoder 在训练前传时要用
+    的那套状态由 ``snapshot_colocated_encoder_rng_tracker`` 在 encoder 构建完立刻整体冻结
+    （见 get_colocated_model），与本函数职责分离。
+    """
     if seed_ is not None and seed_ > 0:
+        pipeline_rank = None
+        tensor_rank = None
+        data_parallel_rank = None
+        expert_model_parallel_rank = None
+        expert_tensor_parallel_rank = None
+        if mpu.is_colocated_encoder_enabled() and is_colocated_encoder:
+            # The encoder's OWN coordinates, derived from its own process groups (no
+            # caller-supplied encoder_pg needed): the pipeline group is single-member
+            # (rank 0 on every rank), the tensor group is its own communicator, the
+            # dp group is the colocated data-parallel group, and the expert-parallel
+            # groups are single-member too (the encoder has no MoE experts).
+            # 共置 encoder 自身坐标取自它自己的通信组（无需调用方传入 encoder_pg）：
+            # pipeline 组单成员（处处 rank 0）、tp 组是它自己的通信子、dp 组是共置
+            # 数据并行组、专家并行组也是单成员（encoder 无 MoE 专家）。
+            encoder_pipeline_group = mpu.get_colocated_encoder_pipeline_model_parallel_group()
+            encoder_tensor_group = mpu.get_colocated_encoder_tensor_model_parallel_group()
+            encoder_data_parallel_group = mpu.get_colocated_data_parallel_group()
+            pipeline_rank = get_pg_rank(encoder_pipeline_group)
+            tensor_rank = get_pg_rank(encoder_tensor_group)
+            data_parallel_rank = get_pg_rank(encoder_data_parallel_group)
+            expert_model_parallel_rank = get_pg_rank(encoder_pipeline_group)
+            expert_tensor_parallel_rank = get_pg_rank(encoder_pipeline_group)
+        if pipeline_rank is None:
+            pipeline_rank = mpu.get_pipeline_model_parallel_rank()
+        if data_parallel_rank is None:
+            data_parallel_rank = mpu.get_data_parallel_rank()
         # Ensure that different pipeline MP stages get different seeds.
-        seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank())
+        seed = seed_ + (100 * pipeline_rank)
         # Ensure different data parallel ranks get different seeds
         if data_parallel_random_init:
-            seed = seed + (10 * mpu.get_data_parallel_rank())
+            seed = seed + (10 * data_parallel_rank)
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.device_count() > 0:
             tensor_parallel.model_parallel_cuda_manual_seed(
-                seed, te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng
+                seed,
+                te_rng_tracker,
+                inference_rng_tracker,
+                use_cudagraphable_rng,
+                tp_rank=tensor_rank,
+                ep_rank=expert_model_parallel_rank,
+                etp_rank=expert_tensor_parallel_rank,
             )
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))

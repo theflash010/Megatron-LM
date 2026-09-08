@@ -154,7 +154,7 @@ class TestColocatedLLaVAModel:
         # Colocated path: encoder forward -> pp0 assembly -> GPTModel.
         # 共置路径：encoder 前传 -> pp0 组装 -> GPTModel。
         image_embeddings = self.enc(imgs)
-        out_bb, lm_bb = self.bb(
+        out_bb, lm_bb, _ = self.bb(
             image_embeddings=image_embeddings,
             input_ids=tokens,
             position_ids=position_ids,
@@ -183,7 +183,7 @@ class TestColocatedLLaVAModel:
         out_ref.sum().backward()
 
         image_embeddings = self.enc(imgs)
-        out_bb, _ = self.bb(
+        out_bb, _, _ = self.bb(
             image_embeddings=image_embeddings,
             input_ids=tokens,
             position_ids=position_ids,
@@ -240,7 +240,7 @@ class TestColocatedLLaVAModel:
             num_image_tiles=num_image_tiles,
         )
         image_embeddings = self.enc(imgs)
-        out_bb, lm_bb = self.bb(
+        out_bb, lm_bb, _ = self.bb(
             image_embeddings=image_embeddings,
             input_ids=tokens,
             position_ids=position_ids,

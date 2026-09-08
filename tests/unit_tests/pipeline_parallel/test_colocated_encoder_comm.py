@@ -235,16 +235,23 @@ def test_async_send_wait_false_and_mb_id():
     rank = Utils.rank
     try:
         pkt = _make_packet(701, img_shape=(4, 3, 8), seq=12, num_image_tiles=(2, 1), microbatch_id=5)
+        handles = None
         if rank == 1:  # producer 1
             handles = comm.colocated_send_forward(pkt, producer=1, wait=False)
-            dist.barrier()  # 等 consumer 收完再 wait（模拟 replenish：提交后继续算）
-            for handle in handles:
-                handle.wait()
         elif rank == 0:  # consumer
             got = comm.colocated_recv_forward(1, expected_microbatch_id=5)
             _check_equal(got, pkt, "async send + microbatch id")
             assert got.microbatch_id.item() == 5, "packet must carry its own microbatch id"
-            dist.barrier()
+        # ``dist.barrier()`` 走的是**默认组（全 rank）**，所以必须放在分支外——每个 rank 的
+        # barrier 次数要一致。此前这一次 barrier 写在 rank 0/1 各自的分支里，world=2 时恰好
+        # 成立，world≥4 时 rank≥2 少调一次，barrier 全体错位一拍 → 死锁（2026-08-27 修）。
+        # dist.barrier() is a default-group collective, so it must be called the same number
+        # of times on every rank; keeping it inside the rank 0/1 branches deadlocked at
+        # world_size >= 4, where the uninvolved ranks called it once fewer.
+        dist.barrier()  # consumer 已收完，producer 现在才 wait（模拟 replenish：提交后继续算）
+        if handles is not None:
+            for handle in handles:
+                handle.wait()
         dist.barrier()
     finally:
         Utils.destroy_model_parallel()
@@ -253,12 +260,10 @@ def test_async_send_wait_false_and_mb_id():
 def test_async_recv_requests():
     """Async recv requests: consumer prefetch-take, producer replenish-step grad recv.
 
-    - consumer 用 ``colocated_recv_forward(..., wait=False)`` 异步 prefetch 前向包，
-      需要时 ``request.start()``（等 shape → 提交数据接收）再 ``request.finish()``（取数）
-      （header 接收挂 NCCL 后台、与计算重叠）；
+    - consumer 用 ``colocated_recv_forward(..., wait=False)`` 异步 prefetch 前向包（通信器
+      在返回前已启动数据接收），需要时 ``request.finish()`` 取数（传输与计算重叠）；
     - producer 用 ``colocated_recv_backward(wait=False)`` 异步提交梯度接收（补发
-      step 的 forward 前），consumer 反传后发梯度，producer ``start()`` 后
-      ``finish()`` 拿到。
+      step 的 forward 前），consumer 反传后发梯度，producer ``finish()`` 拿到。
 
     **enqueue 顺序约束（NCCL 同组 P2P 严格 FIFO）**：两端必须"先前向后反传"——
     producer 先 ``send_forward`` 再 ``recv_backward``，consumer 先 ``recv_forward``
@@ -276,12 +281,12 @@ def test_async_recv_requests():
             # 再异步提交收上一个自己发送的 micro batch 的梯度。
             comm.colocated_send_forward(pkt, producer=1)
             grad_req = comm.colocated_recv_backward(wait=False)
-            grad = grad_req.start().finish().grad
+            grad = grad_req.finish().grad
             assert grad.shape == (4, 3, 8) and grad.dtype == DTYPE, "async grad recv mismatch"
         elif rank == 0:  # consumer
             pkt = _make_packet(801, img_shape=(4, 3, 8), seq=10, num_image_tiles=(2, 1), microbatch_id=3)
             recv_req = comm.colocated_recv_forward(1, expected_microbatch_id=3, wait=False)  # prefetch
-            got = recv_req.start().finish()  # take（start 提前提交数据接收、finish 取数）
+            got = recv_req.finish()  # take（prefetch 时已启动数据接收，finish 只取数）
             _check_equal(got, pkt, "async prefetch + take")
             assert got.microbatch_id.item() == 3, "packet must carry its own microbatch id"
             comm.colocated_send_backward(BackwardPacket(grad=_make_grad(901, (4, 3, 8))), 1)
