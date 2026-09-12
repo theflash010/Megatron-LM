@@ -32,7 +32,7 @@ from megatron.core.models.multimodal.colocated_llava_model import (
     ColocatedViTEncoder,
 )
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
-from megatron.core.pipeline_parallel.colocated_encoder_comm import ForwardPacket
+from megatron.core.pipeline_parallel.colocated_encoder_comm import MergedEncoderBatch
 from megatron.core.pipeline_parallel.colocated_schedule import forward_backward_colocated
 from megatron.core.pipeline_parallel.schedules import forward_backward_no_pipelining
 from megatron.core.tensor_parallel.random import (
@@ -177,12 +177,29 @@ def _make_reference_forward_step(microbatches):
     return reference_forward_step
 
 
-def _make_colocated_forward_step(microbatches, encoder, backbone):
+def _make_merged_batch(microbatches):
+    """Stack the per-microbatch list into ONE merged batch (optimization Task 1, design A).
+
+    优化 spec Task 1（设计 A）：共置路径的 dataloader 一次取回整个合并批（batch 维 =
+    ``num_microbatches × micro_batch_size`` 个样本），encoder 只前传一次。本 helper 把
+    per-microbatch 列表沿 batch 维堆叠成**取数契约的 4 元组**
+    （tokens/labels/images/num_image_tiles——与 ``colocated_encoder_get_batch`` 的返回
+    一致）；num_tiles 逐样本为 1（``split_merged_batch`` 等分断言的前提）。encoder
+    分支拿它构造 ``MergedEncoderBatch``（不含 images——那是 encoder 的输入）。
+    """
+    return tuple(
+        torch.cat([fields[index] for fields in microbatches], dim=0) for index in range(4)
+    )
+
+
+def _make_colocated_forward_step(merged_batch, encoder, backbone):
     """forward_step_func for the colocated path (mirrors colocated_train.colocated_forward_step).
 
-    encoder 分支（phase ①）取一个 microbatch 跑 encoder 得 ``ForwardPacket``；backbone
-    分支（phase ②）用 schedule 绑定的 packet 跑 backbone，并把展开 labels/loss_mask 写回
-    ``intra_packet``（PP=1 时无人接收，但契约一致）。
+    优化 spec Task 1（设计 A）：encoder 分支（phase ①）**每个 iteration 只被调一次**，
+    一次 ``next(data_iterator)`` 取回合并批 + 一次前传 -> ``(MergedEncoderBatch, None)``；
+    backbone 分支（phase ②）用 schedule 绑定的 packet（拆分后的逐 microbatch 包）跑
+    backbone，并把展开 labels/loss_mask 写回 ``intra_packet``（PP=1 时无人接收，但
+    契约一致）。
     """
     encoder_calls = []
 
@@ -190,9 +207,10 @@ def _make_colocated_forward_step(microbatches, encoder, backbone):
         chunk = model[0] if isinstance(model, (list, tuple)) else model
         if chunk is encoder:
             tokens, labels, images, num_image_tiles = next(data_iterator)
-            encoder_calls.append(tokens)
-            return ForwardPacket(
-                image_embeddings=encoder(images),
+            encoder_calls.append(tokens.shape[0])
+            image_embeddings = encoder(images)
+            return MergedEncoderBatch(
+                image_embeddings=image_embeddings,
                 tokens=tokens,
                 labels=labels,
                 num_image_tiles=num_image_tiles,
@@ -309,13 +327,14 @@ def test_colocated_schedule_matches_pp0_only():
         )
         reference_grads = _collect_grads(reference)
 
-        # 共置路径：phase ① → ② → ④。
+        # 共置路径：phase ① → ② → ④（Task 1：encoder 分支一次吃合并批）。
+        merged_batch = _make_merged_batch(microbatches)
         colocated_forward_step, encoder_calls = _make_colocated_forward_step(
-            microbatches, encoder, backbone
+            merged_batch, encoder, backbone
         )
         colocated_losses = forward_backward_colocated(
             forward_step_func=colocated_forward_step,
-            data_iterator=iter(microbatches),
+            data_iterator=iter([merged_batch]),
             model=[encoder, backbone],
             num_microbatches=_NUM_MICROBATCHES,
             seq_length=_SEQ_LENGTH,
@@ -323,8 +342,14 @@ def test_colocated_schedule_matches_pp0_only():
         )
         colocated_grads = _collect_grads(encoder, backbone)
 
-        assert len(encoder_calls) == _NUM_MICROBATCHES, (
-            f"phase ① 应对每个 microbatch 调一次 encoder，实际 {len(encoder_calls)}"
+        # 优化 spec Task 1：encoder 分支整个 iteration 只被调一次（合并批样本数 =
+        # num_microbatches × micro_batch_size）。
+        assert len(encoder_calls) == 1, (
+            f"phase ① 应只调一次 encoder（合并批），实际 {len(encoder_calls)}"
+        )
+        assert encoder_calls[0] == _NUM_MICROBATCHES * _MICRO_BATCH_SIZE, (
+            f"合并批样本数应为 {_NUM_MICROBATCHES * _MICRO_BATCH_SIZE}，"
+            f"实际 {encoder_calls[0]}"
         )
         assert len(colocated_losses) == len(reference_losses) == _NUM_MICROBATCHES, (
             f"两条路径的 forward_data_store 长度应相同："

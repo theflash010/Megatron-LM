@@ -2186,6 +2186,25 @@ def _nvtx_range_get_func_path():
     return f"{module.__name__}.{caller_func}"
 
 
+def _nvtx_message_with_rank_if_colocated(message: str) -> str:
+    """Append the global rank to colocated NVTX messages, resolved at call time.
+
+    Colocated ranges (messages prefixed with "colocated-") are traced on every
+    rank of the pipeline, so a single nsys report contains same-named ranges from
+    several processes; the suffix keeps them distinguishable in the GUI
+    (e.g. "colocated-warmup_rank2"). The rank is resolved lazily -- never at
+    import time -- because decorators build their base messages before
+    distributed initialization. Non-colocated messages are returned unchanged.
+    共置区间名自动追加 rank 后缀（延迟到调用时解析，装饰器在 import 时构造的消息
+    此时尚未初始化分布式）；非 colocated- 前缀的消息原样返回。
+    """
+    if not message.startswith("colocated-"):
+        return message
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return message
+    return f"{message}_rank{torch.distributed.get_rank()}"
+
+
 def nvtx_range_push(msg=None, suffix=None) -> None:
     """Push NVTX range onto stack. If msg is not provided, use the calling function's path.
 
@@ -2200,6 +2219,7 @@ def nvtx_range_push(msg=None, suffix=None) -> None:
         msg = _nvtx_range_get_func_path()
     if suffix is not None:
         msg = f"{msg}.{suffix}"
+    msg = _nvtx_message_with_rank_if_colocated(msg)
 
     # If we have entered this range before, do not use the newly-created "msg" object.
     # But instead point to the original, first-created, "msg" object.
@@ -2227,6 +2247,7 @@ def nvtx_range_pop(msg=None, suffix=None) -> None:
         msg = _nvtx_range_get_func_path()
     if suffix is not None:
         msg = f"{msg}.{suffix}"
+    msg = _nvtx_message_with_rank_if_colocated(msg)
 
     # Update list of NVTX range messages and check for consistency
     if not _nvtx_range_messages:

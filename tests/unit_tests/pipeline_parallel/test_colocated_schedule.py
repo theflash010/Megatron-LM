@@ -1,22 +1,21 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for the colocated schedule wrapper, phase ① (Task 4.1/4.2).
+"""Unit tests for the colocated schedule wrapper, phase ① (Task 4.1/4.2; Task 1 merged).
 
 共置 schedule（顶层函数 ``forward_backward_colocated``）的 phase ①
-（encoder 轮盘前传 + 本地 buffer）单元测试：
+（encoder **合并**前传 + 本地 buffer）单元测试：
 - 每个 producer（边界组内槽位）负责的 microbatch = p, p+P, p+2P, ...（``get_microbatches_for_producer``），
   即每 producer 处理 ``num_microbatches / P`` 个 microbatch = ``global_mbs / (dp * inner_dp)``；
-- phase ① 由 schedule 循环调 ``forward_step_func`` 的 **encoder 分支**（模拟
-  colocated_train.colocated_forward_step：取数据 + encoder forward -> 5 字段包）拿包
-  存 buffer——schedule 不接收 get_batch_fn/image_token_index/img_seq_len（4.2 职责分工）；
-- buffer 每项 = 前向包 5 字段；``image_embeddings`` 保留 grad_fn（phase ④ 统一反传用，
-  分离图发生在发送/组装时）；
+- 优化 spec Task 1（设计 A）：schedule 对 forward step 的 encoder 分支**每个 iteration
+  只调一次**（一次取合并批 + 一次前传 -> ``MergedEncoderBatch``），经
+  ``ForwardPacket.split_merged_batch`` 等分回逐 microbatch 的包、打 id 存 buffer——
+  切片是合并张量的 view（共享 storage、保 grad_fn），合并张量本体由 schedule 返回；
 - 跨 rank：所有 producer 的 microbatch 恰好覆盖 0..num_microbatches-1 一次（不重不漏）；
 - 主函数 wiring（4.3f）：完整跑 phase ①+②（PP=1 全本地 / PP>1 边界配对），返回
-  forward_data_store；forward step encoder 分支每 microbatch 恰一次、num_microbatches
+  forward_data_store；encoder 分支每 iteration 恰一次、num_microbatches
   非 pp 倍数在校验处抛 AssertionError；
 - n>P 完整节奏（4.6f）：n = 2*P 跑 phase ①→②→④，覆盖 4.4 补货、4.5 逐 step
-  prefetch、4.6c/4.6d 的边界梯度往返与 4.6e 的统一 encoder 反传。
+  prefetch、4.6c/4.6d 的边界梯度往返与 4.6e 的**合并** encoder 反传（Task 1）。
 """
 
 import pytest
@@ -26,7 +25,10 @@ from functools import partial
 
 import megatron.core.parallel_state as ps
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.pipeline_parallel.colocated_encoder_comm import ForwardPacket
+from megatron.core.pipeline_parallel.colocated_encoder_comm import (
+    ForwardPacket,
+    MergedEncoderBatch,
+)
 from megatron.core.pipeline_parallel.colocated_schedule import (
     _colocated_encoder_forward,
     forward_backward_colocated,
@@ -183,33 +185,38 @@ class FakeBackbone(torch.nn.Module):
         return activation, loss_mask
 
 
-def _make_fake_batch(seed, num_tiles, seq=_SEQ_LENGTH):
-    """Deterministic batch 4-tuple (colocated_encoder_get_batch contract).
+def _make_fake_merged_batch(seed, num_samples, seq=_SEQ_LENGTH):
+    """Deterministic MERGED batch 4-tuple (colocated_encoder_get_batch contract, Task 1).
 
-    与 ``colocated_train.colocated_encoder_get_batch`` 一致（4 元组
-    tokens/labels/imgs/num_tiles）；loss_mask 由 consumer 从 labels 重建，不在 batch/包里
-    （2026-08-13 用户确认）。
+    优化 spec Task 1（设计 A）：dataloader 一次取回本 rank 的全部 micro batch，所以
+    fake 数据是**合并批**——``num_samples`` 个样本沿 batch 维堆叠（tokens/labels
+    ``[N, seq]``、imgs ``[N, 3, h, w]``、num_tiles ``[N]``）。与生产一致的两条数据假设
+    在这里也成立：labels 已左移（fake 直接给最终形态）、每样本恰好 1 个 tile
+    （``split_merged_batch`` 的等分断言会拦截非 1）。
     """
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    imgs = torch.randn((num_tiles, 3, _IMG_H, _IMG_W), dtype=torch.float32, device="cuda", generator=g)
-    tokens = torch.randint(0, 100, (1, seq), dtype=torch.int64, device="cuda", generator=g)
-    labels = torch.randint(0, 100, (1, seq), dtype=torch.int64, device="cuda", generator=g)
-    num_tiles_t = torch.tensor([num_tiles], dtype=torch.int32, device="cuda")
-    return (tokens, labels, imgs, num_tiles_t)
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    imgs = torch.randn(
+        (num_samples, 3, _IMG_H, _IMG_W), dtype=torch.float32, device="cuda", generator=generator
+    )
+    tokens = torch.randint(0, 100, (num_samples, seq), dtype=torch.int64, device="cuda", generator=generator)
+    labels = torch.randint(0, 100, (num_samples, seq), dtype=torch.int64, device="cuda", generator=generator)
+    num_tiles = torch.ones(num_samples, dtype=torch.int32, device="cuda")
+    return (tokens, labels, imgs, num_tiles)
 
 
-def _make_fake_colocated_forward_step(batches, my_microbatches, encoder, backbone, served):
+def _make_fake_colocated_forward_step(merged_batch, encoder, backbone, served):
     """Fake 'colocated_forward_step': (data_iterator, model, packet=None, intra_packet=None),
     branched by chunk.
 
-    模拟 colocated_train.colocated_forward_step（4.3f，4.3j 加 intra_packet）：
-    - encoder 分支（``model=[encoder]`` list，phase ①）：取一个 micro batch 数据 +
-      ``encoder_chunk(images)`` -> 4 字段 ForwardPacket（schedule 打标 id 后存 buffer）；
+    模拟 colocated_train.colocated_forward_step（4.3f，4.3j 加 intra_packet；优化 spec
+    Task 1 改为**合并形态**）：
+    - encoder 分支（``model=[encoder]`` list，phase ①）：**每个 iteration 只被调一次**，
+      一次 ``next(data_iterator)`` 取回合并批 + ``encoder_chunk(images)`` 一次前传 ->
+      ``(MergedEncoderBatch, None)``（与生产一致：裸张量集合，非 ForwardPacket）；
     - backbone 分支（``model=backbone`` 单 chunk 或 list，phase ②）：consumer
-      （``pre_process``）用 **partial 绑定的 packet** 的 image_embeddings 跑 FakeBackbone，
-      并把展开 labels/loss_mask 写回 intra_packet（4.3j，伴随传输用）；非 consumer 用
-      intra_packet 闭包绑定传入的 labels/loss_mask 跑 FakeBackbone（input_tensor 已
-      set_input_tensor）。返回 ``(output, loss_func)``。
+      （``pre_process``）用 **partial 绑定的 packet**（拆分后的逐 microbatch 包）跑
+      FakeBackbone，并把展开 labels/loss_mask 写回 intra_packet（4.3j）；非 consumer 用
+      intra_packet 闭包绑定传入的 labels/loss_mask。返回 ``(output, loss_func)``。
     """
 
     def fake_loss_func(loss_mask, output_tensor):
@@ -224,11 +231,10 @@ def _make_fake_colocated_forward_step(batches, my_microbatches, encoder, backbon
     def fake_colocated_forward_step(data_iterator, model, packet=None, intra_packet=None):
         chunk = model[0] if isinstance(model, (list, tuple)) else model
         if isinstance(chunk, MockEncoder):
-            microbatch = my_microbatches[len(served)]
-            served.append(microbatch)
-            tokens, labels, imgs, num_tiles = batches[microbatch]
-            image_embeddings = encoder(imgs)
-            return ForwardPacket(
+            tokens, labels, imgs, num_tiles = next(data_iterator)
+            served.append(tokens.shape[0])
+            image_embeddings = encoder(imgs)  # [1, merged_batch, h_lang]，保留 grad_fn
+            return MergedEncoderBatch(
                 image_embeddings=image_embeddings,
                 tokens=tokens,
                 labels=labels,
@@ -312,38 +318,50 @@ def _my_microbatches_setup(world, num_microbatches=None):
     my_microbatches = ps.get_microbatches_for_producer(
         producer_id, num_microbatches, num_producers
     )
-    # 本 rank 的 batch（按 my_microbatches 顺序），num_tiles 随 microbatch 变化（microbatch % 3 + 1）。
-    batches = {
-        microbatch: _make_fake_batch(1000 + microbatch, num_tiles=microbatch % 3 + 1)
-        for microbatch in my_microbatches
-    }
-    return num_microbatches, my_microbatches, batches
+    # 合并批：本 rank 全部 micro batch 的样本沿 batch 维堆叠（batch 顺序 == 轮盘序列），
+    # 每个 microbatch 1 个样本（MBS=1）。优化 spec Task 1：dataloader 一次取回合并批。
+    per_mb = [
+        _make_fake_merged_batch(1000 + microbatch, 1) for microbatch in my_microbatches
+    ]
+    merged_batch = tuple(
+        torch.cat([fields[index] for fields in per_mb], dim=0) for index in range(4)
+    )
+    return num_microbatches, my_microbatches, merged_batch
 
 
 def test_colocated_encoder_forward_round_robin_buffer():
-    """Phase ① helper: every producer computes its round-robin microbatches into the buffer.
+    """Phase ① helper: ONE merged forward, split back into round-robin packets (Task 1).
 
-    每个 producer（边界组内槽位）用 get_microbatches_for_producer 拿自己负责的
-    microbatch；schedule 循环调 forward step 的 encoder 分支拿包存 buffer（buffer
-    保留 grad_fn、覆盖全部 microbatch 一次；数据/模型细节在 forward step 里）。
+    优化 spec Task 1（设计 A）：每个 producer（边界组内槽位）用 get_microbatches_for_producer
+    拿自己负责的 microbatch；schedule 对 forward step 的 encoder 分支**只调一次**（一次
+    取合并批 + 一次前传），经 ``ForwardPacket.split_merged_batch`` 等分回逐 microbatch
+    的包并打 id 存 buffer。断言：buffer key = 轮盘序列、5 字段齐全、值与合并批的对应
+    切片一致、切片是 view 但保留 grad_fn（phase ④ 对合并张量单次 backward）、合并张量
+    由本函数返回（schedule 显式持有）。
     """
     world = Utils.world_size
-    num_microbatches, my_microbatches, batches = _my_microbatches_setup(world)
+    num_microbatches, my_microbatches, merged_batch = _my_microbatches_setup(world)
     try:
         encoder = MockEncoder().cuda()
         served = []
         # backbone 参数传 None：本测试只调 encoder 分支（phase ①）。
         fake_forward_step = _make_fake_colocated_forward_step(
-            batches, my_microbatches, encoder, None, served
+            merged_batch, encoder, None, served
         )
         producer_id, num_producers = _producer_identity()
-        encoder_buffers = _colocated_encoder_forward(
+        encoder_buffers, merged_image_embeddings = _colocated_encoder_forward(
             fake_forward_step,
-            object(),
+            iter([merged_batch]),
             encoder,
             num_microbatches,
             producer_id=producer_id,
             num_producers=num_producers,
+        )
+
+        # --- 合并调用：encoder 分支每个 iteration 恰好一次，吃掉整个合并批 ---
+        assert served == [len(my_microbatches)], (
+            f"phase ① must call the encoder branch ONCE with the merged batch "
+            f"({len(my_microbatches)} samples), got {served}"
         )
 
         # --- 分配公式：每 producer 恰好 num_microbatches / P 个，key = 轮盘序列 ---
@@ -356,8 +374,18 @@ def test_colocated_encoder_forward_round_robin_buffer():
             f"got {len(encoder_buffers)}"
         )
 
-        # --- buffer 内容：5 字段齐全、值与 batch/encoder 一致、grad_fn 保留 ---
-        for microbatch in my_microbatches:
+        # --- 合并张量：形状 = [1, N, h_lang]、保留 grad_fn（phase ④ 单次 backward 的对象）---
+        tokens_m, labels_m, imgs_m, tiles_m = merged_batch
+        assert merged_image_embeddings.shape == (1, len(my_microbatches), _H_LANG), (
+            f"merged image_embeddings shape {tuple(merged_image_embeddings.shape)}"
+        )
+        assert merged_image_embeddings.requires_grad, (
+            "the merged tensor is the graph output; phase ④ backwards through it"
+        )
+
+        # --- buffer 内容：5 字段齐全、值 = 合并批对应切片、id 已打标、view 保 grad_fn ---
+        tokens, labels, imgs, num_tiles = merged_batch
+        for index, microbatch in enumerate(my_microbatches):
             pkt = encoder_buffers[microbatch]
             assert set(pkt.to_dict()) == set(ForwardPacket.field_names), (
                 f"microbatch {microbatch} packet keys {sorted(pkt.to_dict())}"
@@ -366,19 +394,32 @@ def test_colocated_encoder_forward_round_robin_buffer():
             assert pkt.microbatch_id.item() == microbatch, (
                 f"microbatch {microbatch}: schedule must stamp the packet's microbatch id"
             )
-            t, l, imgs, nt = batches[microbatch]
-            assert torch.equal(pkt.image_embeddings, encoder(imgs)), (
-                f"microbatch {microbatch} embeddings"
+            # 切片顺序 == batch 顺序 == 轮盘序列：每个包必须等于合并张量的第 index 切片，
+            # 且与合并张量**共享 storage**（view 语义——phase ④ 只 backward 合并张量一次）。
+            merged_slice = merged_image_embeddings[:, index : index + 1, :]
+            assert torch.equal(pkt.image_embeddings, merged_slice), (
+                f"microbatch {microbatch} embeddings must equal merged slice {index}"
+            )
+            assert (
+                pkt.image_embeddings.untyped_storage().data_ptr()
+                == merged_image_embeddings.untyped_storage().data_ptr()
+            ), (
+                f"microbatch {microbatch}: the packet's image_embeddings must be a VIEW "
+                "sharing storage with the merged tensor"
             )
             assert pkt.image_embeddings.requires_grad, (
-                f"microbatch {microbatch}: image_embeddings must keep grad_fn for the "
-                "phase-④ backward"
+                f"microbatch {microbatch}: the slice is a view of the merged tensor and "
+                "must keep grad_fn"
             )
-            assert torch.equal(pkt.tokens, t) and torch.equal(pkt.labels, l)
-            assert torch.equal(pkt.num_image_tiles, nt)
-        assert len(served) == num_microbatches // world, (
-            "forward step encoder branch called once per owned microbatch"
-        )
+            assert torch.equal(pkt.tokens, tokens[index : index + 1]), (
+                f"microbatch {microbatch} tokens must equal merged slice {index}"
+            )
+            assert torch.equal(pkt.labels, labels[index : index + 1]), (
+                f"microbatch {microbatch} labels must equal merged slice {index}"
+            )
+            assert torch.equal(pkt.num_image_tiles, num_tiles[index : index + 1]), (
+                f"microbatch {microbatch} num_tiles must equal merged slice {index}"
+            )
 
         # --- 跨 rank：所有 producer 的 microbatch 恰好覆盖 0..n-1 一次（不重不漏） ---
         all_keys = [None] * world
@@ -404,7 +445,7 @@ def test_forward_backward_colocated_wiring():
     world = Utils.world_size
     # n = P（每 producer 1 个包）：4.3b 全量发送在 n/P>1 时死锁（NCCL 未配对 send 阻塞
     # 同组后续 isend），冒烟用 1 发 1 收配对（doc §2.11）。
-    num_microbatches, my_microbatches, batches = _my_microbatches_setup(
+    num_microbatches, my_microbatches, merged_batch = _my_microbatches_setup(
         world, num_microbatches=world
     )
     try:
@@ -413,11 +454,11 @@ def test_forward_backward_colocated_wiring():
         backbone = FakeBackbone(pre_process=(ps.get_pipeline_model_parallel_rank() == 0)).cuda()
         served = []
         fake_forward_step = _make_fake_colocated_forward_step(
-            batches, my_microbatches, encoder, backbone, served
+            merged_batch, encoder, backbone, served
         )
         loss_store = forward_backward_colocated(
             forward_step_func=fake_forward_step,
-            data_iterator=object(),
+            data_iterator=iter([merged_batch]),
             model=[encoder, backbone],
             num_microbatches=num_microbatches,
             seq_length=_SEQ_LENGTH,
@@ -427,10 +468,10 @@ def test_forward_backward_colocated_wiring():
         assert isinstance(loss_store, list), (
             f"expected forward_data_store (list), got {type(loss_store)}"
         )
-        # phase ① executed: forward step encoder branch called once per owned microbatch.
-        assert len(served) == num_microbatches // world, (
-            f"phase ① must call the forward step encoder branch once per owned "
-            f"microbatch, got {len(served)}"
+        # phase ① executed: the encoder branch is called ONCE with the whole merged batch.
+        assert served == [num_microbatches // world], (
+            f"phase ① must call the encoder branch once with {num_microbatches // world} "
+            f"merged samples, got {served}"
         )
 
         # num_microbatches 不是 pp_size 的整数倍 -> 校验处抛错（world=1 时恒整除，跳过）。
@@ -438,7 +479,7 @@ def test_forward_backward_colocated_wiring():
             with pytest.raises(AssertionError):
                 forward_backward_colocated(
                     forward_step_func=fake_forward_step,
-                    data_iterator=object(),
+                    data_iterator=iter([merged_batch]),
                     model=[encoder, backbone],
                     num_microbatches=world + 1,  # 不是 pp_size 的整数倍
                     seq_length=_SEQ_LENGTH,
@@ -463,7 +504,7 @@ def test_forward_backward_colocated_multi_microbatch_per_producer():
     ``producer_grad_buffers`` 键 == ``encoder_buffers`` 键）会在运行中自检。
     """
     world = Utils.world_size
-    num_microbatches, my_microbatches, batches = _my_microbatches_setup(
+    num_microbatches, my_microbatches, merged_batch = _my_microbatches_setup(
         world, num_microbatches=2 * world
     )
     try:
@@ -471,11 +512,11 @@ def test_forward_backward_colocated_multi_microbatch_per_producer():
         backbone = FakeBackbone(pre_process=(ps.get_pipeline_model_parallel_rank() == 0)).cuda()
         served = []
         fake_forward_step = _make_fake_colocated_forward_step(
-            batches, my_microbatches, encoder, backbone, served
+            merged_batch, encoder, backbone, served
         )
         loss_store = forward_backward_colocated(
             forward_step_func=fake_forward_step,
-            data_iterator=object(),
+            data_iterator=iter([merged_batch]),
             model=[encoder, backbone],
             num_microbatches=num_microbatches,
             seq_length=_SEQ_LENGTH,
@@ -484,12 +525,10 @@ def test_forward_backward_colocated_multi_microbatch_per_producer():
         assert isinstance(loss_store, list), (
             f"expected forward_data_store (list), got {type(loss_store)}"
         )
-        # 每 producer 恰好 2 个 microbatch，且顺序即轮盘序列。
-        assert served == my_microbatches, (
-            f"phase ① must serve the round-robin microbatches in order, got {served}"
-        )
-        assert len(served) == num_microbatches // world == 2, (
-            f"expected 2 microbatches per producer, got {len(served)}"
+        # phase ① 合并调用：encoder 分支只被调一次，合并批样本数 = 每 producer 的 mb 数。
+        assert served == [num_microbatches // world], (
+            f"phase ① must serve ONE merged call with {num_microbatches // world} "
+            f"samples, got {served}"
         )
         # phase ④ 真的跑了：encoder 参数拿到梯度（裸模型，无 DDP —— 4.6e 跳过 no_sync/
         # finalize，直接 autograd.backward 到参数上）。
@@ -518,7 +557,7 @@ def _run_multi_microbatch_once(
     生产入口把两者都硬编码为 True（arguments.py），所以"同时开"这个组合必须被覆盖。
     """
     world = Utils.world_size
-    num_microbatches, my_microbatches, batches = _my_microbatches_setup(world)
+    num_microbatches, my_microbatches, merged_batch = _my_microbatches_setup(world)
     try:
         torch.manual_seed(20260827)
         encoder = MockEncoder().cuda()
@@ -527,11 +566,11 @@ def _run_multi_microbatch_once(
         backbone.config.deallocate_pipeline_outputs = deallocate_pipeline_outputs
         served = []
         fake_forward_step = _make_fake_colocated_forward_step(
-            batches, my_microbatches, encoder, backbone, served
+            merged_batch, encoder, backbone, served
         )
         forward_backward_colocated(
             forward_step_func=fake_forward_step,
-            data_iterator=object(),
+            data_iterator=iter([merged_batch]),
             model=[encoder, backbone],
             num_microbatches=num_microbatches,
             seq_length=_SEQ_LENGTH,
@@ -544,15 +583,16 @@ def _run_multi_microbatch_once(
 
 
 def test_colocated_deallocate_encoder_outputs_keeps_grads():
-    """两个 deallocate 开关都不改变 encoder 梯度（Task 4.9）。
+    """两个 deallocate 开关都不改变 encoder 梯度（Task 4.9；Task 1 后 encoder 侧失效）。
 
-    producer 把包序列化进发送缓冲后伪释放 ``image_embeddings.data``，phase ④ 改走
-    ``custom_backward``——只用图与形状元数据，梯度必须与不开关时逐元素一致。
-    第三个组合（两个开关同时为 True）是**生产入口的实际配置**（arguments.py 把
-    ``deallocate_encoder_outputs`` 与 ``deallocate_pipeline_outputs`` 都硬编码为 True），
-    此时 backbone 1F1B 的 ``output_tensor`` 也变成空壳、`backward_step` 走 custom_backward，
-    与 phase ④ 的 custom_backward 同时存在，必须实测而不是推断。
-    world=1 时 P=1、没有网络发送路径，伪释放不会触发，跳过。
+    优化 spec Task 1（合并前传）起，encoder 侧伪释放**结构性失效**：
+    ``_deallocate_encoder_output`` 已改为显式 no-op——各包的 ``image_embeddings`` 是
+    合并张量的 view，伪释放释放不了 base 的存储，且合并张量本就要活到 phase ④ 的
+    单次 backward。本用例降级为**回归守卫**：开关组合不得改变梯度。
+    backbone 侧的 ``deallocate_pipeline_outputs``（PP 激活伪释放、``backward_step``
+    走 ``custom_backward``）仍然真实生效——生产入口把两个开关都硬编码为 True
+    （arguments.py），该组合必须实测。
+    world=1 时 P=1、没有网络发送路径，跳过。
     """
     if Utils.world_size == 1:
         pytest.skip("Task 4.9 只在有 producer 网络发送路径时生效（world_size > 1）")

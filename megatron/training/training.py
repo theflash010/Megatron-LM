@@ -834,6 +834,89 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
+# ---- Optimization spec Task 3: CUDA memory snapshot hooks (env-gated, default off) ----
+# 启用条件：COLLOCATED_MEM_SNAPSHOT_DIR（pickle 输出目录）与
+# COLLOCATED_MEM_SNAPSHOT_DUMP_AT_ITER（目标 iteration N）两个环境变量齐全；可选
+# COLLOCATED_MEM_SNAPSHOT_RANKS（默认 "0"）与 COLLOCATED_MEM_SNAPSHOT_MAX_ENTRIES
+# （默认 200000）。埋点分两处：
+#   - 记录起点在训练入口脚本的 __main__ 里、pretrain() 之前（见 maybe_start_memory_
+#     snapshot_recording）——此时 torch.distributed 尚未初始化，rank 从环境变量 RANK
+#     读取（torchrun 为每个 worker 注入）。这样权重/优化器状态/DDP 桶等常驻块在分配时
+#     就带上调用栈。栈存在块自身（segments[].blocks[].frames）上，与环形缓冲无关：
+#     alloc 事件即使后来被挤出窗口，块的归因仍然完整。环形缓冲（max_entries 条事件）
+#     只决定时间线能回放多远。
+#   - dump 点在 train() 循环头 iteration == N+1——所有 rank 在同一迭代边界命中（循环
+#     被流水线同步），无轮询无 sleep；dump 后训练照常继续，不打断任何 rank。
+# 已知口径：pickle 的"存活块清单"是 dump 时刻状态；时间线只保留最近 max_entries 条
+# 事件——每个块的一生占 alloc / free_requested / free_completed 三条事件，
+# 200000 ≈ 恰好覆盖最后一个 iteration（GBS=64/MBS=1/world=4 实测 ~181.5k 事件/iter）。
+# ---- CUDA memory snapshot hooks (opt-in via env; see Chinese comment above) ----
+
+_memory_snapshot_config = None
+
+
+def maybe_start_memory_snapshot_recording():
+    """Start CUDA allocation-history recording before pretrain() (env-gated, no-op by default).
+
+    在 pretrain() 之前开启 CUDA 分配历史记录（环境开关驱动，默认无操作）。
+    构建全局 memory_snapshot_config 供 dump 钩子使用；记录本身只在选定 rank 开启。
+    此刻 torch.distributed 尚未初始化，rank 从环境变量 RANK 读取（torchrun 注入）。
+    """
+    global _memory_snapshot_config
+    memory_snapshot_dir = os.environ.get("COLLOCATED_MEM_SNAPSHOT_DIR")
+    memory_snapshot_dump_at_iter = os.environ.get("COLLOCATED_MEM_SNAPSHOT_DUMP_AT_ITER")
+    if not memory_snapshot_dir or not memory_snapshot_dump_at_iter:
+        return
+    memory_snapshot_ranks = {
+        int(item)
+        for item in os.environ.get("COLLOCATED_MEM_SNAPSHOT_RANKS", "0").split(",")
+        if item.strip()
+    }
+    _memory_snapshot_config = {
+        "snapshot_dir": memory_snapshot_dir,
+        "dump_at_iter": int(memory_snapshot_dump_at_iter),
+        "ranks": memory_snapshot_ranks,
+        "max_entries": int(os.environ.get("COLLOCATED_MEM_SNAPSHOT_MAX_ENTRIES", "200000")),
+    }
+    os.makedirs(memory_snapshot_dir, exist_ok=True)
+    print(
+        f"[memory-snapshot] enabled: dump_at={_memory_snapshot_config['dump_at_iter']}, "
+        f"ranks={sorted(_memory_snapshot_config['ranks'])}, "
+        f"max_entries={_memory_snapshot_config['max_entries']}, dir={memory_snapshot_dir}",
+        flush=True,
+    )
+    if int(os.environ.get("RANK", "0")) in _memory_snapshot_config["ranks"]:
+        torch.cuda.memory._record_memory_history(max_entries=_memory_snapshot_config["max_entries"])
+        print(
+            f"[memory-snapshot] recording started (rank={os.environ.get('RANK', '0')}, "
+            f"max_entries={_memory_snapshot_config['max_entries']})",
+            flush=True,
+        )
+
+
+def maybe_dump_memory_snapshot(iteration):
+    """Dump the allocation snapshot at the loop head of iteration == dump_at_iter + 1 (env-gated, no-op by default).
+
+    在目标 iteration 的下一轮循环头把 pickle 落盘并停止记录（环境开关驱动，默认无操作）。
+    dump 之后不做任何打断：记录已停止（enabled=None），训练照常继续，何时停由使用者决定。
+    """
+    if _memory_snapshot_config is None:
+        return
+    if iteration != _memory_snapshot_config["dump_at_iter"] + 1:
+        return
+    if torch.distributed.get_rank() in _memory_snapshot_config["ranks"]:
+        memory_snapshot_path = os.path.join(
+            _memory_snapshot_config["snapshot_dir"],
+            f"mem_snapshot_rank{torch.distributed.get_rank()}.pickle",
+        )
+        print(f"[memory-snapshot] dumping rank={torch.distributed.get_rank()} ...", flush=True)
+        torch.cuda.memory._dump_snapshot(memory_snapshot_path)
+        torch.cuda.memory._record_memory_history(enabled=None)
+        print(f"[memory-snapshot] dumped rank={torch.distributed.get_rank()} -> {memory_snapshot_path}", flush=True)
+    else:
+        print(f"[memory-snapshot] rank={torch.distributed.get_rank()} passthrough", flush=True)
+
+
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -3459,8 +3542,13 @@ def train(
 
     # Run training iterations till done.
     buffered_rollouts = None
+
     while iteration < args.train_iters: #循环迭代
-        if (args.profile 
+        # ---- Memory snapshot dump hook: recording starts in the entry script before
+        # pretrain(); dump happens at the N+1 loop head; see maybe_dump_memory_snapshot. ----
+        maybe_dump_memory_snapshot(iteration)
+
+        if (args.profile
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
             # Enable NVTX range when profiling starts and nvtx_ranges is set.

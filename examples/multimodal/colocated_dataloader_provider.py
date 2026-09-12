@@ -33,9 +33,41 @@ from dataloader_provider import EnergonDataloader, datasets_provider
 from dataset_helpers import TaskEncoder
 
 from megatron.core import parallel_state
+from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.utils import get_pg_rank, get_pg_size
 from megatron.energon import WorkerConfig, get_savable_loader
 from megatron.training import get_args
+
+
+def colocated_encoder_merged_batch_size():
+    """Dataloader batch size for the merged encoder forward (optimization spec Task 1).
+
+    合并前传（优化 spec doc §1.2 设计 A）要求本 rank 在一个 iteration 内的
+    ``num_microbatches / num_producers`` 个 micro batch **一次取回**，因此 Energon 的
+    batch_size 取 ``micro_batch_size * num_microbatches / num_producers``。两个前提在
+    这里运行时钉住：
+
+    * **不支持 rampup batch size**——dataloader 的 batch_size 在建表时固定，而 rampup
+      会在训练中改变 ``num_microbatches``，两者矛盾；当前共置脚本也未使用 rampup。
+    * **``num_microbatches`` 必须能被 producer 数整除**——轮盘分配
+      （``get_microbatches_for_producer``）与合并粒度共用这条不变量。
+
+    Returns:
+        合并后的 batch size（样本/批）。GBS=64、MBS=1、4 producers 时为 16。
+    """
+    args = get_args()
+    assert args.rampup_batch_size is None, (
+        "the merged encoder forward fixes the dataloader batch size at build time, which "
+        f"conflicts with --rampup-batch-size {args.rampup_batch_size} (num_microbatches "
+        "changes per iteration); colocated training does not support rampup batch size"
+    )
+    num_microbatches = get_num_microbatches()
+    num_producers = get_pg_size(parallel_state.get_colocated_data_parallel_group())
+    assert num_microbatches % num_producers == 0, (
+        f"num_microbatches ({num_microbatches}) must be divisible by the number of "
+        f"producers ({num_producers}); see get_microbatches_for_producer"
+    )
+    return args.micro_batch_size * (num_microbatches // num_producers)
 
 
 def is_colocated_dataloader_rank():
@@ -95,7 +127,10 @@ def colocated_train_valid_test_dataloaders_provider(
     )
 
     train_dataset, _, _ = datasets_provider(
-        task_encoder, worker_config, build_validation=False
+        task_encoder,
+        worker_config,
+        build_validation=False,
+        batch_size=colocated_encoder_merged_batch_size(),
     )
     train_dataloader = get_savable_loader(train_dataset, worker_config=worker_config)
 

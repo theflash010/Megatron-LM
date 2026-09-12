@@ -40,7 +40,7 @@ from megatron.core.models.multimodal.colocated_llava_model import (
     ColocatedViTEncoder,
 )
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
-from megatron.core.pipeline_parallel.colocated_encoder_comm import ForwardPacket
+from megatron.core.pipeline_parallel.colocated_encoder_comm import MergedEncoderBatch
 from megatron.core.pipeline_parallel.colocated_schedule import forward_backward_colocated
 from megatron.core.pipeline_parallel.schedules import forward_backward_no_pipelining
 from megatron.core.tensor_parallel.random import (
@@ -361,8 +361,11 @@ def _make_colocated_forward_step(encoder_module, backbone_module):
         chunk = model[0] if isinstance(model, (list, tuple)) else model
         module = chunk.module if isinstance(chunk, DistributedDataParallel) else chunk
         if module is encoder_module:
+            # 优化 spec Task 1（设计 A）：encoder 分支每个 iteration 只被调一次——一次
+            # next() 取回本 rank 的合并批（batch 顺序 == 轮盘序列），一次前传 ->
+            # (MergedEncoderBatch, None)，由 schedule 拆分回逐 microbatch 的包。
             tokens, labels, images, num_image_tiles = next(data_iterator)
-            return ForwardPacket(
+            return MergedEncoderBatch(
                 image_embeddings=chunk(images),
                 tokens=tokens,
                 labels=labels,
@@ -417,8 +420,19 @@ def _wrap_with_ddp(chunk, pg_collection):
 
 
 def _my_data_iterator(microbatches, replica: int, my_microbatches: List[int]):
-    """本 rank 的数据迭代器：只产出属于自己的 (replica, microbatch)，按 phase ① 的消费顺序。"""
-    return iter([microbatches[(replica, index)] for index in my_microbatches])
+    """本 rank 的数据迭代器（优化 spec Task 1，设计 A）：一次产出**合并批**。
+
+    合并批 = 属于本 rank 的全部 microbatch 样本沿 batch 维堆叠（batch 顺序 == 轮盘
+    序列，即 ``my_microbatches`` 的升序）——encoder 分支一次 ``next()`` 消费完，
+    与生产 dataloader 的合并粒度一致。
+    """
+    merged = tuple(
+        torch.cat(
+            [microbatches[(replica, index)][field] for index in my_microbatches], dim=0
+        )
+        for field in range(4)
+    )
+    return iter([merged])
 
 
 def test_two_layer_dp_matches_sequential_global_batch():
@@ -507,11 +521,18 @@ def test_two_layer_dp_matches_sequential_global_batch():
                 )
                 assert hasattr(parameter, "main_grad"), f"{name} 没有 main_grad（DDP 没生效）"
                 actual = parameter.main_grad.float() * total_tokens
+                # 优化 spec Task 1（合并前传）：共置路径的 GEMM 形状变为整批（如
+                # vision_projection fc1 一次吃 [mbs*n/P, h]，参考路径逐 mb 各一次），
+                # bf16 累加顺序不同 ⇒ 纯舍入级噪声；且该差异随链路传播——backbone 吃到
+                # 略有不同的 image_embeddings 后，其下游参数（如 linear_proj.bias，对
+                # s×b 求和）也带同量级偏差（实测最大 ~2.4e-3）。atol/rtol 放宽到 1e-2
+                # 容纳它；Task 5.8 的结构性错误（per-token 分母错 P 倍、分片错位）是
+                # 相对差 ~1.0 的量级级偏差，仍会被牢牢拦住。
                 torch.testing.assert_close(
                     actual,
                     reference_grads[reference_name].float(),
-                    atol=1e-4,
-                    rtol=1e-3,
+                    atol=1e-2,
+                    rtol=1e-2,
                     msg=lambda formatted, name=name: f"参数 {name} 的归约后梯度不一致\n{formatted}",
                 )
                 checked += 1

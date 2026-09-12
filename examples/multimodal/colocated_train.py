@@ -45,7 +45,7 @@ from megatron.core.models.multimodal.colocated_llava_model import (
 )
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX
 from megatron.core.parallel_state import get_colocated_encoder_tensor_model_parallel_group
-from megatron.core.pipeline_parallel.colocated_encoder_comm import ForwardPacket
+from megatron.core.pipeline_parallel.colocated_encoder_comm import MergedEncoderBatch
 from megatron.core.pipeline_parallel.colocated_schedule import IntraPacket
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import (
@@ -61,7 +61,13 @@ from megatron.training.arguments import parse_and_validate_args
 
 
 def colocated_encoder_get_batch(data_iterator, image_token_index, img_seq_len):
-    """Phase ①: fetch a micro batch for the encoder producer (image + pack fields).
+    """Phase ①: fetch one (possibly merged) batch for the encoder producer (image + pack fields).
+
+    优化 spec Task 1 起 batch 维与"一个 micro batch"解耦：非合并模式下一个 batch 就是
+    一个 micro batch（batch_size = micro_batch_size）；合并模式（设计 A）下 dataloader 的
+    batch_size 已提到 ``micro_batch_size * num_microbatches / num_producers``，一次
+    ``next()`` 取回**本 rank 整个 iteration 的全部 micro batch**。本函数对 batch 维完全
+    形状无关：取数、broadcast、labels 左移、pad 检查都按张量形状走，代码不变。
 
     只取 encoder 前传 + 打包所需：images（前传）、tokens/labels/num_image_tiles（打包给
     消费者）。**不生成 loss_mask/position_ids**（2026-08-13 用户确认：消费者在
@@ -234,32 +240,44 @@ def _half_precision_forward_kwargs(chunk):
 
 
 def _encoder_forward(data_iterator, encoder_chunk):
-    """Phase ①: fetch data and run the encoder-only forward -> ForwardPacket.
+    """Phase ①: fetch the MERGED batch and run the encoder-only forward -> MergedEncoderBatch.
 
-    phase ①（schedule 外）：取一个 micro batch 的数据，``encoder_chunk(images)`` 纯前传，
-    返回 5 字段前向包 ``ForwardPacket``（4 个内容字段 + microbatch id 字段，id 由
-    schedule 打标；``image_embeddings`` 保留 grad_fn，phase ④ 统一反传用；分离图在
-    发送/组装时 detach）。返回 ``(packet, None)`` 给 schedule 存 buffer。
+    优化 spec Task 1（设计 A）：dataloader 的 batch_size 已由 provider 提到合并粒度
+    （``micro_batch_size * num_microbatches / num_producers``，colocated_dataloader_provider.py
+    的 ``colocated_encoder_merged_batch_size``），因此本函数一次 ``next()`` 取回的是
+    **本 rank 整个 iteration 的全部 micro batch**，`encoder_chunk` 也只调**一次**：
+
+    - `colocated_encoder_get_batch` 对 batch 维完全形状无关（broadcast / 左移 labels /
+      pad 检查都按张量形状走），代码不变，语义从"一个 micro batch"变为"一个合并批"；
+    - 返回 ``MergedEncoderBatch``（裸张量集合，非 ``ForwardPacket``——合并批永不上
+      线路，见其 docstring）。``image_embeddings`` 为
+      ``[img_seq_len, merged_batch, h_lang]``（seq-first，batch 在 dim=1）。
+      **切分回逐 microbatch 的 ForwardPacket 发生在 schedule**
+      （``_colocated_encoder_forward``，经 ``ForwardPacket.split_merged_batch``）。
+    - ``image_embeddings`` 保留 grad_fn（phase ④ 对**整块**做合并反传）；分离图在
+      发送/组装时 detach。返回 ``(batch, None)`` 与 forward_step 契约一致。
     """
     args = get_args()
     image_token_index = getattr(args, "image_token_index", None)
     img_seq_len = getattr(args, "img_seq_len", None)
-    # 只取 images + 打包字段（tokens/labels/num_image_tiles）；
+    # 一次取回合并批（images + 打包字段 tokens/labels/num_image_tiles）；
     # loss_mask/position_ids 不在 producer 侧生成（消费者在 colocated_backbone_get_batch 里重建）。
     tokens, labels, images, num_tiles = colocated_encoder_get_batch(
         data_iterator, image_token_index, img_seq_len
     )
+    # 一次前传跑完合并批：[img_seq_len, merged_batch, h_lang]，保留 grad_fn。
     image_embeddings = encoder_chunk(
         images, **_half_precision_forward_kwargs(encoder_chunk)
-    )  # [img_seq_len, num_tiles, h_lang]，保留 grad_fn
-    packet = ForwardPacket(
-        image_embeddings=image_embeddings,
-        tokens=tokens,
-        labels=labels,
-        num_image_tiles=num_tiles,
     )
-    assert set(packet.to_dict()) == set(ForwardPacket.field_names)
-    return packet, None
+    return (
+        MergedEncoderBatch(
+            image_embeddings=image_embeddings,
+            tokens=tokens,
+            labels=labels,
+            num_image_tiles=num_tiles,
+        ),
+        None,
+    )
 
 
 def _backbone_forward(data_iterator, backbone_chunk, packet=None, intra_packet=None):
@@ -341,7 +359,11 @@ def colocated_forward_step(data_iterator, model, packet=None, intra_packet=None)
     注入给 train_step 的唯一 forward_step_func（签名 ``(data_iterator, model)``），按
     ``model`` 的 chunk 类型分支：
     - ``model=[encoder_chunk]``（phase ①，schedule 调，**list**）：encoder 分支，返回
-      ``(ForwardPacket, None)``；
+      ``(MergedEncoderBatch, None)``。优化 spec Task 1（设计 A）起 schedule **每个
+      iteration 只调一次**，返回的是**合并批的裸张量集合**（非 ``ForwardPacket``——
+      合并批永不上线路，见 ``MergedEncoderBatch`` 的 docstring），由 schedule 经
+      ``ForwardPacket.split_merged_batch`` 拆分回逐 microbatch 的包并打
+      ``microbatch_id``；
     - ``model=backbone_chunk``（phase ②，1F1B 调，**已解包的单 chunk**——forward_step
       辅助函数在 schedules.py 内 ``model = model[0]``）：backbone 分支，输入已由 schedule
       设置好，返回 ``(output, loss_func)``。
@@ -391,6 +413,7 @@ if __name__ == "__main__":
     # Imported here rather than at module scope: these are entry-only dependencies.
     from colocated_args import add_colocated_extra_args, validate_colocated_args
     from colocated_dataloader_provider import colocated_train_valid_test_dataloaders_provider
+    from megatron.training.training import maybe_start_memory_snapshot_recording
     from model import model_provider
     from train import llava_embedding_ranks, llava_position_embedding_ranks
 
@@ -405,6 +428,13 @@ if __name__ == "__main__":
     # does not know these fields.
     validate_colocated_args(args)
     full_config = pretrain_cfg_container_from_args(args)
+
+    # env-gated CUDA memory snapshot: start recording BEFORE pretrain() so that
+    # weights / optimizer states / DDP buckets carry allocation stacks. torch.distributed
+    # is not initialized yet - the rank filter reads the RANK env var (set by torchrun).
+    # 显存快照（环境开关驱动，默认无操作）：记录在 pretrain() 之前开启，权重/优化器/
+    # DDP 桶的分配才带调用栈。此刻 torch.distributed 尚未初始化，rank 过滤读 RANK 环境变量。
+    maybe_start_memory_snapshot_recording()
 
     pretrain(
         full_config,

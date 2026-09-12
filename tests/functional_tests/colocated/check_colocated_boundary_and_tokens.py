@@ -44,6 +44,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.colocated_llava_model import ColocatedViTEncoder
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.parallel_state import get_microbatches_for_producer
+from megatron.core.pipeline_parallel.colocated_encoder_comm import ForwardPacket
 from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_pg_rank, get_pg_size, unwrap_model
 from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
@@ -167,9 +168,10 @@ def instrumented_forward_step(data_iterator, model, packet=None, intra_packet=No
             state["ids"] = get_microbatches_for_producer(
                 get_pg_rank(boundary_group), get_num_microbatches(), get_pg_size(boundary_group)
             )
-        # 第 2 个 iteration 的第一次 encoder 调用：所有 rank 都刚走完第 1 个 iteration 的
-        # 全部相位，此刻落盘的记录完整且各 rank 同步到达。
-        if state["encoder_calls"] == len(state["ids"]) and not state["dumped"]:
+        # 优化 spec Task 1（合并前传）：encoder 分支每个 iteration 只调一次——第 2 个
+        # iteration 的第一次 encoder 调用即"第 2 个 iteration 开始"，此刻落盘的记录
+        # 完整且各 rank 同步到达。
+        if state["encoder_calls"] == 1 and not state["dumped"]:
             dump_records()
             state["dumped"] = True
 
@@ -181,15 +183,23 @@ def instrumented_forward_step(data_iterator, model, packet=None, intra_packet=No
         return result
 
     if is_encoder_branch:
-        produced_packet, _ = result
-        # id 按 phase ① 的循环顺序取（schedule 在 forward_step_func 返回**之后**才给包打上
-        # microbatch_id，这里拿不到）。若这个顺序假设不成立，producer/consumer 摘要就会对不上，
-        # 由离线比对的第 ② 项直接暴露，而不会静默通过。
-        # The id follows phase ①'s loop order, because the schedule stamps microbatch_id only
-        # after forward_step_func returns. A wrong assumption here surfaces as a digest
-        # mismatch in check ②, never as a silent pass.
-        microbatch_id = state["ids"][state["encoder_calls"] % len(state["ids"])]
-        records["producer_packets"][str(microbatch_id)] = packet_digest(produced_packet)
+        produced_batch, _ = result
+        # 合并批（MergedEncoderBatch，优化 spec Task 1）：一次调用产出整个 iteration
+        # 的样本。按与 schedule 相同的规则（ForwardPacket.split_merged_batch 等分）还原
+        # 逐 microbatch 的包做摘要；batch 顺序 == 轮盘序列（沿用旧的"循环顺序"假设，
+        # 若不成立由离线比对的第 ② 项直接暴露，不会静默通过）。
+        # The merged batch is split with the SAME rule the schedule uses; the batch order
+        # equals the round-robin order (the old "loop order" assumption) — a wrong order
+        # surfaces as a digest mismatch in check ②, never as a silent pass.
+        per_mb_packets = ForwardPacket.split_merged_batch(
+            image_embeddings=produced_batch.image_embeddings,
+            tokens=produced_batch.tokens,
+            labels=produced_batch.labels,
+            num_image_tiles=produced_batch.num_image_tiles,
+            num_splits=len(state["ids"]),
+        )
+        for microbatch_id, split_packet in zip(state["ids"], per_mb_packets):
+            records["producer_packets"][str(microbatch_id)] = packet_digest(split_packet)
         state["encoder_calls"] += 1
         return result
 

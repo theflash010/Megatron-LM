@@ -24,7 +24,7 @@ from megatron.training import get_args
 from megatron.training.checkpointing import get_checkpoint_name
 
 
-def datasets_provider(task_encoder,worker_config=None, build_validation=True):
+def datasets_provider(task_encoder,worker_config=None, build_validation=True, batch_size=None):
     """Create multimodal train, validation and test datasets.
 
     ``build_validation=False`` builds the train dataset only. Colocated training does not
@@ -33,13 +33,24 @@ def datasets_provider(task_encoder,worker_config=None, build_validation=True):
     to declare a val split.
     ``build_validation=False`` 时只建训练集：共置训练不支持评估（arguments.py 的共置校验块
     已断言），建验证集既是白做，又会额外要求数据集必须声明 val split。
+
+    ``batch_size`` overrides the train dataset's batch size when given. Colocated training
+    passes the MERGED batch size (``micro_batch_size * num_microbatches / num_producers``)
+    so that one ``next(data_iterator)`` fetches every micro batch the rank owns in the
+    iteration and the encoder runs one merged forward over all of them (optimization spec
+    Task 1, design A). Non-colocated training leaves it None and keeps ``micro_batch_size``.
+    ``batch_size`` 非空时覆盖训练集的 batch size：共置训练传入合并粒度
+    （``micro_batch_size * num_microbatches / num_producers``），让一次 ``next(data_iterator)``
+    取回本 rank 在该 iteration 拥有的全部 micro batch，encoder 只做一次合并前传（优化 spec
+    Task 1，设计 A）；非共置路径不传，维持 ``micro_batch_size`` 不变。
     """
     args = get_args()
 
     dname = args.data_path[0] if type(args.data_path) is list else args.data_path #数据集路径
+    train_batch_size = batch_size if batch_size is not None else args.micro_batch_size
     train_dataset = get_train_dataset(
         dname,
-        batch_size=args.micro_batch_size, #每个batch size是micro batch size
+        batch_size=train_batch_size, #非共置是 micro batch size；共置下是合并粒度（见函数 docstring）
         task_encoder=task_encoder,
         virtual_epoch_length=1000, #每个dp rank在一个epoch处理的样本数量
         max_samples_per_sequence=100, #每个 sample-sequence 最多包含多少个样本。用于数据打包（packing），把多个短序列拼成一个长序列以提高训练效率。

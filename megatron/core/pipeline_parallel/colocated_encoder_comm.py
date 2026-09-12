@@ -30,7 +30,7 @@ backbone 1F1B 的 P2P 在同一组上排队（stream 串行）以及潜在的交
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -85,6 +85,35 @@ def _padded_bytes(num_bytes: int, align: int = _ALIGN) -> int:
     用同一规则计算，保证布局一致）。
     """
     return (num_bytes + align - 1) // align * align
+
+
+class MergedEncoderBatch(NamedTuple):
+    """The merged encoder batch: raw fields, NOT a ForwardPacket (optimization Task 1).
+
+    优化 spec Task 1（合并前传，设计 A）：dataloader 一次取回本 rank 整个 iteration 的
+    合并批、encoder 只前传一次。这个中间量**只在本 rank 本地存在、永不上线路**（没有
+    ``microbatch_id``、不可序列化），因此刻意**不**包成 ``ForwardPacket``——那会污染
+    "packet = 跨边界线红单元"的语义。逐 microbatch 的 ``ForwardPacket`` 只在 schedule
+    调 ``ForwardPacket.split_merged_batch`` 拆分并打标之后才诞生。
+
+    Optimization spec Task 1 (design A): the dataloader fetches the rank's whole
+    iteration in one merged batch and the encoder forwards it once. This intermediate
+    exists only locally and never crosses the wire (no microbatch_id, not serializable),
+    so it is deliberately NOT wrapped in a ForwardPacket — that would muddy the
+    "packet = boundary wire unit" semantics. Per-microbatch ForwardPackets come into
+    being only after the schedule splits via ForwardPacket.split_merged_batch and
+    stamps the ids.
+
+    字段布局与 ``ForwardPacket`` 的内容字段一一对应（batch 维是"样本数"：mbs=1 时等于
+    microbatch 数）。``image_embeddings`` 保留 grad_fn（phase ④ 对整块做单次 backward）。
+    Field layout mirrors ForwardPacket's content fields (the batch dim counts samples;
+    with mbs=1 it equals the microbatch count). image_embeddings keeps grad_fn.
+    """
+
+    image_embeddings: torch.Tensor  # [img_seq_len, merged_batch, h_lang]（seq-first）
+    tokens: torch.Tensor  # [merged_batch, L]
+    labels: torch.Tensor  # [merged_batch, L + 1]
+    num_image_tiles: torch.Tensor  # [merged_batch]
 
 
 @dataclass
@@ -172,6 +201,85 @@ class ForwardPacket:
             "microbatch_id": self.microbatch_id,
         }
 
+    @classmethod
+    def split_merged_batch(
+        cls,
+        image_embeddings: torch.Tensor,
+        tokens: torch.Tensor,
+        labels: torch.Tensor,
+        num_image_tiles: torch.Tensor,
+        num_splits: int,
+    ) -> List["ForwardPacket"]:
+        """Split a MERGED encoder batch into per-microbatch packets along the batch dim.
+
+        优化 spec Task 1（合并前传，设计 A）：dataloader 一次取回本 rank 整个 iteration
+        的合并批、encoder 只前传一次，本方法把合并批的**裸张量**等分成逐 microbatch 的
+        ``ForwardPacket``。输入刻意是裸张量而非某个"合并 packet"——合并批只在本
+        rank 本地存在、永不上线路（没有 microbatch_id、不可序列化），包成 packet 会
+        污染"packet = 跨边界线红单元"的语义；``ForwardPacket`` 实例只在本方法返回的
+        逐 microbatch 粒度上诞生（调用方随后打 ``microbatch_id``）。切分维度由各字段
+        的布局决定：
+
+        - ``image_embeddings`` 是 seq-first ``[img_seq_len, batch, h_lang]``，沿 **dim=1**
+          切——切片是 view 且**保留 grad_fn**，整批仍只有一张计算图（phase ④ 对合并
+          张量做单次 backward，合并张量由 schedule 持有；从 view 拿不回父张量，这正是
+          schedule 要显式持有它的原因）；
+        - ``tokens``/``labels`` 是 ``[batch, L]``、``num_image_tiles`` 是 ``[batch]``，
+          沿 **dim=0** 切（文本字段无梯度）。
+
+        两条数据假设在这里运行时钉住（配置一变立刻失败，而不是静默切错位）：
+        ① 合并批的 batch 维必须能被 ``num_splits`` 整除——每个 split 收
+        ``batch_dim // num_splits`` 个样本（= mbs；mbs=1 时 batch 维恰等于 num_splits）；
+        ② 每个样本恰好一个 image tile（无 tiling/packing；启用后需改 cumsum 变长切分）。
+        切片保持 view、**不**做 ``contiguous()``：通信器序列化时逐字段
+        ``contiguous()``（``serialize`` 的扁平化拷贝本来就免不了），本地路径消费 view
+        也没有问题；预拷贝只会白白多一份峰值显存。
+
+        Returns:
+            ``num_splits`` 个 ``ForwardPacket``，**按 batch 顺序**排列——调用方
+            （schedule）用自己的轮盘 microbatch 序列一一对应打 ``microbatch_id``。
+        """
+        batch_dim = image_embeddings.shape[1]
+        assert batch_dim % num_splits == 0, (
+            f"merged image_embeddings batch dim ({batch_dim}) must be divisible by "
+            f"num_splits ({num_splits}): each microbatch owns "
+            f"micro_batch_size = batch_dim / num_splits samples "
+            "(dataloader merged batch size = micro_batch_size * num_microbatches / "
+            "num_producers)"
+        )
+        assert (
+            tokens.shape[0] == batch_dim
+            and labels.shape[0] == batch_dim
+            and num_image_tiles.numel() == batch_dim
+        ), (
+            f"merged text fields batch dims (tokens {tokens.shape}, labels {labels.shape}, "
+            f"num_tiles {tuple(num_image_tiles.shape)}) must all be {batch_dim}"
+        )
+        if bool((num_image_tiles != 1).any().item()):
+            raise AssertionError(
+                "every sample must own exactly one image tile for the equal-split merge, "
+                f"got num_tiles={num_image_tiles.tolist()}; tiling/packing configurations "
+                "need a cumsum-based variable-length split instead"
+            )
+
+        # torch.chunk 在可整除时给出 num_splits 个等大 view；切片顺序即 batch 顺序。
+        image_chunks = torch.chunk(image_embeddings, num_splits, dim=1)
+        token_chunks = torch.chunk(tokens, num_splits, dim=0)
+        label_chunks = torch.chunk(labels, num_splits, dim=0)
+        tile_chunks = torch.chunk(num_image_tiles, num_splits, dim=0)
+        return [
+            cls(
+                image_embeddings=image_chunk,
+                tokens=token_chunk,
+                labels=label_chunk,
+                num_image_tiles=tile_chunk,
+                # microbatch_id 留 None：调用方按轮盘序列打标后才能发送。
+            )
+            for image_chunk, token_chunk, label_chunk, tile_chunk in zip(
+                image_chunks, token_chunks, label_chunks, tile_chunks
+            )
+        ]
+
     def field_dtypes(self, float_dtype: torch.dtype) -> List[torch.dtype]:
         """Per-field dtypes, resolving None (image_embeddings) to ``float_dtype``.
         各字段 dtype（image_embeddings 用传入的 float dtype，其余固定）。
@@ -256,6 +364,35 @@ class ForwardPacket:
         # 5 个字段按规范顺序切出（第 5 个即 microbatch id 张量），与 dataclass 字段顺序
         # 一致，直接整体构造。
         return ForwardPacket(*fields)
+
+
+class MergedEncoderBatch(NamedTuple):
+    """The merged encoder batch: raw fields, NOT a ForwardPacket (optimization Task 1).
+
+    优化 spec Task 1（合并前传，设计 A）：dataloader 一次取回本 rank 整个 iteration 的
+    合并批、encoder 只前传一次。这个中间量**只在本 rank 本地存在、永不上线路**（没有
+    ``microbatch_id``、不可序列化），因此刻意**不**包成 ``ForwardPacket``——那会污染
+    "packet = 跨边界线红单元"的语义。逐 microbatch 的 ``ForwardPacket`` 只在 schedule
+    调 ``ForwardPacket.split_merged_batch`` 拆分并打标之后才诞生。
+
+    Optimization spec Task 1 (design A): the dataloader fetches the rank's whole
+    iteration in one merged batch and the encoder forwards it once. This intermediate
+    exists only locally and never crosses the wire (no microbatch_id, not serializable),
+    so it is deliberately NOT wrapped in a ForwardPacket — that would muddy the
+    "packet = boundary wire unit" semantics. Per-microbatch ForwardPackets come into
+    being only after the schedule splits via ForwardPacket.split_merged_batch and
+    stamps the ids.
+
+    字段布局与 ``ForwardPacket`` 的内容字段一一对应（batch 维是"样本数"：mbs=1 时等于
+    microbatch 数）。``image_embeddings`` 保留 grad_fn（phase ④ 对整块做单次 backward）。
+    Field layout mirrors ForwardPacket's content fields (the batch dim counts samples;
+    with mbs=1 it equals the microbatch count). image_embeddings keeps grad_fn.
+    """
+
+    image_embeddings: torch.Tensor  # [img_seq_len, merged_batch, h_lang]（seq-first）
+    tokens: torch.Tensor  # [merged_batch, L]
+    labels: torch.Tensor  # [merged_batch, L + 1]
+    num_image_tiles: torch.Tensor  # [merged_batch]
 
 
 @dataclass
