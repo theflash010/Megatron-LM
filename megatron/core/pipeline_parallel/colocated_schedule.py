@@ -24,6 +24,7 @@ microbatch p, p+P, p+2P, ...，即每个 producer 处理 ``num_microbatches / P 
 """
 
 import contextlib
+
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
@@ -177,13 +178,12 @@ def forward_backward_colocated(
         parallel_state.get_colocated_boundary_group(), config
     )
 
-    # 4.6g：流水前预热边界通信——每 producer 双向各一次 1 元素交换。边界组上的
-    # communicator 与 p2p transport 都是懒初始化且会合带超时，而 1F1B 里 consumer 与
-    # producer 到达边界收发的时刻天然错开（最长 P-2 步），不预热会直接超时报错退出。
-    # 4.6g: warm up the boundary transports before the pipeline starts; lazy per-pair
-    # communicator / per-direction transport creation is a rendezvous with a timeout,
-    # and the two ends reach their first boundary op several steps apart in 1F1B.
-    comm.warmup_boundary_communicators()
+    # Boundary/PP warmup is NOT done here: both NCCL communicators are eagerly built
+    # ONCE at init time inside initialize_model_parallel (use_colocated_encoder block),
+    # which is the zero-traffic point; see the "one-time eager warmup" block there.
+    # 边界/PP 预热不在这里做：两个 NCCL communicator 已在 initialize_model_parallel
+    # （use_colocated_encoder 块）的初始化阶段一次性建好——那里是零流量时点；见该处的
+    # "one-time eager warmup" 块。
 
     # Phase ①：encoder **合并**前传 -> 本地 buffer + 合并张量（优化 spec Task 1，设计 A）。
     # schedule 每个 iteration 只调一次 forward_step_func 的 encoder 分支（一次取数 +

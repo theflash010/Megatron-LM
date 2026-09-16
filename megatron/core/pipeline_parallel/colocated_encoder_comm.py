@@ -35,6 +35,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from megatron.core import parallel_state
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.utils import nvtx_decorator
 
@@ -625,6 +626,16 @@ class EncoderBackboneBoundaryCommunicator:
     def warmup_boundary_communicators(self) -> None:
         """Create the per-pair communicator and both transport directions up-front.
 
+        NOTE (2026-09-14): this method is NO LONGER called by the schedule. The
+        canonical warmup moved to initialize_model_parallel's use_colocated_encoder
+        block ("one-time eager warmup"): the pp-group barrier + the same 1-element
+        exchanges now run ONCE at init, at the zero-traffic point. Kept as a manual
+        debugging/diagnostic utility only.
+        注意（2026-09-14）：本方法已不再被 schedule 调用。正式预热移至
+        initialize_model_parallel 的 use_colocated_encoder 块（"one-time eager warmup"）：
+        pp 组 barrier + 同样的 1 元素交换现在在初始化阶段（零流量时点）一次性执行。
+        本方法仅保留作手动调试/诊断工具。
+
         流水线开始前预热边界通信：对每个 producer p ∈ [1, group_size) **双向各做一次
         1 元素交换**，把懒初始化的会合开销挪到两端都确定会到的位置（Task 4.6g）。
 
@@ -646,6 +657,21 @@ class EncoderBackboneBoundaryCommunicator:
             # PP=1: everything is local, there is no boundary network at all.
             # PP=1 全本地直传，没有边界网络，无需预热。
             return
+        # Exp D (504 hang fix candidate): eagerly create the pipeline-group NCCL
+        # communicator HERE, before any boundary traffic is in flight. The pipeline
+        # group is a dedicated ProcessGroup instance whose NCCL comm is lazily built
+        # on its first p2p (parallel_state.py); at 504 that creation happened inside
+        # the first batched p2p's coalescing context WHILE the boundary packets were
+        # still in flight, freezing all 4 ranks inside the C++ enqueue (trace 2026-09-14).
+        # A barrier on the very same group (the one P2PCommunicator uses,
+        # colocated_schedule.py) moves the comm creation out of the collision window.
+        # 判别实验 D（504 挂死修复候选）：在 boundary 流量起飞前，就在这里强制完成
+        # pipeline 组 NCCL communicator 的懒初始化。pipeline 组是独立 ProcessGroup 实例、
+        # comm 懒建于首次 p2p（parallel_state.py）；504 下该创建发生在首次批量 p2p 的
+        # coalescing 语境里、且 boundary 包仍在飞，4 rank 全部冻结在 C++ 提交内部
+        # （2026-09-14 轨迹）。对同一 group（P2PCommunicator 实际使用的那一个，
+        # colocated_schedule.py）做一次 barrier，把 comm 创建挪出碰撞窗口。
+        dist.barrier(group=parallel_state.get_pipeline_model_parallel_group())
         send_buffer = torch.ones(1, dtype=self.dtype, device="cuda")
         recv_buffer = torch.empty(1, dtype=self.dtype, device="cuda")
         if self.is_consumer():
@@ -863,9 +889,10 @@ class EncoderBackboneBoundaryCommunicator:
         header_handle = dist.irecv(
             header, src=src_rank, group=self.colocated_boundary_group
         )
-        return _ForwardRecvRequest(
+        request = _ForwardRecvRequest(
             self, header_handle, header, src_rank, producer, expected_microbatch_id
         )._start()
+        return request
 
     def _start_recv_forward(self, request: "_ForwardRecvRequest") -> object:
         """Wait the header, allocate the data buffer, post the data irecv.
@@ -877,9 +904,10 @@ class EncoderBackboneBoundaryCommunicator:
         request._header_handle.wait()
         _, total_bytes = ForwardPacket.parse_shape_header(request._header, self.dtype)
         request._flat = torch.empty(total_bytes, dtype=torch.uint8, device="cuda")
-        return dist.irecv(
+        data_handle = dist.irecv(
             request._flat, src=request._src_rank, group=self.colocated_boundary_group
         )
+        return data_handle
 
     def _finish_recv_forward(self, request: "_ForwardRecvRequest") -> ForwardPacket:
         """Finish phase of an async forward receive: wait the data, assemble the packet.

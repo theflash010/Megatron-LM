@@ -1409,6 +1409,67 @@ def initialize_model_parallel(
                 _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GROUP = group
                 _COLOCATED_ENCODER_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = encoder_tensor_ranks
 
+        # One-time eager warmup of the two lazily-initialized NCCL communicators that
+        # would otherwise be created in the middle of training traffic. ONLY these two:
+        # - the pipeline-parallel group: its NCCL comm is lazily built on the first
+        #   pipeline p2p; at image resolution 504 that creation collided with the
+        #   boundary packets still in flight and froze all ranks inside the C++ enqueue
+        #   (NCCL multi-communicator concurrent-init deadlock, localized 2026-09-14).
+        # - the colocated boundary group: its comm and the per-pair transports are also
+        #   lazy, and the two ends reach their first boundary op several steps apart in
+        #   1F1B (Task 4.6g); the 1-element exchange below builds the comm AND both
+        #   directions' transports up front.
+        # A barrier here is safe and ideal: torch.distributed is fully initialized by
+        # now (initialize.py: set_device -> init_process_group -> initialize_model_parallel)
+        # and NO traffic has ever flown on any NCCL group, so every communicator is
+        # created once at this zero-traffic point and reused for the whole job.
+        # 一次性预热两个懒初始化的 NCCL communicator，避免它们在训练流量中途才建。
+        # 只做这两个组：
+        # - pipeline-parallel 组：comm 懒建于首次 pipeline p2p；504 分辨率下该创建与
+        #   仍在飞的 boundary 包相撞，4 rank 全部冻结在 C++ 提交内部（NCCL 多
+        #   communicator 并发初始化死锁，2026-09-14 定位）。
+        # - colocated boundary 组：comm 与逐对 transport 同为懒建，且 1F1B 两端到达
+        #   边界收发的时刻天然错开（Task 4.6g）；下面的 1 元素交换一次性建好 comm
+        #   与两个方向的 transport。
+        # 在这里 barrier 安全且理想：torch.distributed 此时已完全初始化
+        # （initialize.py：set_device -> init_process_group -> initialize_model_parallel），
+        # 且任何 NCCL 组上都还没有任何流量——所有 communicator 都在这个零流量时点
+        # 一次性建好、全程复用。
+        if pipeline_model_parallel_size > 1:
+            torch.distributed.barrier(group=_PIPELINE_MODEL_PARALLEL_GROUP)
+        if len(_COLOCATED_BOUNDARY_GLOBAL_RANKS) > 1:
+            torch.distributed.barrier(group=_COLOCATED_BOUNDARY_GROUP)
+            # The dtype is irrelevant here (any 1-element tensor forces the lazy
+            # comm/transport creation); float32 keeps it independent of model config.
+            # dtype 在此无关紧要（任意 1 元素张量即可触发懒建的 comm/transport 创建）；
+            # 用 float32 与模型 config 解耦。
+            warmup_send_buffer = torch.ones(1, dtype=torch.float32, device="cuda")
+            warmup_recv_buffer = torch.empty(1, dtype=torch.float32, device="cuda")
+            warmup_consumer_global_rank = _COLOCATED_BOUNDARY_GLOBAL_RANKS[0]
+            if rank == warmup_consumer_global_rank:
+                for boundary_producer_rank in _COLOCATED_BOUNDARY_GLOBAL_RANKS[1:]:
+                    torch.distributed.irecv(
+                        warmup_recv_buffer,
+                        src=boundary_producer_rank,
+                        group=_COLOCATED_BOUNDARY_GROUP,
+                    ).wait()
+                    torch.distributed.isend(
+                        warmup_send_buffer,
+                        dst=boundary_producer_rank,
+                        group=_COLOCATED_BOUNDARY_GROUP,
+                    ).wait()
+            else:
+                torch.distributed.isend(
+                    warmup_send_buffer,
+                    dst=warmup_consumer_global_rank,
+                    group=_COLOCATED_BOUNDARY_GROUP,
+                ).wait()
+                torch.distributed.irecv(
+                    warmup_recv_buffer,
+                    src=warmup_consumer_global_rank,
+                    group=_COLOCATED_BOUNDARY_GROUP,
+                ).wait()
+
     # Build the tensor + data parallel groups.
     global _TENSOR_AND_DATA_PARALLEL_GROUP
     global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
