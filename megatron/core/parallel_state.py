@@ -157,18 +157,37 @@ _COLOCATED_ENCODER_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS = None
 _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS = None
 
-# Colocated boundary communication group: same members as the encoder inner dp
-# group (the ranks of one outer dp replica) but a SEPARATE NCCL instance, used
-# exclusively for the encoder->backbone-entry boundary P2P (forward packet and
-# backward grad). Kept independent from the pipeline-parallel group and the
-# encoder inner dp group to avoid serializing boundary P2P with the 1F1B P2P on
-# the same NCCL group.
-# 共置边界通信组：成员与 encoder inner dp 组相同（一个外层 dp 副本内的 rank），
-# 但是独立的 NCCL 实例，专用于 encoder→backbone entry 的边界 P2P（前向数据包与
-# 反向梯度）。与 pp_group / enc_inner_dp 组保持独立，避免边界 P2P 与 1F1B P2P
-# 在同一组上串行。
-_COLOCATED_BOUNDARY_GROUP = None
+# Colocated boundary communication groups: same members as the encoder inner dp
+# group (the ranks of one outer dp replica) but SEPARATE NCCL instances, split by
+# direction so forward-activation sends and backward-grad sends never share one
+# NCCL stream/group (dual-channel-p2p Task 1, 2026-09-22): ACTIVATION =
+# producer->consumer, GRAD = consumer->producer. Both stay independent from the
+# pipeline-parallel group and the encoder inner dp group to avoid serializing
+# boundary P2P with the 1F1B P2P on the same NCCL group.
+# 共置边界通信组：成员与 encoder inner dp 组相同（一个外层 dp 副本内的 rank），但为
+# 独立 NCCL 实例，按方向拆成两组，使前向激活发送与反向梯度发送不共享同一 NCCL
+# 流/组（dual-channel-p2p Task 1，2026-09-22）：ACTIVATION = producer→consumer，
+# GRAD = consumer→producer。两组都与 pp_group / enc_inner_dp 独立，避免边界 P2P 与
+# 1F1B P2P 在同一 NCCL 组上串行。
+_COLOCATED_BOUNDARY_ACTIVATION_GROUP = None
+_COLOCATED_BOUNDARY_GRAD_GROUP = None
 _COLOCATED_BOUNDARY_GLOBAL_RANKS = None
+
+# Colocated boundary: the user-provided microbatch->producer partition function, registered
+# by the training entry before distributed init (defaults to round-robin on the application
+# side). The owner table is built from it during initialization (dual-channel-p2p Task 3).
+# 共置边界：训练入口在分布式初始化前注册的 microbatch→producer 划分函数（默认轮盘在应用侧
+# 解析）；owner 表在初始化时据此构建（dual-channel-p2p Task 3）。
+_COLOCATED_MICROBATCH_PARTITION_FUNC = None
+
+# Colocated boundary: the microbatch->producer owner table, a host ``list[int]`` of length
+# num_microbatches whose m-th entry is the producer (boundary-group slot) that owns microbatch
+# m. Built once during init by broadcasting rank 0's validated mapping and stored host-side so
+# every rank shares one authoritative table and downstream lookups stay pure Python.
+# 共置边界：microbatch→producer 归属表，长度 num_microbatches 的主机 ``list[int]``，第 m 项 =
+# 负责 microbatch m 的 producer（边界组槽位）。初始化时由 rank0 计算+校验后广播、落主机侧一次，
+# 使每个 rank 共享同一张权威表，下游查表保持纯 Python。
+_COLOCATED_MICROBATCH_OWNER_TABLE = None
 
 # Colocated data parallel group for colocated encoder training: ALL W ranks that
 # hold a replica of the encoder, i.e. the cartesian product of the outer
@@ -1243,26 +1262,56 @@ def initialize_model_parallel(
                 _ENCODER_INNER_DATA_PARALLEL_GROUP = group
                 _ENCODER_INNER_DATA_PARALLEL_GLOBAL_RANKS = inner_ranks
 
-        # Build the colocated boundary communication groups. Same members as the
-        # encoder inner dp groups (one outer replica), but a SEPARATE NCCL
-        # instance, used only for the encoder->backbone-entry boundary P2P.
-        # 构建共置边界通信组：成员与 enc_inner_dp 组相同（一个外层副本），但是独立
-        # NCCL 实例，专用于 encoder→backbone entry 的边界 P2P。
-        global _COLOCATED_BOUNDARY_GROUP
+        # Build the colocated boundary communication groups (dual-channel-p2p
+        # Task 1, 2026-09-22): two SEPARATE NCCL instances over the same members
+        # (one outer replica's pp ranks), split by direction so forward-activation
+        # and backward-grad boundary P2P never share one NCCL stream/group.
+        # 构建共置边界通信组（dual-channel-p2p Task 1，2026-09-22）：在同一成员（一个
+        # 外层副本的 pp ranks）上建两个独立 NCCL 实例，按方向拆分，使前向激活与反向
+        # 梯度的边界 P2P 不共享同一 NCCL 流/组。
+        global _COLOCATED_BOUNDARY_ACTIVATION_GROUP
+        global _COLOCATED_BOUNDARY_GRAD_GROUP
         global _COLOCATED_BOUNDARY_GLOBAL_RANKS
-        assert _COLOCATED_BOUNDARY_GROUP is None, (
-            "colocated boundary communication group is already initialized"
+        assert _COLOCATED_BOUNDARY_ACTIVATION_GROUP is None, (
+            "colocated boundary communication groups are already initialized"
         )
         for boundary_ranks in decoder_rank_generator.get_ranks('pp'):
-            group = create_group(
+            activation_group = create_group(
                 boundary_ranks,
                 timeout=timeout,
                 pg_options=get_nccl_options("dp", nccl_comm_cfgs),
-                group_desc="COLOCATED_BOUNDARY_GROUP",
+                group_desc="COLOCATED_BOUNDARY_ACTIVATION_GROUP",
+            )
+            grad_group = create_group(
+                boundary_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("dp", nccl_comm_cfgs),
+                group_desc="COLOCATED_BOUNDARY_GRAD_GROUP",
             )
             if rank in boundary_ranks:
-                _COLOCATED_BOUNDARY_GROUP = group
+                _COLOCATED_BOUNDARY_ACTIVATION_GROUP = activation_group
+                _COLOCATED_BOUNDARY_GRAD_GROUP = grad_group
                 _COLOCATED_BOUNDARY_GLOBAL_RANKS = boundary_ranks
+
+        # Build the colocated microbatch->producer owner table now that the boundary group
+        # exists (dual-channel-p2p Task 3). num_producers = boundary group size (== pipeline
+        # size). get_num_microbatches() is ALREADY the per-replica count (calculator divided
+        # GBS by micro_batch_size * backbone data_parallel_size at arg-parse), so do NOT divide
+        # by D_outer again. rank 0 evaluates the registered partition function, validates it is
+        # an exact partition, and broadcasts the result to every rank.
+        # 边界组建好后构建 microbatch→producer 归属表（dual-channel-p2p Task 3）：producer 数 =
+        # 边界组规模（= pipeline 并行度）。get_num_microbatches() 已是"单个 backbone dp 副本"的
+        # mb 数（参数解析时已按 GBS/(mbs*backbone_dp) 整除），不要再除一次 D_outer。rank0 求值
+        # 已注册的划分函数、校验其为精确划分并广播给每个 rank。
+        colocated_microbatch_partition_func = get_colocated_microbatch_partition_func()
+        if colocated_microbatch_partition_func is not None:
+            from megatron.core.num_microbatches_calculator import get_num_microbatches
+
+            build_colocated_microbatch_owner_table(
+                get_num_microbatches(), #这个返回值是单个DP副本的mb数量（已经过DP划分，这里的DP是指backbone的DP副本）
+                len(_COLOCATED_BOUNDARY_GLOBAL_RANKS),
+                colocated_microbatch_partition_func,
+            )
 
         # Build the colocated data-parallel groups: all W ranks holding an encoder
         # replica (the outer dp-cp dimension times the inner pipeline dimension).
@@ -1438,7 +1487,6 @@ def initialize_model_parallel(
         if pipeline_model_parallel_size > 1:
             torch.distributed.barrier(group=_PIPELINE_MODEL_PARALLEL_GROUP)
         if len(_COLOCATED_BOUNDARY_GLOBAL_RANKS) > 1:
-            torch.distributed.barrier(group=_COLOCATED_BOUNDARY_GROUP)
             # The dtype is irrelevant here (any 1-element tensor forces the lazy
             # comm/transport creation); float32 keeps it independent of model config.
             # dtype 在此无关紧要（任意 1 元素张量即可触发懒建的 comm/transport 创建）；
@@ -1446,29 +1494,41 @@ def initialize_model_parallel(
             warmup_send_buffer = torch.ones(1, dtype=torch.float32, device="cuda")
             warmup_recv_buffer = torch.empty(1, dtype=torch.float32, device="cuda")
             warmup_consumer_global_rank = _COLOCATED_BOUNDARY_GLOBAL_RANKS[0]
-            if rank == warmup_consumer_global_rank:
-                for boundary_producer_rank in _COLOCATED_BOUNDARY_GLOBAL_RANKS[1:]:
-                    torch.distributed.irecv(
-                        warmup_recv_buffer,
-                        src=boundary_producer_rank,
-                        group=_COLOCATED_BOUNDARY_GROUP,
-                    ).wait()
+            # Warm up BOTH direction-split boundary groups (dual-channel-p2p Task 1,
+            # 2026-09-22): each ProcessGroupNCCL is lazily built, so exchange one
+            # element on each so their comm + both transport directions exist before
+            # any real traffic.
+            # 两个方向拆分的边界组都要预热（dual-channel-p2p Task 1，2026-09-22）：每个
+            # ProcessGroupNCCL 都是懒建，需各交换一次 1 元素，令其 comm 与两个方向的
+            # transport 在真正流量前建好。
+            for warmup_boundary_group in (
+                _COLOCATED_BOUNDARY_ACTIVATION_GROUP,
+                _COLOCATED_BOUNDARY_GRAD_GROUP,
+            ):
+                torch.distributed.barrier(group=warmup_boundary_group)
+                if rank == warmup_consumer_global_rank:
+                    for boundary_producer_rank in _COLOCATED_BOUNDARY_GLOBAL_RANKS[1:]:
+                        torch.distributed.irecv(
+                            warmup_recv_buffer,
+                            src=boundary_producer_rank,
+                            group=warmup_boundary_group,
+                        ).wait()
+                        torch.distributed.isend(
+                            warmup_send_buffer,
+                            dst=boundary_producer_rank,
+                            group=warmup_boundary_group,
+                        ).wait()
+                else:
                     torch.distributed.isend(
                         warmup_send_buffer,
-                        dst=boundary_producer_rank,
-                        group=_COLOCATED_BOUNDARY_GROUP,
+                        dst=warmup_consumer_global_rank,
+                        group=warmup_boundary_group,
                     ).wait()
-            else:
-                torch.distributed.isend(
-                    warmup_send_buffer,
-                    dst=warmup_consumer_global_rank,
-                    group=_COLOCATED_BOUNDARY_GROUP,
-                ).wait()
-                torch.distributed.irecv(
-                    warmup_recv_buffer,
-                    src=warmup_consumer_global_rank,
-                    group=_COLOCATED_BOUNDARY_GROUP,
-                ).wait()
+                    torch.distributed.irecv(
+                        warmup_recv_buffer,
+                        src=warmup_consumer_global_rank,
+                        group=warmup_boundary_group,
+                    ).wait()
 
     # Build the tensor + data parallel groups.
     global _TENSOR_AND_DATA_PARALLEL_GROUP
@@ -1902,27 +1962,49 @@ def get_colocated_encoder_inter_distributed_optimizer_instance_global_ranks():
     return _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS
 
 
-def get_colocated_boundary_group(check_initialized=True):
-    """Get the colocated boundary communication group (colocated encoder training).
+def get_colocated_boundary_activation_group(check_initialized=True):
+    """Get the colocated boundary ACTIVATION P2P group (colocated encoder training).
 
-    The group contains the P ranks of one outer dp replica (same members as the
-    encoder inner dp group) but is a SEPARATE NCCL instance used exclusively for
-    the encoder->backbone-entry boundary P2P (forward packet and backward grad).
-    It stays independent from the pipeline-parallel group to avoid serializing
-    boundary P2P with the 1F1B P2P on the same NCCL group.
+    Carries encoder-activation packets producer->consumer only. Same members as the
+    encoder inner dp group (one outer dp replica, P ranks) but a SEPARATE NCCL
+    instance, split by direction from the GRAD group so forward-activation sends and
+    backward-grad sends never share one NCCL stream/group (dual-channel-p2p Task 1,
+    2026-09-22).
 
-    获取共置边界通信组（共置训练）：成员为一个外层 dp 副本内的 P 个 rank（与
-    encoder inner dp 组相同），但是独立的 NCCL 实例，专用于 encoder→backbone
-    entry 的边界 P2P。与 pp_group 独立，避免边界 P2P 与 1F1B P2P 同组串行。
+    获取共置边界 ACTIVATION P2P 组（共置训练）：只承载 producer→consumer 的 encoder
+    激活包。成员为一个外层 dp 副本内的 P 个 rank（与 encoder inner dp 组相同），但为
+    独立 NCCL 实例，并与 GRAD 组按方向拆分（dual-channel-p2p Task 1，2026-09-22）。
 
     Only available when ``initialize_model_parallel(use_colocated_encoder=True)``.
     仅在 ``initialize_model_parallel(use_colocated_encoder=True)`` 时可用。
     """
     if check_initialized:
-        assert _COLOCATED_BOUNDARY_GROUP is not None, (
-            "colocated boundary communication group is not initialized"
+        assert _COLOCATED_BOUNDARY_ACTIVATION_GROUP is not None, (
+            "colocated boundary activation communication group is not initialized"
         )
-    return _COLOCATED_BOUNDARY_GROUP
+    return _COLOCATED_BOUNDARY_ACTIVATION_GROUP
+
+
+def get_colocated_boundary_grad_group(check_initialized=True):
+    """Get the colocated boundary GRAD P2P group (colocated encoder training).
+
+    Carries boundary gradients consumer->producer only. Same members as the
+    ACTIVATION group but a SEPARATE NCCL instance, so backward-grad P2P never shares
+    one NCCL stream/group with forward-activation P2P (dual-channel-p2p Task 1,
+    2026-09-22).
+
+    获取共置边界 GRAD P2P 组（共置训练）：只承载 consumer→producer 的边界梯度。成员与
+    ACTIVATION 组相同，但为独立 NCCL 实例，使反向梯度 P2P 与前向激活 P2P 不共享同一
+    NCCL 流/组（dual-channel-p2p Task 1，2026-09-22）。
+
+    Only available when ``initialize_model_parallel(use_colocated_encoder=True)``.
+    仅在 ``initialize_model_parallel(use_colocated_encoder=True)`` 时可用。
+    """
+    if check_initialized:
+        assert _COLOCATED_BOUNDARY_GRAD_GROUP is not None, (
+            "colocated boundary grad communication group is not initialized"
+        )
+    return _COLOCATED_BOUNDARY_GRAD_GROUP
 
 
 def is_colocated_encoder_enabled():
@@ -1939,7 +2021,7 @@ def is_colocated_encoder_enabled():
     ``forward_backward_colocated``——megatron.core 不读 megatron.training 的 args，
     以该开关已经落地的并行状态为单一来源。
     """
-    return _COLOCATED_BOUNDARY_GROUP is not None
+    return _COLOCATED_BOUNDARY_ACTIVATION_GROUP is not None
 
 
 def get_colocated_boundary_global_ranks():
@@ -2210,6 +2292,95 @@ def get_microbatches_for_producer(producer_id, num_microbatches, num_producers):
         f"producers ({num_producers}) for round-robin colocated encoder scheduling"
     )
     return list(range(producer_id, num_microbatches, num_producers))
+
+
+def set_colocated_microbatch_partition_func(partition_func):
+    """Register the colocated microbatch->producer partition function (training entry).
+
+    注册共置 microbatch→producer 划分函数（训练入口在分布式初始化前调用）。签名
+    ``(num_microbatches, num_producers) -> list[list[int]]``（第 i 项 = producer i 拥有的 mb id
+    升序表，producer 0 即 backbone consumer），供初始化时据此构建 owner 表，无需依赖 config。
+    """
+    global _COLOCATED_MICROBATCH_PARTITION_FUNC
+    _COLOCATED_MICROBATCH_PARTITION_FUNC = partition_func
+
+
+def get_colocated_microbatch_partition_func():
+    """Return the registered colocated microbatch partition function, or None if unset.
+    返回已注册的共置 microbatch 划分函数；未注册返回 None。"""
+    return _COLOCATED_MICROBATCH_PARTITION_FUNC
+
+
+def build_colocated_microbatch_owner_table(num_microbatches, num_producers, partition_func):
+    """Build and broadcast the colocated microbatch->producer owner table.
+
+    rank 0 求值 ``partition_func``（第 i 项 = producer i 拥有的 mb id，producer 0 即 consumer），
+    校验其为 ``range(num_microbatches)`` 的精确划分（每个 mb 恰好被拥有一次、producer id 落在
+    ``[0, num_producers)``），打包成 int32 逆映射 ``owner[m]=producer`` 后广播至全体，使每个 rank
+    共享同一张权威表（即便自定义划分不确定）；结果落主机侧供纯 Python 查表。
+    Build/validate on rank 0, broadcast the inverse map over the WORLD group, store host-side.
+    """
+    global _COLOCATED_MICROBATCH_OWNER_TABLE
+    if torch.distributed.get_rank() == 0:
+        producer_microbatches = partition_func(num_microbatches, num_producers)
+        assert len(producer_microbatches) == num_producers, (
+            f"partition function returned {len(producer_microbatches)} producer lists, "
+            f"expected num_producers ({num_producers})"
+        )
+        owner_by_microbatch = [-1] * num_microbatches
+        for producer_id, microbatch_ids in enumerate(producer_microbatches):
+            for microbatch_id in microbatch_ids:
+                assert 0 <= microbatch_id < num_microbatches, (
+                    f"partition assigned microbatch {microbatch_id} to producer {producer_id}, "
+                    f"out of range [0, {num_microbatches})"
+                )
+                assert owner_by_microbatch[microbatch_id] == -1, (
+                    f"microbatch {microbatch_id} assigned to more than one producer "
+                    f"({owner_by_microbatch[microbatch_id]} and {producer_id}); partition must be exact"
+                )
+                owner_by_microbatch[microbatch_id] = producer_id
+        unassigned = [m for m, p in enumerate(owner_by_microbatch) if p == -1]
+        assert not unassigned, (
+            f"partition left microbatches {unassigned} unassigned; must cover every mb exactly once"
+        )
+        owner_of_microbatch = torch.tensor(
+            owner_by_microbatch, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+    else:
+        owner_of_microbatch = torch.empty(
+            num_microbatches, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+    # Broadcast over the WORLD group (not per boundary group): the table maps mb -> producer
+    # SLOT and its inputs are identical across replicas, so every boundary group ends up with
+    # the SAME authoritative table; src=0 is merely who evaluates and sends.
+    # 用 WORLD 组广播（非按边界组）：表映射 mb→producer 槽位，输入各副本相同，故全作业一份权威表。
+    torch.distributed.broadcast(owner_of_microbatch, src=0)
+    _COLOCATED_MICROBATCH_OWNER_TABLE = owner_of_microbatch.tolist()
+
+
+def get_colocated_microbatch_owner_table():
+    """Return the colocated microbatch->producer owner table (host ``list[int]``), or None.
+    返回共置 microbatch→producer 归属表（主机 ``list[int]``，``owner[m]=producer``）；未构建返回 None。"""
+    return _COLOCATED_MICROBATCH_OWNER_TABLE
+
+
+def get_colocated_microbatch_owner(microbatch_id):
+    """Return the producer (boundary-group slot) that owns ``microbatch_id``.
+    返回负责 ``microbatch_id`` 的 producer（边界组槽位）。"""
+    return _COLOCATED_MICROBATCH_OWNER_TABLE[microbatch_id]
+
+
+def get_colocated_owned_microbatches(producer_id):
+    """Return the ascending list of microbatch ids owned by ``producer_id``.
+
+    "producer 拥有哪些 microbatch" 的唯一权威来源（取代只支持轮盘的 get_microbatches_for_producer）：
+    升序（1F1B 拉取序要求）由按 microbatch 顺序扫描 owner 表自然得到；各 producer 不必占等差步长。
+    """
+    return [
+        microbatch_id
+        for microbatch_id, owner in enumerate(_COLOCATED_MICROBATCH_OWNER_TABLE)
+        if owner == producer_id
+    ]
 
 
 def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
@@ -2870,11 +3041,20 @@ def destroy_model_parallel():
     global _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS
     _COLOCATED_ENCODER_INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GLOBAL_RANKS = None
 
-    global _COLOCATED_BOUNDARY_GROUP
-    _COLOCATED_BOUNDARY_GROUP = None
+    global _COLOCATED_BOUNDARY_ACTIVATION_GROUP
+    _COLOCATED_BOUNDARY_ACTIVATION_GROUP = None
+
+    global _COLOCATED_BOUNDARY_GRAD_GROUP
+    _COLOCATED_BOUNDARY_GRAD_GROUP = None
 
     global _COLOCATED_BOUNDARY_GLOBAL_RANKS
     _COLOCATED_BOUNDARY_GLOBAL_RANKS = None
+
+    global _COLOCATED_MICROBATCH_PARTITION_FUNC
+    _COLOCATED_MICROBATCH_PARTITION_FUNC = None
+
+    global _COLOCATED_MICROBATCH_OWNER_TABLE
+    _COLOCATED_MICROBATCH_OWNER_TABLE = None
 
     global _COLOCATED_DATA_PARALLEL_GROUP
     _COLOCATED_DATA_PARALLEL_GROUP = None

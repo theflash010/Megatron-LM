@@ -44,7 +44,10 @@ from megatron.core.models.multimodal.colocated_llava_model import (
     ColocatedViTEncoder,
 )
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX
-from megatron.core.parallel_state import get_colocated_encoder_tensor_model_parallel_group
+from megatron.core.parallel_state import (
+    get_colocated_encoder_tensor_model_parallel_group,
+    set_colocated_microbatch_partition_func,
+)
 from megatron.core.pipeline_parallel.colocated_encoder_comm import MergedEncoderBatch
 from megatron.core.pipeline_parallel.colocated_schedule import IntraPacket
 from megatron.core.transformer.module import Float16Module
@@ -397,6 +400,18 @@ def colocated_forward_step(data_iterator, model, packet=None, intra_packet=None)
 
 
 if __name__ == "__main__":
+    # dual-channel-p2p diagnostics (2026-09-22): register a NON-fatal SIGUSR1 handler that dumps
+    # every thread's Python stack to stderr without terminating the process. Unlike SIGABRT (which
+    # aborts), this lets us sample the same live rank repeatedly (kill -USR1 <pid>) to tell a slow
+    # first iteration from a real stall by observing whether frames advance between samples.
+    # 双通道 P2P 诊断（2026-09-22）：注册一个**非致命** SIGUSR1 处理器，收到信号时把所有线程的
+    # Python 栈打到 stderr 且不结束进程。区别于 SIGABRT（会 abort）——它允许对同一个存活 rank
+    # 反复采样（kill -USR1 <pid>），通过两次采样帧是否推进来区分"首迭代慢"与"真卡死"。
+    import faulthandler as _faulthandler
+    import signal as _signal
+
+    _faulthandler.register(_signal.SIGUSR1, all_threads=True, chain=False)
+
     # 入口与 ``train.py`` 同构，三处替换：dataloader provider 换成共置版（分片域=全 W、
     # 每个 rank 都取数）、forward_step_func 换成 ``colocated_forward_step``、去掉评估相关
     # 的回调（共置不支持评估，arguments.py 的共置校验块已断言 --eval-iters 0）。
@@ -411,7 +426,12 @@ if __name__ == "__main__":
     # embedding rank 辅助函数）只有真正启动训练时才需要，import 它们的代价与副作用不该落在
     # "被 schedule 复用的实现层"上。
     # Imported here rather than at module scope: these are entry-only dependencies.
-    from colocated_args import add_colocated_extra_args, validate_colocated_args
+    from colocated_args import (
+        add_colocated_extra_args,
+        default_round_robin_partition,
+        reverse_block_partition,
+        validate_colocated_args,
+    )
     from colocated_dataloader_provider import colocated_train_valid_test_dataloaders_provider
     from megatron.training.training import maybe_start_memory_snapshot_recording
     from model import model_provider
@@ -428,6 +448,19 @@ if __name__ == "__main__":
     # does not know these fields.
     validate_colocated_args(args)
     full_config = pretrain_cfg_container_from_args(args)
+
+    # 共置 microbatch → producer 划分函数：默认轮盘（default_round_robin_partition）。必须在
+    # pretrain() 之前注册——owner 表在 pretrain 内部的分布式初始化阶段据此构建并广播
+    # （dual-channel-p2p Task 3）。env COLOCATED_REVERSE_BLOCK_PARTITION=1 改用逆序分块划分
+    # （reverse_block_partition，见 colocated_args）：前一整块 mb 集中在单个远端 producer +
+    # 每 producer owned 数 > D，压测 owned>D 工况；不设或非 "1" 时走默认轮盘。
+    # Register the microbatch->producer partition before pretrain(); the owner table is built
+    # from it during pretrain's distributed init. Default round-robin; env-gated reverse-block
+    # stress partition for the owned>D case.
+    if os.environ.get("COLOCATED_REVERSE_BLOCK_PARTITION", "0") == "1":
+        set_colocated_microbatch_partition_func(reverse_block_partition)
+    else:
+        set_colocated_microbatch_partition_func(default_round_robin_partition)
 
     # env-gated CUDA memory snapshot: start recording BEFORE pretrain() so that
     # weights / optimizer states / DDP buckets carry allocation stacks. torch.distributed

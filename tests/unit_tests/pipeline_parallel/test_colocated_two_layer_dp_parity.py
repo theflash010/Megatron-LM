@@ -486,7 +486,7 @@ def test_two_layer_dp_matches_sequential_global_batch():
         for chunk_config in (language_config, vision_config):
             chunk_config.finalize_model_grads_func = finalize_model_grads
 
-        boundary_group = parallel_state.get_colocated_boundary_group()
+        boundary_group = parallel_state.get_colocated_boundary_activation_group()
         producer_id = torch.distributed.get_group_rank(
             boundary_group, torch.distributed.get_rank()
         )

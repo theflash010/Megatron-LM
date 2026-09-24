@@ -130,8 +130,8 @@ def dump_records():
     rank = torch.distributed.get_rank()
     payload = {
         "rank": rank,
-        "producer_id": get_pg_rank(mpu.get_colocated_boundary_group()),
-        "num_producers": get_pg_size(mpu.get_colocated_boundary_group()),
+        "producer_id": get_pg_rank(mpu.get_colocated_boundary_activation_group()),
+        "num_producers": get_pg_size(mpu.get_colocated_boundary_activation_group()),
         "pipeline_rank": mpu.get_pipeline_model_parallel_rank(),
         "num_microbatches": get_num_microbatches(),
         **records,
@@ -164,7 +164,7 @@ def instrumented_forward_step(data_iterator, model, packet=None, intra_packet=No
 
     if is_encoder_branch:
         if state["ids"] is None:
-            boundary_group = mpu.get_colocated_boundary_group()
+            boundary_group = mpu.get_colocated_boundary_activation_group()
             state["ids"] = get_microbatches_for_producer(
                 get_pg_rank(boundary_group), get_num_microbatches(), get_pg_size(boundary_group)
             )

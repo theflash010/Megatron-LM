@@ -110,7 +110,7 @@ def test_round_robin_microbatch_mapping(order):
 
     # producer 槽位取自边界组内的编号（与生产代码同源，见 colocated_schedule phase ①）。
     # The producer slot is the boundary group's own rank, as in production.
-    boundary_group = ps.get_colocated_boundary_group()
+    boundary_group = ps.get_colocated_boundary_activation_group()
     producer = torch.distributed.get_group_rank(boundary_group, torch.distributed.get_rank())
     # num_microbatches == num_producers: producer p handles exactly microbatch p.
     # num_microbatches == num_producers 时，producer p 恰好负责 microbatch p。
@@ -216,10 +216,19 @@ def test_colocated_data_parallel_group_spans_all_ranks(order):
     assert inner_size == pp
     assert inner_size * outer_size == colocated_group.size()
 
-    # A separate NCCL instance from the boundary group, which keeps its own members.
-    # 与边界组是不同的 NCCL 实例，边界组成员不变。
-    assert colocated_group is not ps.get_colocated_boundary_group()
-    assert ps.get_colocated_boundary_group().size() == pp
+    # A separate NCCL instance from both boundary groups (dual-channel-p2p Task 6: the boundary
+    # is split into an ACTIVATION and a GRAD group — distinct NCCL instances over the same P
+    # members). 与两个边界组（activation / grad，成员相同但各自独立 NCCL 实例）都不是同一个。
+    activation_group = ps.get_colocated_boundary_activation_group()
+    grad_group = ps.get_colocated_boundary_grad_group()
+    assert colocated_group is not activation_group
+    assert colocated_group is not grad_group
+    assert activation_group is not grad_group
+    assert activation_group.size() == pp
+    assert grad_group.size() == pp
+    assert torch.distributed.get_process_group_ranks(
+        activation_group
+    ) == torch.distributed.get_process_group_ranks(grad_group)
 
     # The boundary group's member ORDER is load-bearing and must follow the pipeline
     # stages: the communicator treats member 0 as the consumer (the backbone entry) and
@@ -228,7 +237,7 @@ def test_colocated_data_parallel_group_spans_all_ranks(order):
     # 边界组的**成员顺序**是承重的，必须与 pipeline stage 一致：communicator 把成员 0 当
     # 消费者（backbone entry），phase ① 又拿组内编号当 producer 槽位。两者在任意 rank
     # order 下都成立，因为该组由 rank generator 的 'pp' 列表建出（Task 5.7）。
-    boundary_group = ps.get_colocated_boundary_group()
+    boundary_group = ps.get_colocated_boundary_activation_group()
     assert ps.get_colocated_boundary_global_ranks() == torch.distributed.get_process_group_ranks(
         ps.get_pipeline_model_parallel_group()
     )

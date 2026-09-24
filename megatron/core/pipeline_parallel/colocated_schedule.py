@@ -24,6 +24,9 @@ microbatch p, p+P, p+2P, ...，即每个 producer 处理 ``num_microbatches / P 
 """
 
 import contextlib
+import os
+import sys
+import time
 
 from dataclasses import dataclass, replace
 from functools import partial
@@ -64,6 +67,30 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+
+
+# dual-channel-p2p 诊断探针（2026-09-22）：env COLOCATED_CPU_PROBE=1 打开后，在 backbone schedule 的
+# 各相位与边界收发前后打印 CPU 侧执行位置（flush 到 stderr，带全局 rank 与时间戳），用于挂起时定位每个
+# rank 的 CPU 最后走到哪一步、卡在哪个 microbatch（BEGIN 有、END 无即卡在该步）。关闭时每次调用只做一次
+# 布尔判断，无其它开销，生产不受影响；与已有 NVTX 区间互补，后续可直接用 nsys 采样。
+# dual-channel-p2p diagnostic probe (2026-09-22): with env COLOCATED_CPU_PROBE=1, print the CPU-side
+# execution point (flushed to stderr, tagged with global rank + timestamp) around each backbone
+# schedule phase and boundary send/recv, so a hang shows where each rank's CPU last got and on which
+# microbatch (a BEGIN with no matching END marks the blocked step). When disabled each call is a
+# single boolean check with no other cost; complements the existing NVTX ranges for later nsys use.
+_COLOCATED_CPU_PROBE = os.environ.get("COLOCATED_CPU_PROBE", "0") == "1"
+
+
+def _cpu_probe(message: str) -> None:
+    """Print a flushed, rank-tagged CPU-execution marker to stderr when COLOCATED_CPU_PROBE=1."""
+    if not _COLOCATED_CPU_PROBE:
+        return
+    global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    print(
+        f"[cpu-probe rank{global_rank} {time.time():.3f}] {message}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 @dataclass
@@ -170,12 +197,15 @@ def forward_backward_colocated(
     # 处理 num_microbatches / P 个 microbatch）。Round-robin requires num_microbatches % P == 0.
     parallel_state.validate_colocated_num_microbatches(num_microbatches)
 
-    # 边界通信器：独立共置边界组（get_colocated_boundary_group()，成员与 pp 组相同
-    # 但是独立 NCCL 实例）+ backbone config。4.3 起 phase ②/④ 使用。
-    # Boundary communicator on the dedicated colocated group (independent NCCL
-    # instance); used by phases ②/④ from Task 4.3 on.
+    # 边界通信器：两个方向隔离的独立共置边界组（dual-channel-p2p Task 2，2026-09-22）——
+    # activation 组走前向激活 producer→consumer，grad 组走反向梯度 consumer→producer，各
+    # 自独立 NCCL 实例 + 内部 stream，成员与 pp 组相同。4.3 起 phase ②/④ 使用。
+    # Boundary communicator on the two direction-split colocated groups (independent
+    # NCCL instances); used by phases ②/④ from Task 4.3 on.
     comm = EncoderBackboneBoundaryCommunicator(
-        parallel_state.get_colocated_boundary_group(), config
+        parallel_state.get_colocated_boundary_activation_group(),
+        parallel_state.get_colocated_boundary_grad_group(),
+        config,
     )
 
     # Boundary/PP warmup is NOT done here: both NCCL communicators are eagerly built
@@ -273,9 +303,9 @@ def _colocated_encoder_forward(
     取数+前传"的循环（24 层 ViT 的 per-layer Python/eager 调度成本原本被支付了 16 次，
     而每层 GPU 只需 0.33 ms，是 encoder 相位 93.7% GPU 空闲的根因）。
 
-    本 rank（producer p）负责的 microbatch = p, p+P, p+2P, ...（
-    ``get_microbatches_for_producer``，Task 1.2）——每 producer 恰好
-    ``num_microbatches / P`` 个，与合并批的 batch 维一一对应（轮盘序列升序 == batch
+    本 rank（producer p）负责的 microbatch 由 owner 表决定（``get_colocated_owned_microbatches``，
+    升序，支持任意/逆序划分；dual-channel-p2p Task 3 起取代只支持轮盘的
+    ``get_microbatches_for_producer``），与合并批的 batch 维一一对应（owned 升序 == batch
     顺序）。合并批由 ``ForwardPacket.split_merged_batch``（classmethod 直接吃裸张量）等分回
     逐 microbatch 的包；schedule 只负责逐包打 ``microbatch_id``（1 元素 int64 张量，
     consumer 在 ``_take_boundary_packet`` 校验）并存入 ``encoder_buffers``。
@@ -294,11 +324,10 @@ def _colocated_encoder_forward(
     ``_take_boundary_packet`` 对喂给 backbone 的那份做 ``detach().requires_grad_(True)``，
     backbone 反传不进入 encoder 图；本地合并图保留给 phase ④ 反传）。
     """
-    # 轮盘分配：producer p -> microbatch p, p+P, p+2P, ...（每个 producer num_microbatches/P 个）。
-    # Round-robin: producer p handles microbatches p, p+P, p+2P, ... (num_microbatches/P each).
-    microbatches = parallel_state.get_microbatches_for_producer(
-        producer_id, num_microbatches, num_producers
-    )
+    # dual-channel-p2p Task 3：本 producer 拥有的 microbatch 由 owner 表决定（升序，支持任意/
+    # 逆序划分），取代只支持轮盘整除的 get_microbatches_for_producer。
+    # This producer's owned microbatches come from the owner table (ascending, any partition).
+    microbatches = parallel_state.get_colocated_owned_microbatches(producer_id)
 
     # Task 5.12: the whole encoder forward runs with the ENCODER's own RNG tracker
     # installed globally, not merely under one forked named state. Two kinds of random
@@ -345,15 +374,12 @@ def _colocated_encoder_forward(
         )
         encoder_buffers[microbatch] = packet
 
-    # 完整性：本 rank 恰好 num_microbatches / P 个 microbatch（每个 producer 负载一致）。
-    # Completeness: exactly num_microbatches / P entries (balanced across producers).
-    expected = num_microbatches // num_producers
-    assert len(encoder_buffers) == expected, (
-        f"producer {producer_id} got {len(encoder_buffers)} microbatches, expected "
-        f"{expected} (num_microbatches {num_microbatches} / num_producers {num_producers})"
-    )
+    # 完整性：buffer 的键恰好是 owner 表给出的 owned 列表（升序）。不同划分下每 producer 的负载
+    # 可不均（如 reverse_block），故不再断言 == num_microbatches / P。
+    # Completeness: buffer keys equal this producer's owned list (per-producer counts may differ
+    # under non-round-robin partitions, so no balanced-count assertion).
     assert sorted(encoder_buffers) == microbatches, (
-        f"buffer keys {sorted(encoder_buffers)} != round-robin microbatches {microbatches}"
+        f"buffer keys {sorted(encoder_buffers)} != owned microbatches {microbatches}"
     )
     return encoder_buffers, merged_image_embeddings
 
@@ -618,47 +644,42 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
     # schedule must not hardcode pipeline-parallel-rank == 0, which breaks under TP>1).
     is_consumer = comm.is_consumer()
     producer_id = comm.producer_id
-    group_size = comm.group_size
 
-    # 4.5b（2026-08-26 用户定案，取代 4.3b/4.3k 的"流水前全量 prefetch"）：consumer 在
-    # 流水前**不做任何边界接收**，统一由循环体内的"前传 mb k 之前 post mb k+1 的 recv"
-    # 一条规则覆盖首波（1..P-1）与后续包（>=P）——首波不再特例化，峰值在飞接收从 P-1
-    # 份降到 1 份（每份含一个 image_embeddings 数据 buffer）。
-    # 代价（已知并接受）：① producer 的首包改为异步发送后会在边界组上悬到 consumer 的
-    # step p-1（最长 P-2 步），这是 4.3k 死锁的同一类 pending op——当前靠
-    # batch_p2p_sync=False 已移除设备级 torch.cuda.synchronize() 这条阻塞路径；
-    # ② 首波的数据搬运从"流水前已完成"变为"只有一步重叠窗口"。
-    # 4.5b (2026-08-26): the consumer posts no boundary receive before the pipeline; a single
-    # rule inside the loop ("before forwarding mb k, post the recv of mb k+1") now covers both
-    # the first wave (1..P-1) and the later packets (>=P). Peak in-flight receives drop from
-    # P-1 to 1. Accepted costs: the producers' first packet is now an async send that stays
-    # pending until the consumer's step p-1 (the 4.3k class of pending op, whose deadlock path
-    # via the device-wide synchronize is already removed by batch_p2p_sync=False), and the
-    # first wave now only has a one-step overlap window instead of completing pre-pipeline.
+    # dual-channel-p2p Task 3：本 producer 拥有的 microbatch（升序，owner 表为权威来源，支持
+    # 任意/逆序划分），以及已 isend 出去的集合（前传供给按 i+x+1 增量发送，避免重发）。owner 0
+    # （consumer）的 owned 本地直传、不 isend，故该集合对 consumer 恒空。
+    # This producer's owned microbatches (ascending, from the owner table) and the set already
+    # isent — the i+x+1 forward supply sends incrementally and never resends.
+    owned_microbatches = parallel_state.get_colocated_owned_microbatches(producer_id)
+    producer_sent_activations = set()
+
+    # dual-channel-p2p Task 3/5：consumer 的边界接收就一条 one-ahead 规则——primer(mb0) 引导后，
+    # 前传 mb i 前 post mb i+1 的 recv；峰值在飞接收 ~2 份（正在 take 的 + 刚 prefetch 的），天然
+    # <= P+1，无需显式限窗。未匹配的 P2P recv 不占自旋 kernel、不阻塞 cudaMalloc（已实测），故提前
+    # post 无死锁风险。prefetched 按 microbatch 号索引（owner 表任意划分下相邻 mb 可能同 owner）。
+    # dual-channel-p2p Task 3/5: the consumer's boundary receive is a single one-ahead rule
+    # (primer for mb 0, then before forwarding mb i post the recv of mb i+1); peak in-flight
+    # receives ~2, naturally <= P+1. Unmatched P2P recvs never block cudaMalloc (measured), so
+    # posting ahead is deadlock-free. prefetched is keyed by microbatch (owner table, any split).
     prefetched = {}
 
-    # 4.6a：反向梯度传输的状态容器（三个，语义各自独立，见 doc §2.11"反向梯度时序"）。
-    # - producer_grad_buffers：microbatch → encoder 输出梯度。**每个 rank 只存本 rank 自己
-    #   产的 microbatch**（consumer 存 m%P==0 的、producer p 存 m%P==p 的）——phase ④ 统一
-    #   encoder 反传时逐个取用。consumer 算出的非本地梯度立刻发走、本地不留，所以这里不会
-    #   出现"别人的 microbatch"。
-    # - pending_grad_requests：producer 侧在飞的梯度接收请求（microbatch → _GradRecvRequest）。
-    #   补货 step 的 ① 存 handle、③ finish() 取梯度，中间夹着 forward 做重叠。
-    # - consumer_boundary_inputs：consumer 侧 FIFO，(microbatch, boundary_embeddings)。
-    #   _take_boundary_packet（前传节奏）append、backward 之后 pop(0)，纪律与
-    #   input_tensors / output_tensors 一致，容量上限 P（stage 0 的在飞 microbatch 数）。
-    # 4.6a: state containers of the backward grad transport (see doc §2.11).
-    # - producer_grad_buffers: microbatch -> encoder output grad; every rank only keeps the
-    #   microbatches it produced itself (the consumer ships the others out immediately), so
-    #   phase ④ is symmetric on every rank.
-    # - pending_grad_requests: the producer's in-flight grad receives (microbatch ->
-    #   _GradRecvRequest); stored by step ① and consumed by step ③ of a restock step, with the
-    #   forward in between for overlap.
-    # - consumer_boundary_inputs: the consumer's FIFO of (microbatch, boundary_embeddings),
-    #   appended in _take_boundary_packet and popped after the backward — same discipline as
-    #   input_tensors / output_tensors, bounded by P.
+    # dual-channel-p2p Task 4：反向梯度传输的状态容器。
+    # - producer_grad_buffers：microbatch → encoder 输出梯度。每个 rank 只存本 rank 自己产的
+    #   microbatch（owner==producer_id 的；consumer 算出的非本地梯度立刻发走）——phase ④ 统一
+    #   encoder 反传时逐个取用。
+    # - producer_grad_requests：本 producer 已 POST 但未等数据的 owned grad irecv（owned mb →
+    #   _GradRecvRequest）。每次自身反传后按 i-x 界增量 POST，phase④ 前由 _finish_owned_grads
+    #   统一等数据落地，使梯度数据传输与 backbone cooldown/后续计算重叠。
+    # - consumer_boundary_inputs：consumer 侧 FIFO，(microbatch, boundary_embeddings)；
+    #   _take_boundary_packet append、backward 之后 pop(0)，容量上限 P。
+    # dual-channel-p2p Task 4: backward grad transport state.
+    # - producer_grad_buffers: microbatch -> encoder output grad; each rank keeps only what it owns.
+    # - producer_grad_requests: owned grad irecvs POSTed but not yet waited (owned mb ->
+    #   _GradRecvRequest); posted incrementally (bound i-x) and drained by _finish_owned_grads
+    #   before phase ④ so the grad data transfer overlaps backbone compute.
+    # - consumer_boundary_inputs: the consumer's FIFO of (microbatch, boundary_embeddings).
     producer_grad_buffers: Dict[int, torch.Tensor] = {}
-    pending_grad_requests: Dict[int, _GradRecvRequest] = {}
+    producer_grad_requests: Dict[int, _GradRecvRequest] = {}
     consumer_boundary_inputs: List[Tuple[int, torch.Tensor]] = []
 
     def _deallocate_encoder_output(packet: ForwardPacket) -> None:
@@ -680,35 +701,20 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         """
         return
 
-    # 4.4/4.5b：进入 backbone 流水前，每个 producer 先给 consumer 发**第 1 个包**
-    #（microbatch == producer_id）作为**启动**——**异步 `wait=False`**（4.5b 用户定案，
-    # 取代 4.3k 的同步等待）：consumer 已不在流水前 post irecv，同步等会直接挂死；异步
-    # 发送让 sender 始终早于 receiver 行动，consumer 到 step producer_id-1 才 post 对应
-    # 的 recv、随即配对。后续包（producer_id+P, ...）在循环体内按需补发（④）。
-    # handle 不保留：与 `_restock_boundary_packet` 一致——包本体活在 encoder_buffers 里
-    # 直到 phase ④，发送缓冲不会被提前回收；完成性由 consumer 的配对 recv 保证。
-    # 4.4/4.5b: before entering the backbone pipeline each producer sends its first packet
-    # (microbatch == producer_id) as a startup seed, now with wait=False (2026-08-26): the
-    # consumer no longer posts any pre-pipeline irecv, so a synchronous send would hang. The
-    # async send keeps the sender ahead of the receiver, which posts the matching recv at its
-    # step producer_id-1. Later packets are restocked inside the loop (step ④). The handle is
-    # dropped on purpose (same as _restock_boundary_packet): the packet itself stays alive in
-    # encoder_buffers until phase ④, so the send buffer cannot be reclaimed early.
-    if not is_consumer: #producer直接异步发送一个micro batch给consumer
-        # NVTX：流水前的启动首包——它在时间线上标出"producer 何时开始喂 consumer"，是
-        # 判断 backbone 流水启动是否被 encoder 相位拖住的锚点。
-        # NVTX: the pre-pipeline startup packet marks when the producer starts feeding the
-        # consumer - the anchor for judging whether the backbone start is held up.
-        nvtx_range_push("colocated-boundary-packet-startup")
-        first_microbatch = producer_id
-        assert first_microbatch in encoder_buffers, (
-            f"producer {producer_id} must own the first microbatch {first_microbatch}"
-        )
-        comm.colocated_send_forward(
-            encoder_buffers[first_microbatch], producer=producer_id, wait=False
-        )
-        _deallocate_encoder_output(encoder_buffers[first_microbatch])
-        nvtx_range_pop("colocated-boundary-packet-startup")
+    # dual-channel-p2p Task 3：consumer 用一颗"引子"引导 one-ahead 预取——进 warmup 前 pre-post
+    # mb 0 的 recv（仅当 mb 0 的 owner 是远端；默认轮盘下 owner(0)==0 本地零拷贝，是 no-op）。
+    # 之后循环内每步"前传 mb i 前 post mb i+1 的 recv"接力。producer **不再需要**流水前的启动
+    # 首包——供给统一由循环顶端的 i+x+1 规则驱动，其在 i=0 时自动等价于 warmup 无条件预热。
+    # Consumer primer that bootstraps the one-ahead prefetch: pre-post mb 0's recv if it is
+    # remote (a no-op under round-robin where owner(0)==0 is local). Producers need no
+    # pre-pipeline startup send — supply is driven by the i+x+1 rule at the top of each step,
+    # which at i=0 doubles as the warmup priming.
+    if is_consumer and num_microbatches > 0:
+        first_owner = parallel_state.get_colocated_microbatch_owner(0)
+        if first_owner != 0:
+            prefetched[0] = comm.colocated_recv_forward(
+                first_owner, expected_microbatch_id=0, wait=False
+            )
 
     def _take_boundary_packet(microbatch: int) -> ForwardPacket:
         """Consumer (stage 0): take the boundary packet of ``microbatch``.
@@ -732,13 +738,18 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         finish range covers only the data wait (absent on producer 0's local path).
         """
         nvtx_range_push("colocated-boundary-packet-take")
-        producer = microbatch % group_size  # 轮盘映射：microbatch s 由 producer s%P 算（doc §2.2）
+        # dual-channel-p2p Task 3：owner 由 owner 表决定（支持任意/逆序划分）；prefetched 按
+        # microbatch 号索引（不再按 producer——逆序划分下相邻 mb 可能同 owner，按 producer 键会
+        # 被后一个覆盖）。owner 0 = consumer 自己：本地零拷贝；否则取 prefetch 的 request。
+        producer = parallel_state.get_colocated_microbatch_owner(microbatch)
         if producer == 0:
-            packet = encoder_buffers[microbatch]  # producer 0 = 自己：本地直传（零拷贝）
+            _cpu_probe(f"take mb={microbatch} LOCAL(producer0)")
+            packet = encoder_buffers[microbatch]  # owner 0 = 自己：本地直传（零拷贝）
         else:
-            # 4.3k：prefetch 时通信器已启动 request（数据 irecv 已入队），take 时只需
-            # finish() 取数据。
-            packet = prefetched[producer].finish()
+            # prefetch 时通信器已启动 request（数据 irecv 已入队），take 时只需 finish() 取数据。
+            _cpu_probe(f"take mb={microbatch} finish() from producer={producer} BEGIN")
+            packet = prefetched.pop(microbatch).finish()
+            _cpu_probe(f"take mb={microbatch} finish() from producer={producer} END")
 
         # 4.6b：边界切断——本地路径与网络路径**同构处理**（无分支），两个操作各服务一条路径：
         # - detach()：本地直传（producer 0）的 image_embeddings 还挂在 encoder 计算图上，
@@ -771,17 +782,18 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         return replace(packet, image_embeddings=boundary_embeddings)
 
     # 4.6c：consumer 侧梯度派发的在飞 isend handle，**按 producer 分桶**（与 prefetched 同构）
-    # ——每个 producer 至多悬 1 份（发它的下一个梯度前先 wait 掉，cooldown 结束后统一 wait
-    # 剩余的），在飞上限 P-1。为什么不是全局只悬 1 份：NCCL 的 send/recv 按 **peer 对**懒创建
-    # 独立 communicator 与独立 stream（key 含两端 rank，即 4.3l 诊断到的那个懒初始化现象），
-    # 同组 FIFO 只约束同一对内部的顺序——跨 producer 本就独立，全局串成一条会让"派发给
-    # producer 2"白等"producer 1 的发送完成"（producer 1 晚 post irecv 就卡住 stage 0）。
-    # 4.6c: the consumer's in-flight grad isend handles, bucketed per producer (mirroring
-    # prefetched) — at most one outstanding per producer (waited before that producer's next
-    # grad, and drained after cooldown), so the bound is P-1 rather than 1. NCCL creates a
-    # dedicated communicator and stream per peer pair, so same-group FIFO only orders ops
-    # within one pair; a single global bucket would serialize independent producers.
-    boundary_grad_send_handles: Dict[int, List] = {}
+    # dual-channel-p2p（2026-09-22）：consumer 侧边界梯度**纯 fire-and-forget**——isend(wait=False)
+    # 发完即丢引用，不留任何监测（无 pending 列表、无 is_completed、无 wait）。显存安全靠 PyTorch 的
+    # record_stream：ProcessGroupNCCL 默认把 P2P 张量登记到 NCCL stream，caching allocator 在该 isend
+    # 完成前不复用其显存、完成后惰性回收，故引用可立即释放（前提：不设 TORCH_NCCL_AVOID_RECORD_STREAMS=1）。
+    # 到达同步的责任在 producer——它在 encoder 反传前的 _finish_owned_grads 里等自己 owned 的 grad irecv
+    # 落地；consumer 全程不阻塞，也不随 owner 划分/包大小变化（原实现按 producer 桶 + 发下一个前 inline
+    # wait 上一个，那个 wait 在大包 rendezvous 下会真卡到对端 post irecv、reverse 下死锁，已整体删除）。
+    # dual-channel-p2p (2026-09-22): the consumer's boundary-grad send is pure fire-and-forget —
+    # isend(wait=False) then drop the reference, with no tracking (no pending list, no is_completed,
+    # no wait). Memory is safe via PyTorch record_stream (ProcessGroupNCCL records P2P tensors on the
+    # NCCL stream by default, so the caching allocator defers reuse until the isend completes). The
+    # arrival barrier belongs to the producer's _finish_owned_grads before its encoder backward.
 
     def _dispatch_boundary_grad() -> None:
         """Consumer (stage 0): take the boundary grad of the finished backward and dispatch it.
@@ -794,11 +806,10 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         梯度不在返回值里；但反传图本身必然算到它（4.6b 已把它切成 leaf），梯度已累积在
         ``.grad`` 上，这里直接取。
 
-        派发（与 producer 侧"补货 step 按 k-P 递增收"顺序匹配，因为 pop 顺序 = 反传顺序 =
-        microbatch 增序）：
-        - ``microbatch % P == 0``（producer 0 = 消费者自己）：本地存
-          ``producer_grad_buffers``，不走通信；
-        - 否则 ``colocated_send_backward(..., wait=False)`` 发回对应 producer。
+        派发（与 producer 侧 ``_receive_owned_grads`` 按 owned 升序 POST irecv 的顺序匹配，因为
+        pop 顺序 = 反传顺序 = microbatch 增序 = 各 owner 的 owned 升序）：
+        - owner 表判 ``owner == 0``（producer 0 = 消费者自己）：本地存 ``producer_grad_buffers``；
+        - 否则 ``colocated_send_backward(..., wait=False)`` 发回 owner 对应 producer（grad 组）。
 
         FIFO（``consumer_boundary_inputs``）而不是 ``prefetched`` 做载体的原因：``prefetched``
         按 producer 为 key，会被同一 producer 的后续 microbatch 覆盖（P=2 时 step k=2 就把
@@ -809,119 +820,172 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         **只有 consumer 调用本函数**——``is_consumer`` 判断放在两处调用点（2026-08-26
         用户要求：写在调用处更清晰，避免让人以为 producer 也要发边界梯度）。
 
-        NVTX：一个区间覆盖"取梯度 + 排空上一次 isend + 派发"整段（内层的
+        NVTX：一个区间覆盖"取梯度 + fire-and-forget 派发"整段（内层的
         ``colocated-boundary-send-backward`` 由通信器提供，外减内即为本函数自身的开销）。
-        **不给排空的 ``handle.wait()`` 单独标区间**：它只是插 stream-wait、CPU 不阻塞，
-        单标恒为 0；真正的等待要看 GPU 时间线（见 _send_intra_packet 的说明）。
-        NVTX: one range for the whole helper (the inner send range comes from the
-        communicator); deliberately none around the drain wait, which does not block the CPU.
+        NVTX: one range for the whole helper; the inner send range comes from the communicator.
         """
         nvtx_range_push("colocated-boundary-grad-dispatch")
         microbatch, boundary_embeddings = consumer_boundary_inputs.pop(0)
+        _cpu_probe(f"grad-dispatch ENTER mb={microbatch}")
         boundary_grad = boundary_embeddings.grad
         assert boundary_grad is not None, (
             f"microbatch {microbatch}: the boundary image_embeddings got no grad — it must be "
             f"a leaf with requires_grad=True (4.6b) and take part in the backbone backward"
         )
-        boundary_embeddings.grad = None  # 释放引用，接收 buffer 可回收 / release the reference
-        producer = microbatch % group_size
+        boundary_embeddings.grad = None  # 断开 .grad 属性（grad 已由 boundary_grad 接住）；boundary_embeddings 出 FIFO 后其激活存储随作用域回收 / detach the .grad attribute; the activation is freed once this leaf leaves scope
+        # dual-channel-p2p Task 4：owner 由 owner 表决定（支持任意/逆序划分）。
+        producer = parallel_state.get_colocated_microbatch_owner(microbatch)
         if producer == 0:
             producer_grad_buffers[microbatch] = boundary_grad  # producer 0 = 自己：本地留存
             nvtx_range_pop("colocated-boundary-grad-dispatch")
             return
-        # 先 wait 掉**这个 producer** 上一次派发的 isend（跨 producer 独立，不互等）——那次
-        # 发送已被它的补货 step 收走（早 P 步），wait 只是确认、不实际阻塞。
-        # Wait this producer's previous dispatch (producers are independent); it was consumed
-        # P steps ago by that producer's restock step, so the wait only confirms.
-        for handle in boundary_grad_send_handles.pop(producer, []): #按 producer 分桶，只有同一producer产的micorbatch梯度再发才需要wait
-            handle.wait()
-        boundary_grad_send_handles[producer] = comm.colocated_send_backward(
+        # dual-channel-p2p（2026-09-22）：fire-and-forget——异步 isend 发回 owner，发完**不留任何句柄/引用**。
+        # 显存由 record_stream 兜底（见函数上方说明），到达由 producer 的 _finish_owned_grads 保证。
+        # dual-channel-p2p (2026-09-22): fire-and-forget — async isend to the owner, keeping no handle
+        # or reference afterwards; memory is guarded by record_stream, arrival by the producer's
+        # _finish_owned_grads.
+        comm.colocated_send_backward(
             BackwardPacket(grad=boundary_grad), producer=producer, wait=False
         )
+        _cpu_probe(f"grad-dispatch isend mb={microbatch} -> producer={producer} DONE")
         nvtx_range_pop("colocated-boundary-grad-dispatch")
 
-    # --- 4.4/4.6d：producer 的补货 step——**steady 阶段**顺序固定为 ① 收梯度 → ② forward →
-    # ③ 等梯度 → ④ 补货；**warmup 阶段只有 ④**（纯前传、consumer 尚未反传，无梯度可收）。
-    # 三个动作各抽一个函数，由两个循环体按各自需要调用。
-    # --- 4.4/4.6d: in the steady loop the producer's restock step is fixed to ① recv grad ->
-    # ② forward -> ③ wait grad -> ④ restock; the warmup loop only does ④ (forward-only, the
-    # consumer has not backwarded yet, so there is no grad to receive).
-    def _start_boundary_grad_recv(microbatch: int) -> None:
-        """Producer step ①: post the grad irecv of ``microbatch`` (one it owns).
+    # dual-channel-p2p Task 4：producer 的边界梯度接收——两步分离以最大化重叠：
+    # _receive_owned_grads 在本 producer 每次自身反传后**只 POST（异步 irecv，不等数据）** owned
+    # 中 <= i-x 的梯度；_finish_owned_grads 在 phase④ encoder 反传前**统一等数据落地**，使梯度数据
+    # 传输与 backbone cooldown/后续计算重叠（consumer 侧对应 _dispatch_boundary_grad 反传后即发）。
+    # dual-channel-p2p Task 4: the producer's boundary-grad receive is split in two to maximize
+    # overlap — _receive_owned_grads only POSTs the async irecv (bound i-x) after each of this
+    # producer's own backwards, and _finish_owned_grads waits the data just before phase ④.
+    def _receive_owned_grads(backward_microbatch: int) -> None:
+        """Producer: POST (async, do NOT wait data) the grad irecv of every owned microbatch
+        <= ``backward_microbatch - producer_id`` not yet posted (dual-channel-p2p Task 4, grad
+        recv bound i-x; x = producer_id = stage 号).
 
-        生产者异步收 **microbatch ``microbatch``**（自己产的）的边界梯度：
-        ``colocated_recv_backward(wait=False)`` 内部已完成"提交 shape 头 → 等头 → 分配
-        buffer → post 数据 irecv"，返回的 request 已在后台传输，存 ``pending_grad_requests``。
-        参数是"**要收谁的梯度**"而不是"当前 step 的 microbatch"——这样 steady 的补货 step
-        （收 k-P）与 cooldown 收尾（收最后一个自己产的）用同一个接口，不必造一个不存在的
-        step 号。所有权判断对两者等价（``(k-P) % P == k % P``）。
-
-        steady 的补货 step 把它放在 forward **之前**：数据传输与紧随其后的 forward 重叠，
-        且梯度此刻**已经就绪**——consumer（stage 0）对 microbatch k-P 的反传恰好比本 step
-        早 1 步（stage i 做 backward x 的时刻 = stage 0 做 backward x+i 的时刻，doc §2.11），
-        所以 irecv 立即配对、不阻塞。
-        ``microbatch < 0`` 表示"本 rank 自己产的第一个 microbatch 没有上一个"，直接返回。
-
-        ``forward_only``（eval）下直接返回：consumer 走的是纯前传分支、根本不会派发边界
-        梯度，这里 post 的 irecv 永远没有对端，而 ``colocated_recv_backward(wait=False)``
-        内部含"等 shape 头"这一次会合，会阻塞并把整个 pipeline 挂死。梯度相关的其它动作
-        早已门住（consumer 的 FIFO 记账、cooldown 整块、phase ④ 的 encoder 反传、两处
-        finalize_model_grads），守卫写在函数体里而不是逐个调用点，是为了让 steady 与
-        cooldown 收尾两处调用一次性覆盖。
-        Return immediately under ``forward_only`` (eval): the consumer takes the pure-forward
-        branch and never dispatches boundary grads, so this irecv would have no counterpart and
-        the header rendezvous inside the receive would block and hang the whole pipeline. The
-        guard lives in the function body rather than at each call site so that both the
-        steady-state call and the cooldown tail call are covered at once.
+        参数与 _supply_owned_activations 对称——传入**本 producer 自身反传的 mb 序号 i**（不是预算好
+        的 limit），内部算 recv_limit = i - x。1F1B 下 consumer（stage 0）对 mb <= i-x 的反传必早于
+        producer x 对 mb i 的反传（doc §3），故这些 owned 梯度已被 consumer isend、irecv 的 header
+        会合立即完成；数据后台传输，由 _finish_owned_grads 在 phase④ 前统一等落地（与 cooldown/
+        后续计算重叠）。owned 里被 i-x 界够不到的最后几个（触发反传号 mb+x 超过 N-1）由
+        _finish_owned_grads 在 schedule 结束后补 POST（那时全部梯度已就绪）。梯度包无 mb id：同一
+        (consumer 0 → producer x) 对按 FIFO 到达 =
+        consumer 反传升序 = 本 producer owned 升序，故按 owned 升序 POST、request 即与该 owned 对号。
+        ``forward_only``（eval）无边界梯度，直接返回。
+        Takes this producer's own backward microbatch (symmetric with _supply_owned_activations);
+        posts async only, the data wait is deferred to _finish_owned_grads before phase ④.
         """
-        if forward_only or is_consumer or microbatch < 0 or microbatch % group_size != producer_id:
+        if forward_only or is_consumer:
             return
-        request = comm.colocated_recv_backward(producer=producer_id, wait=False)
-        pending_grad_requests[microbatch] = request
-
-    def _finish_boundary_grad_recv(microbatch: int) -> None:
-        """Producer step ③: wait the grad posted by ① for ``microbatch`` and store it.
-
-        ``finish()`` 等数据 handle（补货 step 里已后台传输了一整个 forward 的时间，通常
-        早已完成）→ 把梯度存进 ``producer_grad_buffers``，phase ④ 统一 encoder 反传时取用。
-        没有对应的在飞请求（① 被守卫拦掉）时直接返回。
-        必须在 ④ 补货**之前**完成：补货的 isend 与这里的梯度 irecv 是**同一对 peer**
-        （producer p ↔ consumer 0）→ 同一个 NCCL communicator 与 stream，未完成的 irecv
-        会挡住后面 enqueue 的 isend。
-        ``forward_only``（eval）下直接返回：与 ① 对称——eval 不产生边界梯度，此时字典本该
-        是空的，早返回让这个不变量显式而不是依赖"pop 不到就返回"的巧合。
-        Return immediately under ``forward_only``, symmetric with step ①: eval produces no
-        boundary grads, so the dictionary is expected to be empty and the early return states
-        that invariant explicitly instead of relying on the pop simply missing.
-        """
-        if forward_only:
-            return
-        request = pending_grad_requests.pop(microbatch, None)
-        if request is None:
-            return
-        producer_grad_buffers[microbatch] = request.finish().grad
-
-    def _restock_boundary_packet(microbatch: int) -> None:
-        """Producer step ④: asynchronously send the next packet it owns ("consume one, add one").
-
-        生产者在补货 step 的**最后一件事**：forward 推进到 microbatch k（k%P==producer_id，
-        即"流水消耗到我负责的包"）后，异步发下一个自己负责的包（k+P）——"消费一个补一个"。
-        ``wait=False`` 提前发送，与 consumer 的提前一整步 prefetch（4.5）配对。
-
-        NVTX：外层区间额外覆盖补货的所属判断与 4.9 的伪释放——内层
-        ``colocated-boundary-send-forward`` 只覆盖发送本身。
-        NVTX: the outer range also covers the ownership check and the 4.9 pseudo-release.
-        """
-        if is_consumer or microbatch % group_size != producer_id:
-            return
-        nvtx_range_push("colocated-boundary-packet-restock")
-        next_microbatch = microbatch + group_size
-        if next_microbatch < num_microbatches:
-            comm.colocated_send_forward(
-                encoder_buffers[next_microbatch], producer=producer_id, wait=False
+        recv_limit = backward_microbatch - producer_id
+        _cpu_probe(f"recv-owned-grads ENTER bwd_mb={backward_microbatch} limit={recv_limit}")
+        for owned_microbatch in owned_microbatches:  # ascending
+            if owned_microbatch > recv_limit:
+                break
+            if owned_microbatch in producer_grad_requests:
+                continue
+            _cpu_probe(f"recv-owned-grads post irecv mb={owned_microbatch} BEGIN")
+            producer_grad_requests[owned_microbatch] = comm.colocated_recv_backward(
+                producer=producer_id, wait=False
             )
-            _deallocate_encoder_output(encoder_buffers[next_microbatch])  # 4.9
-        nvtx_range_pop("colocated-boundary-packet-restock")
+            _cpu_probe(f"recv-owned-grads post irecv mb={owned_microbatch} END")
+
+    def _finish_owned_grads() -> None:
+        """Producer: POST any still-un-posted owned grad, then wait every posted grad's DATA and
+        store it into producer_grad_buffers, right before phase ④ encoder backward.
+
+        调用点：cooldown 全部结束后。此刻 consumer 已反传全部 mb、发出全部梯度，故 owned 里被
+        i-x 界够不到的最后几个（触发反传号 mb+x 超过 N-1）此刻也可安全接收——先把这些剩余 owned
+        补 POST，再统一等所有已 POST 的 grad 数据落地（phase④ 前唯一的数据等待点，把 grad 传输藏在
+        前面的 backbone cooldown/计算里）。finish() 顺序与配对无关（匹配在 POST 时按 FIFO 已定），
+        每个 request 落进它 POST 时对应的 owned mb。``forward_only``/consumer 直接返回。
+        """
+        if forward_only or is_consumer:
+            return
+        for owned_microbatch in owned_microbatches:  # POST any tail the i-x bound never reached
+            if owned_microbatch not in producer_grad_requests:
+                _cpu_probe(f"finish-owned-grads post tail irecv mb={owned_microbatch}")
+                producer_grad_requests[owned_microbatch] = comm.colocated_recv_backward(
+                    producer=producer_id, wait=False
+                )
+        for owned_microbatch, request in producer_grad_requests.items():
+            _cpu_probe(f"finish-owned-grads WAIT data mb={owned_microbatch} BEGIN")
+            producer_grad_buffers[owned_microbatch] = request.finish().grad
+            _cpu_probe(f"finish-owned-grads WAIT data mb={owned_microbatch} END")
+        producer_grad_requests.clear()
+
+    def _supply_owned_activations(
+        forward_microbatch: int, is_warmup: bool
+    ) -> None:
+        """Producer: isend owned activations with mb id <= forward_microbatch + x (steady) or
+        + x + 1 (warmup) not yet sent (x = producer_id = this stage index).
+
+        **dual-channel-p2p（2026-09-23 更正）调用位置：warmup 前所有 rank 各调一次 (0)（universal
+        supply，启动兜底）+ 每个 warmup/steady step 在 take/partial 之后、forward_step 之前调用。**
+        要发的 encoder 激活在 phase① 已算好、已驻留，isend 是纯 host 异步动作、不阻塞（未匹配
+        isend 不占自旋 kernel、不阻塞后续 cudaMalloc，已实测）。原设计放在 step 最顶端、recv_forward
+        之前以打破启动循环依赖；2026-09-23 起 backbone PP p2p 内部 cudaMalloc 的全设备同步不能被
+        boundary kernel 挡住（用户定案 boundary 通信后置），故 step 内调用点后移到 take 之后，启动期
+        由 warmup 前的 universal supply 覆盖。owned 升序，超过上界即停。
+        **dual-channel-p2p（2026-09-23 波前分析定案）供给紧界：steady 用 ``i+x``（紧界）、
+        warmup/pre-warmup 用 ``i+x+1``（提前一拍），由 ``is_warmup`` 区分。** consumer 能开始
+        ``forward(i+x)`` 的前提是 PP 依赖链把 producer x 的 ``forward(i)`` 送到（chain root =
+        consumer 上一拍的 forward 发送），故 steady 的 ``isend(i+x)`` 的**发射**被依赖链保证先于
+        consumer 的 ``take(i+x)``——紧界就是 ``i+x``，且 consumer 的反传尾巴（PP sb/rf + B + grad
+        派发）给了 producer 整拍缓冲，等待有界、无同波竞速。warmup 全是 F、step 尾巴只有一次 PP
+        send，吸收不了跨 x-1 跳的 relay 延迟，``isend(i+x)`` 与 ``take(i+x)`` 同波竞速，必须
+        ``+1`` 提前一拍。在 ``=1``（单硬件队列）下 steady 的 ``+1`` 会造成同波 isend/irecv 竞速并
+        闭环成执行序死锁（GBS≥32 实测），故 steady 不得带 ``+1``；多连接（``=2``）下无害。旧
+        "``+1`` 是紧界"的结论属于旧调度模型（供给在 step 顶端、recv 阻塞在循环体），已被本模型取代。
+        Supply-bound invariant (2026-09-23 wave-front analysis): steady supplies at the tight bound
+        ``i+x`` while warmup/pre-warmup supplies one wave early at ``i+x+1``, selected by
+        ``is_warmup``. The PP dependency chain guarantees producer x reaches step i before
+        consumer's ``forward(i+x)`` starts, so the steady ``isend(i+x)`` is always issued before
+        consumer's ``take(i+x)`` — tight and race-free, with the backward tail giving the producer
+        a full step of slack. Warmup is forward-only (its step tail cannot absorb the x-1 hop
+        relay latency), so ``+1`` is required there. Under a single hardware queue
+        (CUDA_DEVICE_MAX_CONNECTIONS=1) the same-wave send/recv race created by a steady ``+1``
+        closes into an execution-order deadlock (observed at GBS>=32), so steady must not carry
+        the ``+1``; with multiple connections it is harmless. The old "+1 is the tight bound"
+        result belonged to the previous schedule model and is superseded.
+        Call sites (2026-09-23 correction): once per rank BEFORE warmup (universal supply,
+        is_warmup=True, covers startup) plus once per warmup/steady step after take/partial and
+        before forward_step — moved away from the step top so the backbone PP p2p's internal
+        cudaMalloc (device-wide sync) is never blocked by queued boundary kernels. Owned ascending,
+        stop past the bound.
+        """
+        if is_consumer:
+            return
+        # dual-channel-p2p（2026-09-23 定案）：warmup/pre-warmup 供给 = i+x+1——提前一拍，吸收
+        # warmup 纯 F 的 step 尾巴吸收不了的跨 x-1 跳 relay 延迟；steady 供给 = i+x（紧界——PP
+        # 依赖链保证发射先于 consumer 的 take，反传尾巴再给一拍缓冲）。=1 下 steady 多出的 +1
+        # 造成同波 isend/irecv 竞速并闭环成执行序死锁（GBS>=32 实测），故必须按相位区分。
+        # dual-channel-p2p (2026-09-23 settled): warmup/pre-warmup supplies at i+x+1 — one wave
+        # early, absorbing the x-1 hop relay latency the forward-only warmup step tail cannot
+        # absorb; steady supplies at the tight bound i+x — the PP chain guarantees the isend
+        # issues before the consumer's take, and the backward tail adds a full step of slack.
+        # Under CUDA_DEVICE_MAX_CONNECTIONS=1 a steady +1 creates a same-wave send/recv race that
+        # closes into an execution-order deadlock (observed at GBS>=32), hence the phase split.
+        if is_warmup:
+            supply_limit = forward_microbatch + producer_id + 1
+        else:
+            supply_limit = forward_microbatch + producer_id
+        _cpu_probe(
+            f"supply ENTER fwd_mb={forward_microbatch} limit={supply_limit} warmup={is_warmup}"
+        )
+        nvtx_range_push("colocated-boundary-activation-supply")
+        for owned_microbatch in owned_microbatches:  # ascending
+            if owned_microbatch > supply_limit:
+                break
+            if owned_microbatch in producer_sent_activations:
+                continue
+            _cpu_probe(f"supply isend mb={owned_microbatch} -> consumer BEGIN")
+            comm.colocated_send_forward(
+                encoder_buffers[owned_microbatch], producer=producer_id, wait=False
+            )
+            _cpu_probe(f"supply isend mb={owned_microbatch} -> consumer END")
+            producer_sent_activations.add(owned_microbatch)
+            _deallocate_encoder_output(encoder_buffers[owned_microbatch])  # 4.9
+        nvtx_range_pop("colocated-boundary-activation-supply")
 
     # --- 4.3i：backbone P2P 伴随传输展开 labels/loss_mask（4.3h 定案；4.3l 起命名
     # 统一为 intra_packet 伴随传输）---
@@ -1076,6 +1140,25 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
 
     # NVTX：backbone warmup 阶段（纯前传）。对应 schedules.py 的 "warmup" 区间。
     # NVTX: the backbone warmup phase (forward only), mirroring schedules.py's "warmup".
+    _cpu_probe(
+        f"SCHEDULE-START is_consumer={is_consumer} producer_id={producer_id} "
+        f"is_pp_last_stage={p2p_communicator.is_pp_last_stage} owned={owned_microbatches} "
+        f"num_warmup={num_warmup_microbatches} num_remaining={num_microbatches_remaining} "
+        f"batch_p2p_comm={config.batch_p2p_comm} batch_p2p_sync={config.batch_p2p_sync}"
+    )
+    # dual-channel-p2p（2026-09-23 用户定案）：**所有 rank** 在进 warmup 前统一补一次货
+    # （_supply_owned_activations 对 consumer 直接返回，是 no-op）。原先只有 last stage 在
+    # pre-steady 补一次（2026-09-22 启动死锁修复），那次补货与 consumer 的 prefetch irecv 是
+    # 同拍紧 race——GBS=64 fa504 下自旋 recv 窗口会与 TE 冷 cudaMalloc 的全设备同步相撞。
+    # 提前到 warmup 前、每个 producer 无条件发 owned ≤ x+1，把 isend 提前到一切自旋 recv
+    # 窗口之前，缩小/消除撞车窗口。
+    # dual-channel-p2p (2026-09-23, user decision): EVERY rank supplies once BEFORE the warmup
+    # loop (a no-op for the consumer). The old last-stage-only pre-steady supply raced with the
+    # consumer's prefetch irecv in the same step; issuing owned <= x+1 unconditionally up front
+    # moves every isend ahead of any spinning-recv window.
+    if num_microbatches > 0:
+        _cpu_probe(f"PRE-WARMUP universal supply(0) producer_id={producer_id}")
+        _supply_owned_activations(0, is_warmup=True)
     nvtx_range_push("colocated-warmup")
     # Run warmup forward passes.
     # 执行 warmup 阶段的前传。
@@ -1090,37 +1173,17 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        _cpu_probe(f"WARMUP step i={i} TOP")
+        _cpu_probe(f"WARMUP i={i} recv_forward(PP) BEGIN")
         input_tensor = p2p_communicator.recv_forward(  # 接受前序 stage 的激活
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
+        _cpu_probe(f"WARMUP i={i} recv_forward(PP) END")
         # 4.3i：伴随接收 labels/loss_mask（在 recv_forward 之后、两端同序）；4.3j 起
         # _recv_intra_packet 返回张量，不再写入模型属性。
         received_labels, received_loss_mask = _recv_intra_packet(
             input_tensor, p2p_communicator.is_pp_first_stage
         )
-        # 4.5/4.5b：consumer 提前一整步 prefetch——forward microbatch i 前，异步收下一个
-        # 需要的包（i+1，producer (i+1)%P）进 prefetched，让数据传输与当前 step 计算重叠。
-        # 4.5b（2026-08-26）：去掉原先的 `next_microbatch >= group_size` 守卫，**首波
-        #（1..P-1）也走这条同一规则**（原先首波由流水前全量 prefetch 负责，已删）——
-        # warmup 的 step i 正好 post mb i+1 的 recv，与 producer 流水前的异步首包配对。
-        # 唯一跳过的情况是 producer 0（本地直传、无通信）——它同时覆盖了"最后一个
-        # forward"这个边界：n % P == 0（validate_colocated_num_microbatches），故
-        # i+1 == n 时 next_producer == 0，无需再判越界。
-        # 4.5/4.5b: the consumer prefetches one full step ahead — before forwarding microbatch
-        # i it asynchronously receives the next needed packet (i+1, producer (i+1)%P) so the
-        # transfer overlaps the current step's compute. 4.5b drops the former
-        # `next_microbatch >= group_size` guard so the first wave (1..P-1) follows the very
-        # same rule (the pre-pipeline bulk prefetch is gone); warmup step i posts the recv of
-        # mb i+1, pairing with the producers' async startup sends. The only skipped case is
-        # producer 0 (local hand-off), which also covers the last forward: n % P == 0, so
-        # i+1 == n maps to producer 0 and no range check is needed.
-        if is_consumer:
-            next_microbatch = i + 1
-            next_producer = next_microbatch % group_size
-            if next_producer != 0:
-                prefetched[next_producer] = comm.colocated_recv_forward(
-                    next_producer, expected_microbatch_id=next_microbatch, wait=False
-                )
         # 4.3b：consumer 前传 microbatch i 前 take 包（stage 0 前传 0..P-2），并用
         # ``functools.partial`` 绑定到 forward step（packet 走闭包，不经模型属性）。
         # 4.3j：intra_packet——consumer 用输出盒子（colocated_forward_step 写回组装
@@ -1138,6 +1201,23 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
                 labels=received_labels, loss_mask=received_loss_mask
             )
             forward_step_func = partial(forward_step_func, intra_packet=intra_packet)
+        # dual-channel-p2p（2026-09-23 用户定案：boundary 通信后置）：supply 与 prefetch 从
+        # step 顶端（recv_forward 之前）移到 take/partial 之后——warmup 的 recv_forward /
+        # send_forward 是 backbone PP p2p，其内部 cudaMalloc 的全设备同步不能被 boundary
+        # kernel 挡住。启动期仍由 warmup 前的 universal supply（owned ≤ x+1）兜底，避免
+        # last stage 的 pre-steady recv 成环。
+        # dual-channel-p2p (2026-09-23, user decision: boundary comm after backbone PP comm):
+        # warmup supply + prefetch moved after take/partial; the pre-warmup universal supply
+        # still covers the startup window.
+        _supply_owned_activations(i, is_warmup=True)
+        if is_consumer:
+            next_microbatch = i + 1
+            if next_microbatch < num_microbatches:
+                next_owner = parallel_state.get_colocated_microbatch_owner(next_microbatch)
+                if next_owner != 0:
+                    prefetched[next_microbatch] = comm.colocated_recv_forward(
+                        next_owner, expected_microbatch_id=next_microbatch, wait=False
+                    )
         output_tensor, num_tokens = forward_step(  # 单个 microbatch 的前传
             forward_step_func,
             data_iterator,
@@ -1153,13 +1233,13 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
             current_microbatch=i,
             is_last_stage=p2p_communicator.is_pp_last_stage,
         )
-        # 4.4：warmup 是纯前传、consumer 还没开始反传，**没有梯度可收**（①③ 不适用），
-        # 只有 producer 的补货（④）——它是前向侧的动作。
-        # 4.4: warmup is forward-only and the consumer has not started backwarding yet, so
-        # there is no grad to receive (①③ do not apply); only the producer's restock (④),
-        # which is a forward-side action.
-        _restock_boundary_packet(i)
+        _cpu_probe(f"WARMUP i={i} forward_step END")
+        # dual-channel-p2p Task 3：warmup 供给已移到 step 顶端的 _supply_owned_activations(i)
+        # （recv_forward 之前）；warmup 纯前传、consumer 尚未反传，无梯度可收（①③ 不适用）。
+        # dual-channel-p2p Task 3: forward supply moved to _supply_owned_activations(i) at the
+        # top of the step (before recv_forward); warmup is forward-only, no grad to receive.
         p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)  # 发给后序 stage
+        _cpu_probe(f"WARMUP i={i} send_forward(PP) DONE")
         # 4.3i：伴随发送 labels/loss_mask——consumer 用 colocated_forward_step 写回的
         # intra_packet，非 consumer 透传 recv 到的同份张量（两分支 intra_packet 内容一致）。
         _send_intra_packet(
@@ -1174,6 +1254,18 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
             output_tensors.append(output_tensor)
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
+    # dual-channel-p2p（2026-09-23 更正）：原先这里有一段"仅 last stage 在 pre-steady 补货"
+    # （2026-09-22 修复 reverse_block 启动死锁：last stage num_warmup==0 从没进过 warmup 循环、
+    # 其首次通信是下方被提升出循环体的 pre-steady recv_forward，若持有低号 mb 会与 stage 0
+    # 成环）。现已被上方"warmup 前所有 rank 统一 _supply_owned_activations(0)"取代——last stage
+    # （num_warmup==0）同样在 warmup 前发齐 owned ≤ x+1，pre-steady recv 不再是它的第一次通信，
+    # 该特例成为死路径，按约定删除（idempotent：producer_sent_activations 保证重复调用也无害）。
+    # dual-channel-p2p (2026-09-23 correction): the former last-stage-only pre-steady supply
+    # (the 2026-09-22 startup-deadlock fix) is superseded by the universal pre-warmup supply
+    # above — the last stage (num_warmup==0) now also sends owned <= x+1 before warmup, so the
+    # hoisted pre-steady recv is no longer its first communication. The special case became a
+    # dead path and is removed (re-calls would be harmless anyway via producer_sent_activations).
+
     nvtx_range_pop("colocated-warmup")
 
     # Before running 1F1B, need to receive first forward tensor.
@@ -1182,9 +1274,11 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
     # 供 steady 循环第一轮的 forward 绑定与发送（4.3j：intra_packet 输入载体）。
     pending_labels, pending_loss_mask = None, None
     if num_microbatches_remaining > 0:
+        _cpu_probe("PRE-STEADY recv_forward(PP) BEGIN")
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
+        _cpu_probe("PRE-STEADY recv_forward(PP) END")
         pending_labels, pending_loss_mask = _recv_intra_packet(
             input_tensor, p2p_communicator.is_pp_first_stage
         )
@@ -1207,24 +1301,7 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         # 4.4/4.5：本 step 的 microbatch 号（k = W + i）。
         # 4.4/4.5: the current microbatch of this step (k = W + i).
         current_microbatch = i + num_warmup_microbatches
-        # 4.6d ①：producer 先异步收上一个自己产的 microbatch（k-P）的梯度（与 forward 重叠）。
-        # 4.6d ①: the producer first posts the grad irecv of its previous microbatch (k-P).
-        _start_boundary_grad_recv(current_microbatch - group_size)
-        # 4.5/4.5b：consumer 提前一整步 prefetch——forward k 前，异步收下一个需要的包
-        #（k+1，producer (k+1)%P）进 prefetched，与当前 step 计算重叠。4.5b（2026-08-26）
-        # 与 warmup 用同一条规则（唯一守卫是"producer 0 本地直传"）；steady 里
-        # k+1 >= P 天然成立，去掉原守卫不改变行为，只是两处形态统一。
-        # 4.5/4.5b: same one-step-ahead prefetch as warmup — before forwarding k, post the
-        # recv of k+1 (producer (k+1)%P). The only guard left is "producer 0 is local"; in the
-        # steady loop k+1 >= P always holds, so dropping the former guard is behaviour-neutral
-        # and merely makes both sites identical.
-        if is_consumer:
-            next_microbatch = current_microbatch + 1
-            next_producer = next_microbatch % group_size
-            if next_producer != 0:
-                prefetched[next_producer] = comm.colocated_recv_forward(
-                    next_producer, expected_microbatch_id=next_microbatch, wait=False
-                )
+        _cpu_probe(f"STEADY step i={i} mb={current_microbatch} TOP")
 
         # 4.3b：consumer 前传 microbatch W+i 前 take 包，并 partial 绑定到 forward step。
         # 4.3j：intra_packet——consumer 用输出盒子，非 consumer 用 pending 的输入载体。
@@ -1240,6 +1317,35 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
                 labels=pending_labels, loss_mask=pending_loss_mask
             )
             forward_step_func = partial(forward_step_func, intra_packet=intra_packet)
+        # dual-channel-p2p（2026-09-23 用户定案：boundary 通信后置到 backbone PP 通信之后）：
+        # supply 与 prefetch 从 step 顶端移到 take/partial 之后——backbone PP p2p（_communicate）
+        # 内部会 torch.empty/cudaMalloc，其全设备同步不能被已入队的 boundary kernel（尤其自旋
+        # irecv）挡住，故本 step 的 boundary 收发尽量靠后。预取 mb k+1 仍早于下一步的 take k+1；
+        # 供给界 i+x+1 只依赖 current_microbatch，位置后移不改变界。
+        # dual-channel-p2p (2026-09-23, user decision: boundary comm goes AFTER backbone PP comm):
+        # supply + prefetch moved from the step top to after take/partial — PP p2p allocates its
+        # recv buffers internally (cudaMalloc) and its device-wide sync must not be blocked by
+        # queued boundary kernels. Prefetch of k+1 still precedes next step's take of k+1; the
+        # i+x+1 supply bound only depends on current_microbatch, so it is unchanged.
+        # dual-channel-p2p（2026-09-23 定案：波前分析 + 实测 iter12+）：steady 供给 = 紧界 i+x
+        # （PP 依赖链保证 isend(i+x) 先于 take(i+x) 发射，反传尾巴再给一拍缓冲，无同波竞速）；
+        # warmup / pre-warmup 才用 i+x+1（纯 F 尾巴吸收不了 relay 延迟，需提前一拍）。=1 下 steady
+        # 带 +1 的同波竞速会闭环成执行序死锁（GBS>=32 实测），故这里必须 is_warmup=False。
+        # dual-channel-p2p (2026-09-23 settled: wave-front analysis + runs): steady supplies at
+        # the tight bound i+x — the PP chain guarantees the isend issues before the take and the
+        # backward tail adds a full step of slack (no same-wave race); warmup/pre-warmup use
+        # i+x+1 (the forward-only tail cannot absorb the relay latency). Under =1 a steady +1
+        # deadlocks via the same-wave race (GBS>=32 observed), hence is_warmup=False here.
+        _supply_owned_activations(current_microbatch, is_warmup=False)
+        if is_consumer:
+            next_microbatch = current_microbatch + 1
+            if next_microbatch < num_microbatches:
+                next_owner = parallel_state.get_colocated_microbatch_owner(next_microbatch)
+                if next_owner != 0:
+                    prefetched[next_microbatch] = comm.colocated_recv_forward(
+                        next_owner, expected_microbatch_id=next_microbatch, wait=False
+                    )
+        _cpu_probe(f"STEADY mb={current_microbatch} forward_step BEGIN")
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -1257,10 +1363,7 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
             current_microbatch=current_microbatch,
             is_last_stage=p2p_communicator.is_pp_last_stage,
         )
-        # 4.6d ③④：前传结束——先等 ① 的梯度落地，再补货（顺序不能换）。
-        # 4.6d ③④: after the forward, wait the grad posted by ① and only then restock.
-        _finish_boundary_grad_recv(current_microbatch - group_size)
-        _restock_boundary_packet(current_microbatch)
+        _cpu_probe(f"STEADY mb={current_microbatch} forward_step END")
         total_num_tokens += num_tokens
 
         if forward_only:
@@ -1278,9 +1381,11 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
                     input_tensor, p2p_communicator.is_pp_first_stage
                 )
         else:  # 训练走这里，前传+反传
+            _cpu_probe(f"STEADY mb={current_microbatch} send_forward_recv_backward(PP) BEGIN")
             output_tensor_grad = p2p_communicator.send_forward_recv_backward(  # 发激活、收梯度
                 output_tensor, send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
+            _cpu_probe(f"STEADY mb={current_microbatch} send_forward_recv_backward(PP) END")
             _send_intra_packet(  # 4.3i：伴随发送 labels/loss_mask
                 intra_packet.labels,
                 intra_packet.loss_mask,
@@ -1302,24 +1407,38 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
                     enable_grad_sync()
 
+            _cpu_probe(f"STEADY mb={current_microbatch} backward BEGIN")
             input_tensor_grad = backward_func(  # 单个 microbatch 的反传
                 input_tensor, output_tensor, output_tensor_grad, config
             )
-            if is_consumer:  # 4.6c：只有 consumer 持边界输入、需要取梯度并派发给 producer
-                _dispatch_boundary_grad()
+            _cpu_probe(f"STEADY mb={current_microbatch} backward END")
 
             if last_iteration:
                 input_tensor = None
+                _cpu_probe(f"STEADY mb={current_microbatch} send_backward(PP,last) BEGIN")
                 p2p_communicator.send_backward(
                     input_tensor_grad, p2p_communicator.is_pp_first_stage
                 )
+                _cpu_probe(f"STEADY mb={current_microbatch} send_backward(PP,last) END")
             else:
+                _cpu_probe(f"STEADY mb={current_microbatch} send_backward_recv_forward(PP) BEGIN")
                 input_tensor = p2p_communicator.send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
+                _cpu_probe(f"STEADY mb={current_microbatch} send_backward_recv_forward(PP) END")
                 pending_labels, pending_loss_mask = _recv_intra_packet(  # 4.3i：下一轮 forward 的载体
                     input_tensor, p2p_communicator.is_pp_first_stage
                 )
+            # dual-channel-p2p（2026-09-23 用户定案：boundary 通信后置）：梯度派发/接收移到本步
+            # 全部 backbone PP 通信（send_backward / send_backward_recv_forward）之后——PP p2p 的
+            # cudaMalloc 全设备同步不再被 boundary kernel 挡住；grad irecv 晚 post 只会缩小自旋
+            # 窗口，consumer 的 grad isend 后移不改 FIFO 顺序（仍按反传序升序发出）。
+            # dual-channel-p2p (2026-09-23, user decision): boundary-grad dispatch/receive moved
+            # after this step's PP send_backward ops (i-x post bound unchanged, FIFO order kept).
+            if is_consumer:
+                _dispatch_boundary_grad()
+            else:
+                _receive_owned_grads(i)
 
     nvtx_range_pop("colocated-steady")
 
@@ -1338,63 +1457,63 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
 
+            _cpu_probe(f"COOLDOWN i={i} recv_backward(PP) BEGIN")
             output_tensor_grad = p2p_communicator.recv_backward(  # 从后序 stage 收梯度
                 send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
+            _cpu_probe(f"COOLDOWN i={i} recv_backward(PP) END")
 
+            _cpu_probe(f"COOLDOWN i={i} backward BEGIN")
             input_tensor_grad = backward_func(
                 input_tensor, output_tensor, output_tensor_grad, config
             )
-            if is_consumer:  # 4.6c：只有 consumer 持边界输入、需要取梯度并派发给 producer
-                _dispatch_boundary_grad()
+            _cpu_probe(f"COOLDOWN i={i} backward END")
 
+            _cpu_probe(f"COOLDOWN i={i} send_backward(PP) BEGIN")
             p2p_communicator.send_backward(  # 把梯度发给前序 stage
                 input_tensor_grad, p2p_communicator.is_pp_first_stage
             )
+            _cpu_probe(f"COOLDOWN i={i} send_backward(PP) END")
+            # dual-channel-p2p（2026-09-23 用户定案：boundary 通信后置）：梯度派发/接收移到本步
+            # backbone PP 通信（recv_backward / send_backward）之后，理由同 steady——PP p2p 内部
+            # cudaMalloc 的全设备同步不能被 boundary kernel 挡住。
+            # dual-channel-p2p (2026-09-23, user decision): boundary-grad ops moved after the
+            # step's PP ops (same rationale as steady).
+            if is_consumer:
+                _dispatch_boundary_grad()
+            else:
+                _receive_owned_grads(num_microbatches_remaining + i)
 
         nvtx_range_pop("colocated-cooldown")
 
-        # 4.6c：cooldown 结束——wait 掉各 producer 桶里剩余的 isend，此后 consumer 侧无在飞
-        # 梯度发送；并断言 FIFO 已空（每个前传的 microbatch 都恰好被反传+派发一次）。
-        # 4.6c: after cooldown, drain every producer's remaining isend and assert the FIFO
-        # drained (every forwarded microbatch was backwarded and dispatched exactly once).
-        # NVTX：这里**不标区间**——整段只有 handle.wait()，而 Work::wait() 只插 stream-wait、
-        # CPU 不阻塞（probe 实测 0.000 s），CPU 侧区间恒为 0；真正的等待在 GPU 时间线上。
-        # NVTX: no range here - the block is nothing but handle.wait(), which does not block
-        # the CPU, so a CPU-side range would always be empty. #这里统一 wait 生产者把梯度发给encoder自身，后续异构batch需要调整，也许会变成不 wait，来一个算一个反传
-        for handles in boundary_grad_send_handles.values():
-            for handle in handles:
-                handle.wait()
-        boundary_grad_send_handles.clear()
+        # dual-channel-p2p（2026-09-22）：consumer 侧边界梯度是 fire-and-forget，无任何在飞句柄/引用需
+        # 排空（record_stream 兜显存、_finish_owned_grads 兜到达）；此处仅断言 FIFO 已空——每个前传的
+        # microbatch 都恰好被反传+派发一次。
+        # dual-channel-p2p (2026-09-22): the consumer's grad sends are fire-and-forget, so there is
+        # nothing to drain here; just assert the FIFO emptied (every forwarded microbatch was
+        # backwarded and dispatched exactly once).
         assert not consumer_boundary_inputs, (
             f"boundary grads not dispatched for microbatches "
             f"{[microbatch for microbatch, _ in consumer_boundary_inputs]}"
         )
 
-        # 4.6d：cooldown 收尾——producer 额外收最后一个自己产的 microbatch 的梯度。
-        # 为什么恰好差这一个：owned microbatch m 的梯度是在"forward 推进到 m+P"的那个补货
-        # step 的 ① 收的，而最后一个 owned microbatch 满足 m+P >= n（没有那一步），所以每个
-        # producer 恰好剩 1 个没收。它的反传发生在 consumer 的 cooldown 里，此刻 consumer
-        # 已经派发（4.6c 的 drain 与这里配对）。
-        # 复用 ①③ 两个接口（参数是"收谁的梯度"，与补货 step 无关）：这里没有 forward 可以
-        # 重叠，start 后立即 finish，等价于同步收。
-        # 4.6d: after cooldown the producer receives the grad of the last microbatch it owns —
-        # grads are otherwise received by step ① at m+P, and the last owned microbatch has
-        # m+P >= n, so exactly one is left per producer. The same ①③ helpers are reused (their
-        # parameter is whose grad to receive); with no forward to overlap, start is immediately
-        # followed by finish, which is equivalent to a synchronous receive.
-        if not is_consumer:
-            last_owned_microbatch = max(encoder_buffers)
-            _start_boundary_grad_recv(last_owned_microbatch)
-            _finish_boundary_grad_recv(last_owned_microbatch)
+        # dual-channel-p2p Task 4：cooldown 收尾——此刻 consumer 已反传全部 mb、发出全部梯度，由
+        # _finish_owned_grads 补 POST owned 里剩余未 POST 的（> N-1-x、触发反传号 mb+x 超过 N-1、
+        # 被 i-x 界够不到的最后几个），再统一等所有已 POST 的 grad 数据落地（phase④ 前唯一等待点，
+        # 数据传输与前面 cooldown 计算重叠；对 consumer 是 no-op）。
+        # After cooldown all grads are available; _finish_owned_grads posts any still-un-posted
+        # owned (the tail the i-x bound never reached) and then waits every posted grad's data.
+        _cpu_probe("COOLDOWN done; _finish_owned_grads BEGIN")
+        _finish_owned_grads()
+        _cpu_probe("_finish_owned_grads END (entering phase-4 encoder backward)")
 
-        # 4.6d：边界梯度收齐——每个 rank 的梯度 buffer 恰好覆盖自己产的全部 microbatch
-        # （phase ④ 统一 encoder 反传的前提），且没有遗留在飞的接收请求。
-        # 4.6d: the grads are complete — every rank's buffer covers exactly the microbatches it
-        # produced (the precondition of the unified phase-④ encoder backward).
-        assert not pending_grad_requests, (
-            f"boundary grad receives still in flight for microbatches "
-            f"{sorted(pending_grad_requests)}"
+        # dual-channel-p2p Task 4：边界梯度收齐——已 POST 的接收请求全部 drain，且每个 rank 的梯度
+        # buffer 恰好覆盖自己产的全部 microbatch（phase ④ 统一 encoder 反传的前提）。
+        # The grads are complete: all posted receives drained and every rank's buffer covers
+        # exactly the microbatches it produced (the precondition of the phase-④ encoder backward).
+        assert not producer_grad_requests, (
+            f"boundary grad receives still posted but not finished for owned microbatches "
+            f"{sorted(producer_grad_requests)}"
         )
         assert sorted(producer_grad_buffers) == sorted(encoder_buffers), (
             f"boundary grad buffer keys {sorted(producer_grad_buffers)} != owned microbatches "

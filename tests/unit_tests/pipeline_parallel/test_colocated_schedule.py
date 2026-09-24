@@ -287,9 +287,18 @@ def _producer_identity():
     与生产代码同源：producer 槽位是共置边界组内的编号（组内 rank），不是 pipeline rank，
     因此在任意 rank order 下都成立（Task 5.7）。
     """
-    boundary_group = ps.get_colocated_boundary_group()
+    boundary_group = ps.get_colocated_boundary_activation_group()
     producer_id = torch.distributed.get_group_rank(boundary_group, torch.distributed.get_rank())
     return producer_id, boundary_group.size()
+
+
+def _round_robin_partition(num_microbatches, num_producers):
+    """Round-robin microbatch->producer partition for tests (producer p owns p, p+P, ...).
+    测试用轮盘划分：第 i 项为 producer i 的 mb id 升序列表，供 build_colocated_microbatch_owner_table。"""
+    return [
+        list(range(producer_slot, num_microbatches, num_producers))
+        for producer_slot in range(num_producers)
+    ]
 
 
 def _my_microbatches_setup(world, num_microbatches=None):
@@ -315,9 +324,15 @@ def _my_microbatches_setup(world, num_microbatches=None):
     snapshot_colocated_encoder_rng_tracker()
     producer_id, num_producers = _producer_identity()
     num_microbatches = 2 * world if num_microbatches is None else num_microbatches
-    my_microbatches = ps.get_microbatches_for_producer(
-        producer_id, num_microbatches, num_producers
+    # dual-channel-p2p Task 6：schedule 现在读 owner 表（get_colocated_owned_microbatches）；生产里
+    # 由训练入口注册划分函数、initialize_model_parallel 时构建，这些测试直接调 schedule，故这里用
+    # 轮盘划分显式建表（build 会 rank0 广播，保证各 rank 一致）。
+    # The schedule reads the owner table; production builds it at init from the registered
+    # partition func, so build it explicitly here (round-robin) for the direct-schedule tests.
+    ps.build_colocated_microbatch_owner_table(
+        num_microbatches, num_producers, _round_robin_partition
     )
+    my_microbatches = ps.get_colocated_owned_microbatches(producer_id)
     # 合并批：本 rank 全部 micro batch 的样本沿 batch 维堆叠（batch 顺序 == 轮盘序列），
     # 每个 microbatch 1 个样本（MBS=1）。优化 spec Task 1：dataloader 一次取回合并批。
     per_mb = [

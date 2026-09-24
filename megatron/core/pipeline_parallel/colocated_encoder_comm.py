@@ -16,17 +16,33 @@
 数据包由协议类承载（**Task 4.2e**）：
 - ``ForwardPacket``：5 字段（4 个内容字段 image_embeddings/tokens/labels/
   num_image_tiles + **microbatch id 字段**，均为真实字段），
-  负责 shape 头 + 扁平数据 buffer 的序列化布局（含 _ALIGN 字节对齐填充）；
+  负责**定长扁平数据 buffer** 的序列化布局（含 _ALIGN 字节对齐填充，HEADER-FREE）；
   **loss_mask 不打包**——消费者在 ``colocated_backbone_get_batch`` 里从 labels
   （含 IGNORE/pad 掩码）本地重建（2026-08-13 用户确认）；
 - ``BackwardPacket``：单张量（image_embeddings 梯度），与 ForwardPacket 对称。
-类负责**布局**（serialize/parse_shape_header/deserialize），本类只做**通信原语**
-（isend/irecv/wait/buffer 管理）——前向包先发一次 shape 头、再发一个连续扁平 buffer
-（共 2 次 P2P，避免逐字段多次发送的延迟开销）；反向包同样 shape 头 + 梯度 2 次 P2P。
+类负责**布局**（serialize/deserialize），本类只做**通信原语**
+（isend/irecv/wait/buffer 管理）。
 
-**重要**：本类使用**独立的共置边界通信组**（``get_colocated_boundary_group()``）——
-成员与 pp_group / enc_inner_dp 组相同但是独立 NCCL 实例，不复用它们，避免与
-backbone 1F1B 的 P2P 在同一组上排队（stream 串行）以及潜在的交叉死锁。
+**dual-channel-p2p（2026-09-22）：HEADER-FREE / 定长协议**——每个样本 shape 由 config
+静态固定（image_seq_length/micro_batch_size/hidden_size/text_seq_length 全部在通信器构造时从 ``get_args()`` 求出），
+所以**去掉 shape 头**：前向包只发**一个定长扁平 buffer**（1 次 P2P），反向包只发**一个
+定长梯度张量**（1 次 P2P）。接收端按构造期算好的定长 layout 直接 ``irecv`` 一块定长
+buffer，**立即返回、真正异步**。这修掉了此前"先收 shape 头 → ``parse_shape_header``
+（``.item()/.tolist()`` 触发 CUDA 同步）"导致的阻塞式接收：那次同步会卡住 schedule
+循环、把"异步"recv 变成同步等待并引发死锁。定长后收方无需等待/解析头即可 post
+单个 irecv。
+HEADER-FREE fixed-length protocol: every sample's shape is statically fixed by config,
+so the shape header is removed. Forward sends ONE fixed-size flat_buffer buffer (1 P2P) and
+backward sends ONE fixed-shape grad (1 P2P); the receiver posts a single fixed-size
+irecv that returns immediately (truly async), fixing the deadlock where the old
+shape-header wait + parse_shape_header (a CUDA sync via .item()/.tolist()) blocked the
+schedule loop.
+
+**重要**：本类使用**两个方向隔离的独立共置边界通信组**（dual-channel-p2p Task 2，
+2026-09-22）：``get_colocated_boundary_activation_group()``（前向激活 producer→consumer）
+与 ``get_colocated_boundary_grad_group()``（反向梯度 consumer→producer）——成员与
+pp_group / enc_inner_dp 组相同但各为独立 NCCL 实例、各自内部 NCCL stream，不复用它们，
+避免与 backbone 1F1B 的 P2P 同组串行，也让边界收发按方向分流、不交叉。
 """
 
 from dataclasses import dataclass
@@ -35,21 +51,19 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from megatron.core import parallel_state
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.utils import nvtx_decorator
 
-# shape 头每字段长度 = 1(ndim) + 3(最多 3 维，0 填充)。字段最多 3 维：
-# image_embeddings [seq, num_tiles, h] 是 3D，文本字段都是 1D，无需预留 4D。
-# Per-field shape-header length = 1 (ndim) + 3 (max dims, zero padded). Fields are
-# at most 3D (image_embeddings [seq, num_tiles, h]); text fields are 1D.
-_SHAPE_HEADER_LEN = 4
-# 前向包字段数 = 5 个内容字段 + microbatch id 字段（第 6 个真实字段，与 num_image_tiles
-# 同类：小张量，走同一套 header 行 / 数据 buffer / deserialize 机制）。
-# Number of forward-packet fields = 5 content fields + the microbatch id field (a real
-# 6th field of the same kind as num_image_tiles: a small tensor going through the same
-# shape-header-row / flat-buffer / deserialize machinery).
-_NUM_FORWARD_FIELDS = 5
+# dual-channel-p2p（2026-09-22）：HEADER-FREE / 定长协议——已删除 ``_SHAPE_HEADER_LEN`` 与
+# ``_NUM_FORWARD_FIELDS``。原本它们服务于"每字段一行 [ndim, d0, d1, d2] 的 shape 头"，
+# 而 shape 头（及其 parse 时的 ``.item()/.tolist()`` CUDA 同步）正是阻塞式接收 → 死锁的
+# 根因。定长协议下每个字段的 shape/dtype/offset 在通信器构造期静态算好（见
+# ``EncoderBackboneBoundaryCommunicator.__init__`` 的 layout），收方无需 header 即可 post
+# 单个定长 irecv，故这两个常量彻底移除（全仓 grep 确认仅本文件内部引用）。
+# dual-channel-p2p (2026-09-22): removed _SHAPE_HEADER_LEN / _NUM_FORWARD_FIELDS. They
+# only served the per-field shape-header rows; the header (and its parse-time CUDA sync)
+# was the deadlock root cause. The fixed-length protocol derives every field's
+# shape/dtype/offset statically at communicator construction, so no header is needed.
 
 
 def _dtype_itemsize(dtype: torch.dtype) -> int:
@@ -71,7 +85,7 @@ def _numel(shape) -> int:
     return n
 
 
-# Byte alignment for the flat forward-packet buffer. view(dtype) on a uint8 slice
+# Byte alignment for the flat_buffer forward-packet buffer. view(dtype) on a uint8 slice
 # requires the storage offset to be divisible by the element size (max 8 for
 # int64), so both sides pad every field's byte length to a multiple of _ALIGN.
 # 扁平前向包的字节对齐：对 uint8 切片做 view(dtype) 要求存储偏移能被元素大小整除
@@ -82,7 +96,7 @@ _ALIGN = 8
 def _padded_bytes(num_bytes: int, align: int = _ALIGN) -> int:
     """Round a byte count up to a multiple of ``align``.
 
-    把字节数向上取整到 align 的整数倍（flat buffer 的字段对齐填充用，收发两端
+    把字节数向上取整到 align 的整数倍（flat_buffer buffer 的字段对齐填充用，收发两端
     用同一规则计算，保证布局一致）。
     """
     return (num_bytes + align - 1) // align * align
@@ -113,7 +127,11 @@ class MergedEncoderBatch(NamedTuple):
 
     image_embeddings: torch.Tensor  # [img_seq_len, merged_batch, h_lang]（seq-first）
     tokens: torch.Tensor  # [merged_batch, L]
-    labels: torch.Tensor  # [merged_batch, L + 1]
+    # dual-channel-p2p（2026-09-22）修正：labels 与 tokens 同形 [merged_batch, L]（NOT L+1）。
+    # colocated_train.py ~139 `labels = labels[:, 1:text_length+1]` + ~141 断言
+    # tokens.shape == labels.shape，故 labels == tokens == (mbs, text_len)；旧注释 "L + 1" 有误。
+    # Corrected: labels is [merged_batch, L], same as tokens (colocated_train.py asserts equal).
+    labels: torch.Tensor  # [merged_batch, L]
     num_image_tiles: torch.Tensor  # [merged_batch]
 
 
@@ -124,15 +142,18 @@ class ForwardPacket:
     共置训练边界的**前向数据包**：一个 encoder producer 的完整输出——image_embeddings
     （encoder 输出，浮点）+ 本地文本数据 tokens/labels/num_image_tiles（**loss_mask 不
     打包**：消费者从 labels 的 IGNORE/pad 掩码本地重建，2026-08-13 用户确认）。
-    类负责数据包的**序列化布局**（shape 头 + 扁平数据 buffer 的构造与解析、字节对齐
-    填充）；通信原语（isend/irecv/wait）留在通信器
+    类负责数据包的**序列化布局**（扁平数据 buffer 的构造与解析、字节对齐填充）；
+    通信原语（isend/irecv/wait）留在通信器
     （``EncoderBackboneBoundaryCommunicator``）。
 
-    发送：``serialize()`` 返回 ``(shape 头, 扁平 uint8 数据)``，通信器
-    把两者各发一次（共 2 次 P2P）。接收：先收固定大小 shape 头（**无需提前知道
-    形状**），``parse_shape_header`` 从 header 解析各字段 shape 并算出总字节数
-    （据此动态分配数据 buffer），收完数据后 ``deserialize`` 把扁平 buffer 还原为各
-    字段张量。
+    dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：``serialize()`` 只返回**一个扁平
+    uint8 buffer**（不再返回 shape 头），通信器一次 P2P 发出。接收端**不收 shape 头、不
+    解析**——它按构造期静态算好的定长 layout（每字段 (shape, dtype)）分配一块定长 buffer，
+    收完后 ``deserialize(flat_buffer, fields_layout)`` 按 padded offset 切分并
+    ``view(dtype).reshape(shape)`` 还原各字段。这消除了旧协议里"先收 header →
+    ``parse_shape_header``（``.item()/.tolist()`` CUDA 同步）"的阻塞式接收（死锁根因）。
+    serialize() returns ONLY the flat_buffer uint8 buffer (no shape header); the receiver rebuilds
+    via the statically-known fixed layout with deserialize.
     """
 
     image_embeddings: torch.Tensor
@@ -140,7 +161,7 @@ class ForwardPacket:
     labels: torch.Tensor
     num_image_tiles: torch.Tensor
     # Microbatch id this packet belongs to — a real 5th field (1-element int64 tensor,
-    # same kind as num_image_tiles): it rides through the same header row + flat buffer
+    # same kind as num_image_tiles): it rides through the same header row + flat_buffer buffer
     # + deserialize machinery. The business layer builds the packet without it (it does
     # not know the id); the schedule stamps it right after the encoder branch returns,
     # and serialize() asserts it is stamped before any send.
@@ -287,32 +308,21 @@ class ForwardPacket:
         """
         return [float_dtype if t is None else t for t in self._FIELD_DTYPES]
 
-    def serialize(self, align: int = _ALIGN) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Serialize into (shape header, flat uint8 buffer); each sent in one P2P call.
+    def serialize(self, align: int = _ALIGN) -> torch.Tensor:
+        """Serialize into ONE flat_buffer uint8 buffer (HEADER-FREE); sent in one P2P call.
 
-        序列化为 ``(shape 头, 扁平 uint8 buffer)``——各一次 P2P 发送：
-        - shape 头：``[_NUM_FORWARD_FIELDS, _SHAPE_HEADER_LEN=4]`` int64。header 就是
-          一行一行的列表，每个字段一行 ``[ndim, d0, d1, d2]``（不足 3 维用 0 填充），
-          **microbatch id 是第 5 个真实字段**（1 元素 int64 张量，行 ``[1, 1, 0, 0]``），
-          与其余字段完全同构——没有特殊行、没有额外 append；
-        - 扁平数据：各字段按自身 dtype 展平为 uint8 字节，每字段字节长度填充到
-          ``align``（8）的整数倍后拼接——保证接收端任意切片的 ``view(dtype)`` 合法
-          （存储偏移能被元素大小整除，最大 int64 = 8）。
-        收发两端用同一填充规则（``_padded_bytes``），布局一致。
+        dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：只返回**一个扁平 uint8 buffer**
+        （不再构造/返回 shape 头）。各字段按自身 dtype 展平为 uint8 字节，每字段字节长度
+        填充到 ``align``（8）的整数倍后 ``torch.cat`` 拼接——保证接收端任意切片的
+        ``view(dtype)`` 合法（存储偏移能被元素大小整除，最大 int64 = 8）。收发两端用同一
+        填充规则（``_padded_bytes``）+ 同一静态定长 layout，布局一致，接收端无需 header。
+        Returns ONLY the flat_buffer buffer; the header row construction is removed.
         """
         # 网络发送前 microbatch id 必已由 schedule 打标（业务层构造时不知 id）。
         assert self.microbatch_id is not None, (
             "microbatch_id must be stamped by the schedule before the packet is sent"
         )
-        for f in self.fields:
-            assert f.ndim <= _SHAPE_HEADER_LEN - 1, f"unsupported ndim {f.ndim}"
         device = self.image_embeddings.device
-        # shape 头 = 各字段行（一个列表，所有字段统一构造，无特殊处理）。
-        header_rows = [
-            [f.ndim] + list(f.shape) + [0] * (_SHAPE_HEADER_LEN - 1 - f.ndim)
-            for f in self.fields
-        ]
-        header = torch.tensor(header_rows, dtype=torch.int64, device=device)
         parts = []
         for f in self.fields:
             b = f.contiguous().view(torch.uint8).reshape(-1)
@@ -320,50 +330,29 @@ class ForwardPacket:
             if pad:
                 b = torch.cat([b, torch.zeros(pad, dtype=torch.uint8, device=device)])
             parts.append(b)
-        flat = torch.cat(parts)
-        return header, flat
-
-    @staticmethod
-    def parse_shape_header(
-        header: torch.Tensor, float_dtype: torch.dtype
-    ) -> Tuple[List[Tuple[int, ...]], int]:
-        """Parse the shape header into (per-field shapes, total padded flat-buffer bytes).
-
-        从已收到的 shape 头解析各字段 shape，并按"每字段字节长度填充到 _ALIGN 整数
-        倍"算出扁平数据的总字节数——接收方据此**动态分配数据 buffer**（无需提前知道
-        包的形状）。
-        """
-        dtypes = [float_dtype if t is None else t for t in ForwardPacket._FIELD_DTYPES]
-        shapes = []
-        total_bytes = 0
-        for i in range(_NUM_FORWARD_FIELDS):
-            ndim = header[i, 0].item()
-            shape = tuple(header[i, 1 : 1 + ndim].tolist())
-            shapes.append(shape)
-            total_bytes += _padded_bytes(_numel(shape) * _dtype_itemsize(dtypes[i]))
-        return shapes, total_bytes
+        flat_buffer = torch.cat(parts)
+        return flat_buffer
 
     @staticmethod
     def deserialize(
-        header: torch.Tensor, flat: torch.Tensor, float_dtype: torch.dtype
+        flat_buffer: torch.Tensor, fields_layout: List[Tuple[Tuple[int, ...], torch.dtype]]
     ) -> "ForwardPacket":
-        """Rebuild a ForwardPacket from a received shape header + flat data buffer.
+        """Rebuild a ForwardPacket from a flat_buffer buffer using a STATIC fixed layout.
 
-        按 shape 头解析的字段偏移切分扁平 buffer：偏移按"填充后长度"推进（保证每
-        字段起始偏移为 _ALIGN 整数倍，``view(dtype)`` 合法），切片取该字段的原始
-        字节数（填充字节不进入还原的张量），再 ``view(dtype).reshape(shape)`` 还原
-        各字段。microbatch id 是第 5 个字段（1 元素 int64），与其余字段一同切出。
+        dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：``fields_layout`` 是构造期静态
+        算好的每字段 ``(shape, dtype)`` 有序列表（顺序即 ``ForwardPacket.field_names``），
+        取代此前从 shape 头解析形状。按字段切分扁平 buffer：偏移按"填充后长度"推进
+        （保证每字段起始偏移为 _ALIGN 整数倍、``view(dtype)`` 合法），切片取该字段原始
+        字节数（填充字节不入张量），再 ``view(dtype).reshape(shape)`` 还原。第 5 个字段
+        即 microbatch id（1 元素 int64），与其余字段一同切出，直接整体构造。
+        Layout-based (no shape header): split ``flat_buffer`` at padded offsets and view each field.
         """
-        shapes, _ = ForwardPacket.parse_shape_header(header, float_dtype)
-        dtypes = [float_dtype if t is None else t for t in ForwardPacket._FIELD_DTYPES]
         fields = []
         offset = 0
-        for shape, dtype in zip(shapes, dtypes):
+        for shape, dtype in fields_layout:
             field_bytes = _numel(shape) * _dtype_itemsize(dtype)
-            fields.append(flat[offset : offset + field_bytes].view(dtype).reshape(shape))
+            fields.append(flat_buffer[offset : offset + field_bytes].view(dtype).reshape(shape))
             offset += _padded_bytes(field_bytes)
-        # 5 个字段按规范顺序切出（第 5 个即 microbatch id 张量），与 dataclass 字段顺序
-        # 一致，直接整体构造。
         return ForwardPacket(*fields)
 
 
@@ -392,7 +381,9 @@ class MergedEncoderBatch(NamedTuple):
 
     image_embeddings: torch.Tensor  # [img_seq_len, merged_batch, h_lang]（seq-first）
     tokens: torch.Tensor  # [merged_batch, L]
-    labels: torch.Tensor  # [merged_batch, L + 1]
+    # dual-channel-p2p（2026-09-22）修正：labels 与 tokens 同形 [merged_batch, L]（NOT L+1）。
+    # Corrected: labels is [merged_batch, L], same as tokens (colocated_train.py asserts equal).
+    labels: torch.Tensor  # [merged_batch, L]
     num_image_tiles: torch.Tensor  # [merged_batch]
 
 
@@ -402,80 +393,51 @@ class BackwardPacket:
 
     共置训练边界的**反向梯度包**：消费者把某个 encoder producer 的 image_embeddings
     梯度（单张量）发回该 producer，与 ``ForwardPacket`` 对称。类负责序列化布局
-    （shape 头 + 梯度张量）；通信原语留在通信器。梯度没有多字段拼接，因此无对齐
-    填充——header 是单个 ``[_SHAPE_HEADER_LEN]`` int64 行 ``[ndim, d0, d1, d2]``，
-    数据即 ``grad.contiguous()`` 本身。
+    （单张量，无对齐填充）；通信原语留在通信器。
+
+    dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：``serialize()`` 只返回
+    ``grad.contiguous()``（不再构造 shape 头）。接收端按构造期静态算好的定长
+    ``(_grad_shape, _grad_dtype)`` 直接分配 buffer 并 irecv，收到的 buffer **本身即梯度**
+    （shape/dtype 天然正确），无需 deserialize。
     """
 
     grad: torch.Tensor
 
-    def serialize(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Serialize into (shape header, contiguous grad tensor); one P2P call each.
+    def serialize(self) -> torch.Tensor:
+        """Serialize into ONE contiguous grad tensor (HEADER-FREE); one P2P call.
 
-        序列化为 ``(shape 头, 连续梯度张量)``——各一次 P2P 发送。shape 头布局：
-        ``header[0] = ndim``；``header[1:1+ndim] = 各维大小``（不足 3 维用 0 填充）。
-        梯度 dtype 固定为通信器 dtype（``config.pipeline_dtype``，如 bf16），不随
-        header 传（字段固定约定）。
+        dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：只返回 ``grad.contiguous()``
+        （不再构造/返回 shape 头）。梯度 shape 定长（= image_embeddings，
+        ``[img_seq_len, mbs, h_lang]``）、dtype 固定为通信器 dtype（``config.pipeline_dtype``，
+        如 bf16），均由接收端构造期静态获知，故不随包传。
         """
-        grad = self.grad
-        assert grad.ndim <= _SHAPE_HEADER_LEN - 1, f"unsupported ndim {grad.ndim}"
-        shape = list(grad.shape)
-        header = torch.tensor(
-            [grad.ndim] + shape + [0] * (_SHAPE_HEADER_LEN - 1 - grad.ndim),
-            dtype=torch.int64,
-            device=grad.device,
-        )
-        return header, grad.contiguous()
-
-    @staticmethod
-    def parse_shape_header(header: torch.Tensor) -> Tuple[int, ...]:
-        """Parse the grad shape header into the grad shape (ndim + dims).
-        从已收到的 shape 头解析梯度形状（维度数 + 各维大小）。
-        """
-        ndim = header[0].item()
-        return tuple(header[1 : 1 + ndim].tolist())
-
-    @staticmethod
-    def deserialize(header: torch.Tensor, buf: torch.Tensor) -> "BackwardPacket":
-        """Wrap a received grad buffer, checking its shape against the header.
-        包装已收到的梯度 buffer 为 BackwardPacket（校验形状与 header 一致）。
-        """
-        shape = BackwardPacket.parse_shape_header(header)
-        assert tuple(buf.shape) == shape, f"grad shape {tuple(buf.shape)} != header {shape}"
-        return BackwardPacket(grad=buf)
+        return self.grad.contiguous()
 
 
 class _ForwardRecvRequest:
-    """In-flight async receive of a forward packet (shape header already submitted).
+    """In-flight async receive of a forward packet (single fixed-size data irecv).
 
-    异步前向接收请求：构造时已提交 shape 头的 irecv，并由通信器在返回前立即
-    ``start()``（等 shape 头 → 解析 → 分配数据 buffer → 异步提交数据 irecv），
-    因此**拿到 request 时数据传输已在后台进行**。调用方只需在真正需要数据时调
-    ``finish()``（等数据 handle → 组装 ``ForwardPacket``）——数据在这两者之间的
-    计算窗口里传输，窗口越长藏得越干净。
-    ``start()`` 不是调用方的职责：它与"提交头"之间没有任何使用者需要的自由度
-    （三个调用点原本都紧跟着调用它），拆成两步只会让"异步接收"看起来像两件事。
-    A request is fully started by the communicator before it is handed out: the data
-    irecv is already in flight, so the caller only calls ``finish()`` when it needs the
-    data. ``start()`` is an internal step, not a caller responsibility.
+    dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：异步前向接收请求。构造后由通信器
+    立即 ``_start()``——**直接分配定长扁平 buffer 并 post 单个数据 irecv（真正非阻塞：无
+    等待、无 header、无 parse）**。此前需先收 shape 头 + ``parse_shape_header``（CUDA
+    同步）才能分配 buffer，那次同步会卡住 schedule 循环 → 死锁；定长后彻底移除 header
+    机制。拿到 request 时数据传输已在后台进行，调用方只需在真正需要数据时调
+    ``finish()``（等数据 handle → 按 layout 组装 ``ForwardPacket``）。
+    A request posts a single fixed-size data irecv (no header, no wait, no parse).
     """
 
     def __init__(
         self,
         comm: "EncoderBackboneBoundaryCommunicator",
-        header_handle,
-        header: torch.Tensor,
         src_rank: int,
         producer: int,
         expected_microbatch_id: Optional[int],
     ):
         self._comm = comm
-        self._header_handle = header_handle
-        self._header = header
         self._src_rank = src_rank
         self.producer = producer
         self.expected_microbatch_id = expected_microbatch_id
-        self._flat = None  # data buffer allocated by _start(); read by finish()
+        self._flat_buffer = None  # data buffer allocated by _start(); read by finish()
         self._data_handle = None  # data irecv handle posted by _start()
         self._packet = None
 
@@ -487,11 +449,11 @@ class _ForwardRecvRequest:
     # classes have same-named methods, so explicit messages are required.
     @nvtx_decorator(message="colocated-boundary-forward-recv-start")
     def _start(self) -> "_ForwardRecvRequest":
-        """Wait the shape header, allocate the data buffer, post the data irecv.
+        """Allocate the fixed-size data buffer and post the single data irecv.
 
-        等 shape 头（构造时已提交）→ 解析 shape → 分配数据 buffer → 异步提交数据
-        irecv（不等待）。**由通信器在交出 request 之前调用**（``_async_recv_forward``），
-        不是公开接口；返回 self 便于在那里链式书写。
+        dual-channel-p2p（2026-09-22）：**直接**分配定长扁平 buffer → post 单个数据
+        irecv（**不等待、无 header、无 parse**，真正非阻塞）。由通信器在交出 request 前
+        调用（``_async_recv_forward``），不是公开接口；返回 self 便于链式书写。
         重复调用是幂等的（``_data_handle`` 已存在则跳过）。
         Called by the communicator before the request is handed out, not by callers.
         """
@@ -512,37 +474,34 @@ class _ForwardRecvRequest:
 
 
 class _GradRecvRequest:
-    """In-flight async receive of the backward grad (shape header already submitted).
+    """In-flight async receive of the backward grad (single fixed-shape data irecv).
 
-    异步梯度接收请求：构造时已提交 shape 头的 irecv，并由通信器在返回前立即
-    ``_start()``（等 shape 头 → 分配梯度 buffer → 异步提交数据 irecv），因此拿到
-    request 时梯度传输已在后台进行。调用方只需在真正需要梯度时调 ``finish()``
-    （等数据 handle → 组装 ``BackwardPacket``，phase ④ 统一反传前做）。
-    与 ``_ForwardRecvRequest`` 同构，理由见那里的说明。
-    Symmetric with ``_ForwardRecvRequest``: fully started before being handed out.
+    dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：异步梯度接收请求。构造后由通信器
+    立即 ``_start()``——**直接分配定长梯度 buffer 并 post 单个数据 irecv（无等待、无
+    header、无 parse，真正非阻塞）**。此前需先收 shape 头才能分配 buffer，那次同步是死锁
+    根因；定长后移除 header。拿到 request 时梯度传输已在后台进行，调用方需要梯度时只调
+    ``finish()``（等数据 handle → 包成 ``BackwardPacket``）。与 ``_ForwardRecvRequest`` 同构。
+    Symmetric with _ForwardRecvRequest: posts a single fixed-shape data irecv, no header.
     """
 
     def __init__(
         self,
         comm: "EncoderBackboneBoundaryCommunicator",
-        header_handle,
-        header: torch.Tensor,
         src_rank: int,
     ):
         self._comm = comm
-        self._header_handle = header_handle
-        self._header = header
         self._src_rank = src_rank
-        self._buf = None  # grad buffer allocated by _start(); read by finish()
+        self._grad_buffer = None  # grad buffer allocated by _start(); read by finish()
         self._data_handle = None  # data irecv handle posted by _start()
         self._packet = None
 
     @nvtx_decorator(message="colocated-boundary-grad-recv-start")
     def _start(self) -> "_GradRecvRequest":
-        """Wait the shape header, allocate the grad buffer, post the data irecv.
+        """Allocate the fixed-shape grad buffer and post the single data irecv.
 
-        等 shape 头 → 分配梯度 buffer → 异步提交数据 irecv（不等待）。**由通信器在交出
-        request 之前调用**（``_async_recv_grad``），不是公开接口；幂等。
+        dual-channel-p2p（2026-09-22）：**直接**分配定长梯度 buffer → post 单个数据 irecv
+        （**不等待、无 header、无 parse**，真正非阻塞）。由通信器在交出 request 前调用
+        （``_async_recv_grad``），不是公开接口；幂等。
         Called by the communicator before the request is handed out, not by callers.
         """
         if self._data_handle is None:
@@ -576,7 +535,10 @@ class EncoderBackboneBoundaryCommunicator:
     （send 返回 handle 列表，稍后 ``wait()``；recv 返回**已启动**的 request 对象，
     数据传输已在后台进行，稍后 ``finish()`` 取数）
     ——producer replenish / consumer prefetch / 补发 step 收梯度用异步路径与计算重叠。
-    前向包 shape 头含 **microbatch id** 行（消费者按序 take 时校验，防乱序错配）。
+    前向包内含 **microbatch id 字段**（消费者按序 take 时校验，防乱序错配）。
+    dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：收发不再传 shape 头——每个样本 shape
+    由 config 静态固定，收方按构造期算好的定长 layout 直接 post 单个 irecv（立即返回、真正
+    异步），消除了旧 shape 头 + parse（CUDA 同步）导致的阻塞式接收/死锁。
     **本地直传短路（producer 0 = 消费者自己）由调用方（wrapper）分支处理**：producer 0
     的包/梯度不经网络、零拷贝本地引用——wrapper 跳过本类方法直接使用本地 buffer
     （包就是 ``ForwardPacket``，dataclass 直接构造即可），不发起任何 P2P，因此网络侧
@@ -585,35 +547,120 @@ class EncoderBackboneBoundaryCommunicator:
 
     def __init__(
         self,
-        colocated_boundary_group,
+        activation_comm_group,
+        grad_comm_group,
         config: ModelParallelConfig,
         dtype: Optional[torch.dtype] = None,
+        image_seq_length: Optional[int] = None,
+        micro_batch_size: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        text_seq_length: Optional[int] = None,
     ):
-        """Initialize with the dedicated colocated boundary group.
+        """Initialize with the two direction-split colocated boundary groups.
 
-        用独立的共置边界通信组初始化（``get_colocated_boundary_group()``：成员与
-        pp_group / enc_inner_dp 组相同但是独立 NCCL 实例）。
+        dual-channel-p2p Task 2（2026-09-22）：边界通信按方向拆成两个独立 NCCL 组，各自
+        内部 NCCL stream，天然隔离收发方向（消除同流收发交叉死锁）：
+        - ``activation_group``：只承载 producer→consumer 的前向激活包（forward）。
+        - ``grad_group``：只承载 consumer→producer 的反向梯度（backward）。
+        两组成员相同（同一外层 dp 副本的 pp ranks），producer 编号/consumer 由任一组推导
+        （此处用 activation_group）。
 
         Args:
-            colocated_boundary_group: the dedicated colocated boundary group
-                (producer order); must come from ``get_colocated_boundary_group()``,
-                NOT the pipeline-parallel group nor the encoder inner dp group.
-                必须传 get_colocated_boundary_group() 的独立边界组。
+            activation_comm_group: forward-activation P2P group (producer order); must
+                come from ``get_colocated_boundary_activation_group()``.
+                前向激活组，须来自 get_colocated_boundary_activation_group()。
+            grad_comm_group: backward-grad P2P group; must come from
+                ``get_colocated_boundary_grad_group()``.
+                反向梯度组，须来自 get_colocated_boundary_grad_group()。
             config: model parallel config (``pipeline_dtype`` is used for floats).
             dtype: optional override of the float dtype (image_embeddings/grad).
+            image_seq_length / micro_batch_size / hidden_size / text_seq_length: optional
+                explicit fixed dims that OVERRIDE ``get_args()``. Default None -> read from
+                the global args. Kept optional so the schedule call site stays unchanged
+                (reads get_args); unit tests pass them explicitly to avoid mocking get_args.
+                可选显式定长维度，覆盖 ``get_args()``；默认 None 时从全局 args 读取。
+                schedule 调用点不传（走 get_args），单元测试显式传入以免 mock get_args。
         """
-        self.colocated_boundary_group = colocated_boundary_group
+        self.activation_comm_group = activation_comm_group
+        self.grad_comm_group = grad_comm_group
         self.config = config
         self.dtype = dtype if dtype is not None else config.pipeline_dtype
 
         self.world_rank = dist.get_rank()
         # Members of the replica in producer order; producer id 0 is the consumer
-        # (the backbone entry, i.e. the backbone first stage).
-        # 副本内成员（按生产者编号）；0 号生产者即消费者（backbone entry）。
-        self.group_ranks = dist.get_process_group_ranks(colocated_boundary_group)
-        self.producer_id = dist.get_group_rank(colocated_boundary_group, self.world_rank)
+        # (the backbone entry, i.e. the backbone first stage). Both groups share the
+        # same membership; derive the topology from the activation group.
+        # 副本内成员（按生产者编号）；0 号生产者即消费者（backbone entry）。两组成员相同，
+        # 拓扑用 activation_comm_group 推导。
+        self.group_ranks = dist.get_process_group_ranks(activation_comm_group)
+        self.producer_id = dist.get_group_rank(activation_comm_group, self.world_rank)
         self.group_size = len(self.group_ranks)
         self.consumer_global_rank = self.group_ranks[0]
+        assert dist.get_process_group_ranks(grad_comm_group) == self.group_ranks, (
+            "activation_comm_group and grad_comm_group must have identical members"
+        )
+
+        # dual-channel-p2p（2026-09-22）HEADER-FREE / 定长协议：每个样本 shape 由 config 静态
+        # 固定，故在此**一次性**算出各包的定长 layout，供收发两端复用——接收端据此直接分配
+        # 定长 buffer 并 post 单个 irecv（立即返回、真正异步），**无需**先收 shape 头再
+        # ``parse_shape_header``（``.item()/.tolist()`` 会触发 CUDA 同步、卡住 schedule 循环 →
+        # 死锁）。四个维度默认从 ``get_args()`` 读取（schedule 调用点不必改签名），也可由
+        # 显式 kwargs 覆盖（单测用）。
+        # HEADER-FREE fixed-length: compute the statically-derived fixed packet layout once
+        # here so the receiver can allocate a fixed buffer and post a single irecv (returns
+        # immediately, truly async) without the shape-header wait + parse (a CUDA sync that
+        # stalled the schedule loop and deadlocked). The four dims default to get_args().
+        if None in (image_seq_length, micro_batch_size, hidden_size, text_seq_length):
+            # 函数内 import 避免 megatron.core -> megatron.training 的模块级循环依赖。
+            # Function-local import avoids a module-level core->training circular import.
+            from megatron.training import get_args
+
+            args = get_args()
+            # image_seq_length = encoder_seq_length（model.py 在建模时置
+            # seq_length == encoder_seq_length == num_image_embeddings；336px=576, 504px=1296）。
+            image_seq_length = (
+                args.encoder_seq_length if image_seq_length is None else image_seq_length
+            )
+            micro_batch_size = (
+                args.micro_batch_size if micro_batch_size is None else micro_batch_size
+            )
+            hidden_size = args.hidden_size if hidden_size is None else hidden_size
+            # 本协议要求 dataloader 序列长度固定（定长 layout 的前提）。
+            # This protocol requires a fixed dataloader seq length.
+            assert args.dataloader_seq_length is not None, (
+                "colocated HEADER-FREE fixed-length protocol requires "
+                "args.dataloader_seq_length to be set (a fixed dataloader seq length)"
+            )
+            text_seq_length = (
+                args.dataloader_seq_length if text_seq_length is None else text_seq_length
+            )
+
+        # 5 个前向字段的定长 (shape, dtype)，顺序 == ForwardPacket.field_names：
+        #   image_embeddings (image_seq_length, micro_batch_size, hidden_size) float(self.dtype)
+        #   tokens           (micro_batch_size, text_seq_length)               int64
+        #   labels           (micro_batch_size, text_seq_length)               int64  ← text_seq_length，NOT +1
+        #   num_image_tiles  (micro_batch_size,)                               int32
+        #   microbatch_id    (1,)                                              int64
+        # The statically-derived fixed forward-field layout (order == field_names).
+        # hidden_size 即语言模型（backbone）隐藏维——包里的 image_embeddings 已由 vision_projection
+        # 投到语言维，故用 args.hidden_size。
+        self._forward_fields: List[Tuple[Tuple[int, ...], torch.dtype]] = [
+            ((image_seq_length, micro_batch_size, hidden_size), self.dtype),
+            ((micro_batch_size, text_seq_length), torch.int64),
+            ((micro_batch_size, text_seq_length), torch.int64),
+            ((micro_batch_size,), torch.int32),
+            ((1,), torch.int64),
+        ]
+        # 前向扁平 buffer 总字节数 = 各字段 padded 字节之和（与 serialize 的 _ALIGN 填充一致）。
+        # Total flat_buffer-buffer bytes = sum of per-field padded bytes (matches serialize).
+        self._forward_total_bytes = sum(
+            _padded_bytes(_numel(shape) * _dtype_itemsize(dtype))
+            for shape, dtype in self._forward_fields
+        )
+        # 反向梯度定长 shape/dtype（= image_embeddings）。
+        # Fixed backward grad shape/dtype (matches image_embeddings).
+        self._grad_shape: Tuple[int, ...] = (image_seq_length, micro_batch_size, hidden_size)
+        self._grad_dtype: torch.dtype = self.dtype
 
     def is_consumer(self) -> bool:
         """Whether this rank is the consumer (the forward-packet receiver).
@@ -621,79 +668,6 @@ class EncoderBackboneBoundaryCommunicator:
         本 rank 是否为消费者（前向数据包接收方，即 backbone entry）。
         """
         return self.producer_id == 0
-
-    @nvtx_decorator(message="colocated-boundary-warmup")
-    def warmup_boundary_communicators(self) -> None:
-        """Create the per-pair communicator and both transport directions up-front.
-
-        NOTE (2026-09-14): this method is NO LONGER called by the schedule. The
-        canonical warmup moved to initialize_model_parallel's use_colocated_encoder
-        block ("one-time eager warmup"): the pp-group barrier + the same 1-element
-        exchanges now run ONCE at init, at the zero-traffic point. Kept as a manual
-        debugging/diagnostic utility only.
-        注意（2026-09-14）：本方法已不再被 schedule 调用。正式预热移至
-        initialize_model_parallel 的 use_colocated_encoder 块（"one-time eager warmup"）：
-        pp 组 barrier + 同样的 1 元素交换现在在初始化阶段（零流量时点）一次性执行。
-        本方法仅保留作手动调试/诊断工具。
-
-        流水线开始前预热边界通信：对每个 producer p ∈ [1, group_size) **双向各做一次
-        1 元素交换**，把懒初始化的会合开销挪到两端都确定会到的位置（Task 4.6g）。
-
-        为什么必须预热（2026-08-26 实测 + torch 2.13.0 源码核对）：非批量 P2P 的
-        communicator 按 rank 对懒创建（key 是排序后的 ``"low:high"``，两个方向共用一个
-        comm，走 ``ncclCommInitRank`` + store 广播 uniqueId），而底层 p2p transport
-        **按方向**懒建连——因此每对有 3 个同步会合点：comm 创建 1 次（无向）+ 两个方向
-        各 1 次。**这些会合带超时**：两端到达时间差一旦超过 PG timeout（store 侧默认
-        60s），先到的一端不是继续等而是直接报错退出
-        （``store->get('0:2') wait timeout``），进程随之被 watchdog 拖下来。1F1B 里
-        consumer 与 producer 到达边界收发的时刻天然错开（最长 P-2 步），所以懒初始化在
-        这里不只是慢，是会让训练崩掉。
-
-        两端严格同序（先 producer→consumer，再 consumer→producer）：一个 rank 对只有一条
-        CUDA stream（torch 用同一个 key 索引 comm 与 stream），双向 op 严格 FIFO、不存在
-        全双工，同序才不互锁。
-        """
-        if self.group_size == 1:
-            # PP=1: everything is local, there is no boundary network at all.
-            # PP=1 全本地直传，没有边界网络，无需预热。
-            return
-        # Exp D (504 hang fix candidate): eagerly create the pipeline-group NCCL
-        # communicator HERE, before any boundary traffic is in flight. The pipeline
-        # group is a dedicated ProcessGroup instance whose NCCL comm is lazily built
-        # on its first p2p (parallel_state.py); at 504 that creation happened inside
-        # the first batched p2p's coalescing context WHILE the boundary packets were
-        # still in flight, freezing all 4 ranks inside the C++ enqueue (trace 2026-09-14).
-        # A barrier on the very same group (the one P2PCommunicator uses,
-        # colocated_schedule.py) moves the comm creation out of the collision window.
-        # 判别实验 D（504 挂死修复候选）：在 boundary 流量起飞前，就在这里强制完成
-        # pipeline 组 NCCL communicator 的懒初始化。pipeline 组是独立 ProcessGroup 实例、
-        # comm 懒建于首次 p2p（parallel_state.py）；504 下该创建发生在首次批量 p2p 的
-        # coalescing 语境里、且 boundary 包仍在飞，4 rank 全部冻结在 C++ 提交内部
-        # （2026-09-14 轨迹）。对同一 group（P2PCommunicator 实际使用的那一个，
-        # colocated_schedule.py）做一次 barrier，把 comm 创建挪出碰撞窗口。
-        dist.barrier(group=parallel_state.get_pipeline_model_parallel_group())
-        send_buffer = torch.ones(1, dtype=self.dtype, device="cuda")
-        recv_buffer = torch.empty(1, dtype=self.dtype, device="cuda")
-        if self.is_consumer():
-            for producer in range(1, self.group_size):
-                producer_rank = self.group_ranks[producer]
-                dist.irecv(
-                    recv_buffer, src=producer_rank, group=self.colocated_boundary_group
-                ).wait()
-                dist.isend(
-                    send_buffer, dst=producer_rank, group=self.colocated_boundary_group
-                ).wait()
-        else:
-            dist.isend(
-                send_buffer,
-                dst=self.consumer_global_rank,
-                group=self.colocated_boundary_group,
-            ).wait()
-            dist.irecv(
-                recv_buffer,
-                src=self.consumer_global_rank,
-                group=self.colocated_boundary_group,
-            ).wait()
 
     # ------------------------------------------------------------------
     # Internal helpers.
@@ -703,20 +677,17 @@ class EncoderBackboneBoundaryCommunicator:
     def _send_backward_packet(
         self, packet: BackwardPacket, dst_rank: int, wait: bool = True
     ) -> Optional[list]:
-        """Send a BackwardPacket: shape header, then the grad tensor (2 P2P calls).
+        """Send a BackwardPacket: ONE grad tensor (1 P2P call, HEADER-FREE).
 
-        发送反向梯度包（消费者→生产者，反传专用）：先发 shape 头再发梯度数据（共 2
-        次 P2P），布局由 ``BackwardPacket.serialize`` 给出（见类 docstring）。
+        dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：只发**一个**连续梯度张量
+        （不再先发 shape 头），布局由 ``BackwardPacket.serialize`` 给出（见类 docstring）。
 
-        ``wait=True``（默认）：阻塞到两次 isend 完成，返回 None。
-        ``wait=False``：提交后立即返回两个 handle（consumer 反传 hook 用，
-        wait 由调用方统一做）。
+        ``wait=True``（默认）：阻塞到 isend 完成，返回 None。
+        ``wait=False``：提交后立即返回 handle 列表（单元素，保持"handle 列表"契约；
+        consumer 反传 hook 用，wait 由调用方统一做）。
         """
-        header, grad = packet.serialize()
-        handles = [
-            dist.isend(header, dst=dst_rank, group=self.colocated_boundary_group),
-            dist.isend(grad, dst=dst_rank, group=self.colocated_boundary_group),
-        ]
+        grad = packet.serialize()
+        handles = [dist.isend(grad, dst=dst_rank, group=self.grad_comm_group)]
         if wait:
             for handle in handles:
                 handle.wait()
@@ -724,78 +695,67 @@ class EncoderBackboneBoundaryCommunicator:
         return handles
 
     def _recv_backward_packet(self, src_rank: int) -> BackwardPacket:
-        """Receive a BackwardPacket synchronously: shape header, then the grad.
+        """Receive a BackwardPacket synchronously: ONE fixed-shape grad (HEADER-FREE).
 
-        同步接收反向梯度包（生产者侧，反传专用）：先收 shape 头确定形状，再按形状
-        分配 GPU buffer 接收数据（共 2 次 P2P），经 ``BackwardPacket.deserialize`` 包装
-        （校验形状与 header 一致）。返回的梯度形状与 image_embeddings 相同
-        （[img_seq, num_tiles, h_lang]），dtype 为通信器 dtype。
+        dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：直接按静态定长
+        ``(_grad_shape, _grad_dtype)`` 分配 buffer 并 irecv 一次（1 次 P2P，**无 header、无
+        parse**），收到的 buffer 本身即梯度（shape/dtype 天然正确），包成 BackwardPacket。
+        梯度形状与 image_embeddings 相同（[img_seq_len, mbs, h_lang]），dtype 为通信器 dtype。
         """
-        header = torch.empty(_SHAPE_HEADER_LEN, dtype=torch.int64, device="cuda")
-        req = dist.irecv(header, src=src_rank, group=self.colocated_boundary_group)
-        req.wait()
-        shape = BackwardPacket.parse_shape_header(header)
-        buf = torch.empty(shape, dtype=self.dtype, device="cuda")
-        req = dist.irecv(buf, src=src_rank, group=self.colocated_boundary_group)
-        req.wait()
-        return BackwardPacket.deserialize(header, buf)
+        buffer = torch.empty(self._grad_shape, dtype=self._grad_dtype, device="cuda")
+        recv_handle = dist.irecv(buffer, src=src_rank, group=self.grad_comm_group)
+        recv_handle.wait()
+        return BackwardPacket(grad=buffer)
 
     def _async_recv_grad(self, src_rank: int) -> _GradRecvRequest:
-        """Asynchronously submit a receive of the backward grad: header irecv, then start it.
+        """Asynchronously submit a receive of the backward grad: single data irecv.
 
-        异步发起梯度接收：提交 shape 头的 irecv → 立即 ``_start()``（等头 → 分配梯度
-        buffer → 提交数据 irecv），返回**已启动**的 ``_GradRecvRequest``。生产者侧用它
-        把接收提前挂到 NCCL 后台，需要梯度时只调 ``request.finish()``。梯度 dtype 在
-        完成时用通信器 dtype 解析。
-        注意 ``_start()`` 内含"等 shape 头"这一次与对端的会合：本方法因此**不是**纯粹
-        的非阻塞提交，调用点必须确保对端确实会发（``forward_only`` 下 consumer 不派发
-        梯度，故 schedule 侧有守卫，见 colocated_schedule.py 的 _start_boundary_grad_recv）。
-        The returned request is already started; note ``_start()`` contains one rendezvous
-        with the peer (waiting the shape header), so the caller must ensure the peer sends.
+        dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：直接构造 ``_GradRecvRequest`` 并
+        ``_start()``——它**只**按静态定长分配梯度 buffer + post 单个数据 irecv（**无 header
+        irecv、不等待、不 parse**，真正非阻塞立即返回）。生产者侧用它把接收提前挂到 NCCL
+        后台，需要梯度时只调 ``request.finish()``。梯度 dtype/shape 用构造期定长 layout。
+        Truly non-blocking: no header rendezvous, just one fixed-shape data irecv.
         """
-        header = torch.empty(_SHAPE_HEADER_LEN, dtype=torch.int64, device="cuda")
-        header_handle = dist.irecv(header, src=src_rank, group=self.colocated_boundary_group)
-        return _GradRecvRequest(self, header_handle, header, src_rank)._start()
+        return _GradRecvRequest(self, src_rank)._start()
 
     def _start_recv_grad(self, request: _GradRecvRequest) -> object:
-        """Wait the header, allocate the grad buffer, post the data irecv.
+        """Allocate the fixed-shape grad buffer and post the single data irecv.
 
-        梯度异步接收的**启动步骤**（由 ``_GradRecvRequest._start()`` 调用）：等 shape 头
-        → 解析形状 → 分配梯度 buffer → **异步提交数据 irecv（不等待）**，返回数据
+        dual-channel-p2p（2026-09-22）：梯度异步接收的**启动步骤**（由
+        ``_GradRecvRequest._start()`` 调用）：按静态定长 ``(_grad_shape, _grad_dtype)`` 分配
+        梯度 buffer → **异步提交单个数据 irecv（不等待、无 header、无 parse）**，返回数据
         handle。数据在此到 ``finish()`` 之间的计算窗口后台传输。
         """
-        request._header_handle.wait()
-        shape = BackwardPacket.parse_shape_header(request._header)
-        request._buf = torch.empty(shape, dtype=self.dtype, device="cuda")
+        request._grad_buffer = torch.empty(
+            self._grad_shape, dtype=self._grad_dtype, device="cuda"
+        )
         return dist.irecv(
-            request._buf, src=request._src_rank, group=self.colocated_boundary_group
+            request._grad_buffer, src=request._src_rank, group=self.grad_comm_group
         )
 
     def _finish_recv_grad(self, request: _GradRecvRequest) -> BackwardPacket:
-        """Finish phase of an async grad receive: wait the data, assemble the packet.
+        """Finish phase of an async grad receive: wait the data, wrap the packet.
 
-        梯度异步接收的**结束阶段**：等数据 handle（通常早已完成）→ 经
-        ``BackwardPacket.deserialize`` 组装（校验形状与 header 一致）。
+        dual-channel-p2p（2026-09-22）HEADER-FREE：等数据 handle（通常早已完成）→ 收到的
+        buffer 本身即梯度（定长分配，shape/dtype 天然正确），直接包成 ``BackwardPacket``。
         """
         request._data_handle.wait()
-        return BackwardPacket.deserialize(request._header, request._buf)
+        return BackwardPacket(grad=request._grad_buffer)
 
     def _send_forward_packet(
         self, packet: ForwardPacket, dst_rank: int, wait: bool = True
     ) -> Optional[list]:
-        """Send a ForwardPacket as (shape header, ONE flat buffer) — 2 P2P calls total.
+        """Send a ForwardPacket as ONE flat_buffer buffer — 1 P2P call total (HEADER-FREE).
 
-        把前向包经 ``ForwardPacket.serialize`` 拼成 (shape 头, 一个扁平 buffer) 发送
-        （共 2 次 P2P，布局与字段顺序见 ``ForwardPacket`` 类 docstring）：
-        ① shape 头：``[_NUM_FORWARD_FIELDS, _SHAPE_HEADER_LEN=4]``（即 [5,4]）int64，
-        每行一个字段，
-        microbatch id 是其中一个字段行（消费者 take 时校验，来自包自身属性）；
-        ② 扁平数据：各字段按自身 dtype 展平为 uint8 字节、字节长度填充到 _ALIGN 的
-        整数倍后拼接（对齐保证接收端任意切片 ``view(dtype)`` 合法）。
+        dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：把前向包经 ``ForwardPacket.serialize``
+        拼成**一个**扁平 uint8 buffer 发送（1 次 P2P，不再先发 shape 头）：各字段按自身
+        dtype 展平为 uint8 字节、字节长度填充到 _ALIGN 的整数倍后拼接（对齐保证接收端任意
+        切片 ``view(dtype)`` 合法）。接收端按静态定长 layout 直接分配定长 buffer 收取、无需
+        header。microbatch id 是包内第 5 个字段（消费者 take 时校验，来自包自身属性）。
 
-        ``wait=True``（默认）：阻塞到两次 isend 完成，返回 None。
-        ``wait=False``：提交后立即返回两个 handle（producer replenish 用，
-        wait 由调用方在 phase ② 后统一做）。
+        ``wait=True``（默认）：阻塞到 isend 完成，返回 None。
+        ``wait=False``：提交后立即返回 handle 列表（单元素，保持"handle 列表"契约；
+        producer replenish 用，wait 由调用方在 phase ② 后统一做）。
         """
         # 发送端按张量自身 dtype 展平，接收端按 ``self.dtype``（config.pipeline_dtype）
         # 反推浮点字段的字节数——两者不一致会让接收端所有偏移错位、解析出垃圾（例如
@@ -808,33 +768,15 @@ class EncoderBackboneBoundaryCommunicator:
         assert packet.image_embeddings.dtype == self.dtype, (
             f"forward packet image_embeddings dtype {packet.image_embeddings.dtype} != "
             f"communicator dtype {self.dtype} (config.pipeline_dtype): the receiver would "
-            f"parse the flat buffer with the wrong element size"
+            f"parse the flat_buffer buffer with the wrong element size"
         )
-        header, flat = packet.serialize() #需要序列化因为dist通信只支持tensor数据，不支持类型对象
-        handles = [
-            dist.isend(header, dst=dst_rank, group=self.colocated_boundary_group),
-            dist.isend(flat, dst=dst_rank, group=self.colocated_boundary_group),
-        ]
+        flat_buffer = packet.serialize()  # 需要序列化因为 dist 通信只支持 tensor 数据，不支持类型对象
+        handles = [dist.isend(flat_buffer, dst=dst_rank, group=self.activation_comm_group)]
         if wait:
             for handle in handles:
                 handle.wait()
             return None
         return handles
-
-    def _receive_forward_flat(
-        self, header: torch.Tensor, src_rank: int, float_dtype: torch.dtype
-    ) -> ForwardPacket:
-        """Receive the flat data buffer after the shape header and rebuild the packet.
-
-        shape 头已到达（前 _NUM_FORWARD_FIELDS 行是字段 shape），据此算出总字节数收
-        扁平数据 buffer，再 ``ForwardPacket.deserialize`` 还原为 ForwardPacket（字段
-        切分 + view(dtype) + reshape，偏移按"填充后长度"推进）。
-        """
-        _, total_bytes = ForwardPacket.parse_shape_header(header, float_dtype)
-        flat = torch.empty(total_bytes, dtype=torch.uint8, device="cuda")
-        req = dist.irecv(flat, src=src_rank, group=self.colocated_boundary_group)
-        req.wait()
-        return ForwardPacket.deserialize(header, flat, float_dtype)
 
     def _check_microbatch_id(
         self, packet: ForwardPacket, expected_microbatch_id: Optional[int]
@@ -845,78 +787,69 @@ class EncoderBackboneBoundaryCommunicator:
         take 时用，防乱序错配）。通信两端是确定的，这里不是验证乱序达到的问题，只是在做校验id
         """
         if expected_microbatch_id is not None:
-            packet_mb_id = packet.microbatch_id
-            assert packet_mb_id is not None and packet_mb_id.item() == expected_microbatch_id, (
-                f"out-of-order forward packet: packet microbatch id {packet_mb_id} "
+            packet_microbatch_id = packet.microbatch_id
+            assert packet_microbatch_id is not None and packet_microbatch_id.item() == expected_microbatch_id, (
+                f"out-of-order forward packet: packet microbatch id {packet_microbatch_id} "
                 f"!= expected {expected_microbatch_id}"
             )
 
     def _recv_forward_packet(
         self, src_rank: int, expected_microbatch_id: Optional[int] = None
     ) -> ForwardPacket:
-        """Receive a ForwardPacket synchronously: shape header, then flat buffer.
+        """Receive a ForwardPacket synchronously: ONE fixed-size flat_buffer buffer (HEADER-FREE).
 
-        同步收前向包（与 ``_send_forward_packet`` 对称，共 2 次 P2P）：先收 shape 头，
-        再收扁平数据并还原为 ForwardPacket，校验包自带的 microbatch id。
+        dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：直接按静态定长 ``_forward_total_bytes``
+        分配扁平 buffer 并 irecv 一次（1 次 P2P，**无 header、无 parse**），再经
+        ``deserialize`` 按 ``_forward_fields`` 还原为 ForwardPacket，校验包自带的 microbatch id。
         """
-        header = torch.empty(
-            (_NUM_FORWARD_FIELDS, _SHAPE_HEADER_LEN), dtype=torch.int64, device="cuda"
-        )
-        req = dist.irecv(header, src=src_rank, group=self.colocated_boundary_group)
-        req.wait()
-        packet = self._receive_forward_flat(header, src_rank, self.dtype)
+        flat_buffer = torch.empty(self._forward_total_bytes, dtype=torch.uint8, device="cuda")
+        recv_handle = dist.irecv(flat_buffer, src=src_rank, group=self.activation_comm_group)
+        recv_handle.wait()
+        packet = ForwardPacket.deserialize(flat_buffer, self._forward_fields)
         self._check_microbatch_id(packet, expected_microbatch_id)
         return packet
 
     def _async_recv_forward(
         self, src_rank: int, producer: int, expected_microbatch_id: Optional[int] = None
     ) -> "_ForwardRecvRequest":
-        """Asynchronously submit a receive of a forward packet: header irecv, then start it.
+        """Asynchronously submit a receive of a forward packet: single data irecv.
 
-        异步发起前向包接收：提交 shape 头的 irecv → 立即 ``_start()``（等头 → 解析 shape
-        → 分配数据 buffer → 提交数据 irecv），返回**已启动**的 ``_ForwardRecvRequest``。
-        消费者 prefetch 时用它把接收提前挂到 NCCL 后台，需要数据时只调
-        ``request.finish()``（取数据）。
-        注意 ``_start()`` 内含"等 shape 头"这一次与对端的会合：本方法因此**不是**纯粹的
-        非阻塞提交，调用点必须确保对端确实会发（prefetch 与 producer 的补货 isend 配对，
-        见 colocated_schedule.py 的 4.5b 说明）。
-        The returned request is already started; note ``_start()`` contains one rendezvous
-        with the peer (waiting the shape header), so the caller must ensure the peer sends.
+        dual-channel-p2p（2026-09-22）HEADER-FREE / 定长：直接构造 ``_ForwardRecvRequest``
+        并 ``_start()``——它**只**按静态定长分配扁平 buffer + post 单个数据 irecv（**无
+        header irecv、不等待、不 parse**，真正非阻塞立即返回）。消费者 prefetch 时用它把
+        接收提前挂到 NCCL 后台，需要数据时只调 ``request.finish()``（取数据）。
+        Truly non-blocking: no header rendezvous, just one fixed-size data irecv.
         """
-        header = torch.empty(
-            (_NUM_FORWARD_FIELDS, _SHAPE_HEADER_LEN), dtype=torch.int64, device="cuda"
-        )
-        header_handle = dist.irecv(
-            header, src=src_rank, group=self.colocated_boundary_group
-        )
         request = _ForwardRecvRequest(
-            self, header_handle, header, src_rank, producer, expected_microbatch_id
+            self, src_rank, producer, expected_microbatch_id
         )._start()
         return request
 
     def _start_recv_forward(self, request: "_ForwardRecvRequest") -> object:
-        """Wait the header, allocate the data buffer, post the data irecv.
+        """Allocate the fixed-size data buffer and post the single data irecv.
 
-        前向异步接收的**启动步骤**（由 ``_ForwardRecvRequest._start()`` 调用）：等 shape
-        头 → 解析 shape 算出总字节数 → 分配数据 buffer → **异步提交数据 irecv（不等待）**，
-        返回数据 handle。数据在此到 ``finish()`` 之间的计算窗口后台传输。
+        dual-channel-p2p（2026-09-22）：前向异步接收的**启动步骤**（由
+        ``_ForwardRecvRequest._start()`` 调用）：按静态定长 ``_forward_total_bytes`` 分配扁平
+        buffer → **异步提交单个数据 irecv（不等待、无 header、无 parse）**，返回数据 handle。
+        数据在此到 ``finish()`` 之间的计算窗口后台传输。
         """
-        request._header_handle.wait()
-        _, total_bytes = ForwardPacket.parse_shape_header(request._header, self.dtype)
-        request._flat = torch.empty(total_bytes, dtype=torch.uint8, device="cuda")
+        request._flat_buffer = torch.empty(
+            self._forward_total_bytes, dtype=torch.uint8, device="cuda"
+        )
         data_handle = dist.irecv(
-            request._flat, src=request._src_rank, group=self.colocated_boundary_group
+            request._flat_buffer, src=request._src_rank, group=self.activation_comm_group
         )
         return data_handle
 
     def _finish_recv_forward(self, request: "_ForwardRecvRequest") -> ForwardPacket:
         """Finish phase of an async forward receive: wait the data, assemble the packet.
 
-        前向异步接收的**结束阶段**：等数据 handle（通常早已完成）→ 还原为
-        ``ForwardPacket`` 并校验其 microbatch id。
+        dual-channel-p2p（2026-09-22）HEADER-FREE：等数据 handle（通常早已完成）→ 按静态
+        定长 ``_forward_fields`` 经 ``deserialize`` 还原为 ``ForwardPacket`` 并校验其
+        microbatch id。
         """
         request._data_handle.wait()
-        packet = ForwardPacket.deserialize(request._header, request._flat, self.dtype)
+        packet = ForwardPacket.deserialize(request._flat_buffer, self._forward_fields)
         self._check_microbatch_id(packet, request.expected_microbatch_id)
         return packet
 
@@ -942,8 +875,8 @@ class EncoderBackboneBoundaryCommunicator:
         """Producer side (producer id > 0): send the forward packet to the consumer.
 
         生产者（producer id>0）：把本生产者的 ``ForwardPacket``（encoder 输出 + 本地
-        文本数据 tokens/labels/num_image_tiles）发给消费者。microbatch id 是
-        包的属性，``serialize`` 写入 shape 头（消费者 take 时校验）。
+        文本数据 tokens/labels/num_image_tiles）发给消费者。microbatch id 是包内第 5 个
+        字段，随定长扁平 buffer 一同发送（消费者 take 时校验；HEADER-FREE，无 shape 头）。
         ``producer`` 默认取本 rank 的 producer id；``wait=False`` 时提交后立即返回
         handle 列表（producer replenish 用，wait 由调用方统一做）。
         """
@@ -966,7 +899,8 @@ class EncoderBackboneBoundaryCommunicator:
 
         消费者：接收生产者 ``producer``（>0）的完整前向数据包（``ForwardPacket``：
         encoder 输出 + 文本字段）。``wait=True``（默认）同步阻塞返回 ``ForwardPacket``；
-        ``wait=False`` 异步提交（挂 shape 头 irecv 并立即启动数据 irecv），返回**已启动**
+        ``wait=False`` 异步提交（HEADER-FREE：直接 post 单个定长数据 irecv、立即返回，
+        无 shape 头、无 parse、真正非阻塞），返回**已启动**
         的 ``_ForwardRecvRequest``（consumer prefetch 用，需要数据时只调
         ``request.finish()``）。
         ``expected_microbatch_id`` 与包自带的 microbatch id 校验（按序 take 时用）。

@@ -153,7 +153,7 @@ def hook_layers_once(model_chunk):
 
 def fixed_micro_batch_dataloaders_provider(train_val_test_num_samples):
     """Return an iterator over the stored micro batches this rank consumes, in phase ① order."""
-    boundary_group = mpu.get_colocated_boundary_group()
+    boundary_group = mpu.get_colocated_boundary_activation_group()
     microbatch_ids = get_microbatches_for_producer(
         get_pg_rank(boundary_group), get_num_microbatches(), get_pg_size(boundary_group)
     )
@@ -209,7 +209,7 @@ def instrumented_forward_step(data_iterator, model, packet=None, intra_packet=No
     if is_encoder_branch:
         sync_vision_projection_once(model_chunk)
         if state["ids"] is None:
-            boundary_group = mpu.get_colocated_boundary_group()
+            boundary_group = mpu.get_colocated_boundary_activation_group()
             state["ids"] = get_microbatches_for_producer(
                 get_pg_rank(boundary_group), get_num_microbatches(), get_pg_size(boundary_group)
             )
