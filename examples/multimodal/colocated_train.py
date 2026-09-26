@@ -429,10 +429,15 @@ if __name__ == "__main__":
     from colocated_args import (
         add_colocated_extra_args,
         default_round_robin_partition,
-        reverse_block_partition,
         validate_colocated_args,
     )
     from colocated_dataloader_provider import colocated_train_valid_test_dataloaders_provider
+    from megatron.core.pipeline_parallel.colocated_microbatch_partition import (
+        consumer_head_block_partition,
+        consumer_head_tail_reverse_partition,
+        consumer_head_tail_reverse_scattered_partition,
+        reverse_block_partition,
+    )
     from megatron.training.training import maybe_start_memory_snapshot_recording
     from model import model_provider
     from train import llava_embedding_ranks, llava_position_embedding_ranks
@@ -449,15 +454,35 @@ if __name__ == "__main__":
     validate_colocated_args(args)
     full_config = pretrain_cfg_container_from_args(args)
 
-    # 共置 microbatch → producer 划分函数：默认轮盘（default_round_robin_partition）。必须在
-    # pretrain() 之前注册——owner 表在 pretrain 内部的分布式初始化阶段据此构建并广播
-    # （dual-channel-p2p Task 3）。env COLOCATED_REVERSE_BLOCK_PARTITION=1 改用逆序分块划分
-    # （reverse_block_partition，见 colocated_args）：前一整块 mb 集中在单个远端 producer +
-    # 每 producer owned 数 > D，压测 owned>D 工况；不设或非 "1" 时走默认轮盘。
+    # 共置 microbatch → producer 划分：由环境变量 ``COLOCATED_MICROBATCH_PARTITION`` 选择
+    # （2026-09-25 起，替代"手动改函数名"）：未设或 0 = 默认轮盘；1 = 均分 reverse
+    # （reverse_block_partition，owner 数均等但顺序反转）；2 = 非均匀
+    # （consumer_head_tail_reverse_partition，头尾 P 归 consumer、中段逆序 12/14/18/20）；
+    # 3 = 非轮询连续均分块（consumer_head_block_partition，consumer 头块，16/16/16/16）；
+    # 4 = 非均匀散开（consumer_head_tail_reverse_scattered_partition，数量同 2、中段反轮盘
+    # 逐个发放）。
+    # 必须在 pretrain() 之前注册——owner 表在 pretrain 内部的分布式初始化阶段据此构建并广播
+    # （dual-channel-p2p Task 3）。后续新增策略：先在 colocated_microbatch_partition.py 写
+    # 好函数，再在这里加一个环境变量分支。
     # Register the microbatch->producer partition before pretrain(); the owner table is built
-    # from it during pretrain's distributed init. Default round-robin; env-gated reverse-block
-    # stress partition for the owned>D case.
-    if os.environ.get("COLOCATED_REVERSE_BLOCK_PARTITION", "0") == "1":
+    # from it during pretrain's distributed init (dual-channel-p2p Task 3). The strategy is
+    # selected by env ``COLOCATED_MICROBATCH_PARTITION`` (2026-09-25, replacing manual
+    # function-name edits): unset/0 = default round-robin; 1 = uniform reversed
+    # (reverse_block_partition); 2 = non-uniform head/tail-consumer 12/14/18/20; 3 = uniform
+    # contiguous non-round-robin blocks (consumer_head_block_partition, consumer takes the
+    # headmost 16/16/16/16); 4 = non-uniform scattered (same counts as 2, middle dealt
+    # reverse-round-robin). New strategies: add the function in
+    # colocated_microbatch_partition.py, then a branch here.
+    colocated_partition_mode = int(os.environ.get("COLOCATED_MICROBATCH_PARTITION", "0"))
+    if colocated_partition_mode == 2:
+        set_colocated_microbatch_partition_func(consumer_head_tail_reverse_partition)
+    elif colocated_partition_mode == 3:
+        set_colocated_microbatch_partition_func(consumer_head_block_partition)
+    elif colocated_partition_mode == 4:
+        set_colocated_microbatch_partition_func(
+            consumer_head_tail_reverse_scattered_partition
+        )
+    elif colocated_partition_mode == 1:
         set_colocated_microbatch_partition_func(reverse_block_partition)
     else:
         set_colocated_microbatch_partition_func(default_round_robin_partition)
@@ -478,3 +503,18 @@ if __name__ == "__main__":
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
     )
+
+    # env-gated per-rank CUDA memory report (memory-balance sweep, 2026-09-26): after
+    # training finishes, print each rank's peak allocator stats. The peak includes the
+    # constant model-build contribution, so cross-run comparisons should use differences.
+    # 每 rank 显存报告（环境开关驱动，默认无操作）：训练自然跑完后打印各 rank 峰值分配统计。
+    # 峰值含建模期常量项，跨档比较看差值。
+    if os.environ.get("COLOCATED_MEM_REPORT", "0") == "1":
+        peak_allocated_gib = torch.cuda.max_memory_allocated() / (1024**3)
+        peak_reserved_gib = torch.cuda.memory_reserved() / (1024**3)
+        print(
+            f"[colocated-mem-report] rank={torch.distributed.get_rank()} "
+            f"peak_allocated_gib={peak_allocated_gib:.3f} "
+            f"peak_reserved_gib={peak_reserved_gib:.3f}",
+            flush=True,
+        )

@@ -28,6 +28,9 @@ from ..utils import (
     get_model_config,
     get_pg_size,
     get_tensor_model_parallel_group_if_none,
+    group_colocated_model_chunks,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 
@@ -499,3 +502,124 @@ def finalize_model_grads(
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens
                 model_chunk.scale_gradients(scaling)
+
+
+def finalize_colocated_model_grads(
+    model: List[torch.nn.Module],
+    num_tokens: Optional[torch.Tensor] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
+):
+    """Colocated grad finalize for BOTH chunks in ONE pass (2026-09-25
+    colocated-unified-grad-finalize).
+
+    共置专属的统一梯度收尾：签名与 :func:`finalize_model_grads` 一致（共用同一条
+    ``finalize_model_grads_func`` hook，training.py 按 colocated 开关二选一设置），但一次
+    处理 ``[encoder_chunk, backbone_chunk]`` 两个 chunk，不再调用 stock 编排器。各段职责：
+    - 两个 chunk 各自的 DDP 桶归约（``finish_grad_sync`` 恰好一次，各用自己的 dp 组）；
+    - backbone 的按参数集归约（conditional embedding / 非 TP / tied word / position
+      embedding——当前共置拓扑下仅 tied word-embedding 跨首末 stage 真跑，其余被单成员
+      pp/tp 组内部门挡掉，保留以对未来 TP/DiT 泛化；encoder 侧对应段因单成员组与
+      ``embd``/``pos_embd`` 为 None 全部 no-op，不重复调用）；
+    - per-token 归一化：保留 backbone 原生的一组 ``broadcast(pp) + all_reduce(D_outer)``。
+      broadcast 把 consumer 算出的 token 数发给同副本其余 pp stage——这也是"给 encoder 用"
+      的来源（encoder 活在每个 pp rank 上）；all_reduce 在 outer-DP 组（``dp_cp``）上跨副本
+      求和。两步后每个 rank 都持有全局 token 数，两个 chunk 共用同一个缩放因子；原先
+      encoder 收尾里对全 W colocated dp 组的第二次 all_reduce 属重复归约，随之删除。
+
+    调用点：共置编排器 ``forward_backward_colocated`` 在 phase ④（encoder backward）之后
+    调 hook——backbone ``finish_grad_sync`` 的等待点因此落在 encoder backward 之后，这是
+    安全的：overlap_grad_reduce 下桶归约已在 backbone 反传期间由 register_grad_ready 发出，
+    这里只是等它完成，与 encoder 反传重叠更充分；整组 broadcast + all_reduce + ``.item()``
+    会合也不再钉住 consumer 的 phase ④ 起点。``finish_embedding_wgrad_compute`` 留在
+    共置 schedule 的 phase ② 末原地不动（defer_embedding_wgrad_compute 的 wgrad 必须先于
+    finish_grad_sync，顺序仍满足）。
+
+    不变量（Task 5.8 数值用例守护）：``num_tokens`` 只在每个副本的 backbone 末 stage
+    （consumer）算出，中间 stage 恒为 0（schedules.py:262-269）——broadcast + D_outer
+    求和的正确性依赖它。
+
+    Args:
+        model: ``[encoder_chunk, backbone_chunk]``（共置 provider 的返回，经
+            ``group_colocated_model_chunks`` 按组件名拆分）。
+        num_tokens: per-token 模式（``calculate_per_token_loss=True``）下共置 schedule 交回的
+            未规约全局 batch token 数（consumer=T_replica / producer=0）；其余模式传 None
+            （整段跳过，DDP 自身 gradient_scaling_factor 负责平均）。
+        pg_collection: backbone 的组集合；不传（None）时回落到 backbone chunk 自带的
+            ``pg_collection`` 属性（共置 provider 两条链都会挂，language_module.py:52 /
+            colocated_llava_model.py:87）。
+        force_all_reduce: 透传给 backbone ``finish_grad_sync``（保存 wgrad 的迭代用）。
+    """
+    chunks_per_module = group_colocated_model_chunks(model)
+    encoder_chunks = chunks_per_module["encoder"]
+    backbone_chunks = chunks_per_module["language_model"]
+    assert len(encoder_chunks) == 1 and len(backbone_chunks) == 1, (
+        "colocated grad finalize needs exactly one chunk per component, got "
+        f"{len(encoder_chunks)} encoder and {len(backbone_chunks)} language_model chunks "
+        f"out of {len(model)} model chunks"
+    )
+    encoder_chunk = encoder_chunks[0]
+    backbone_chunk = backbone_chunks[0]
+
+    backbone_config = get_model_config(backbone_chunk)
+    if pg_collection is not None:
+        backbone_pg_collection = pg_collection
+    else:
+        backbone_pg_collection = get_attr_wrapped_model(backbone_chunk, "pg_collection")
+    backbone_chunk_list = [backbone_chunk]
+
+    # NVTX：encoder 的收尾（DDP 桶归约等待）与 backbone 的收尾分开打区间——不同参数集、
+    # 不同通信组（2026-09-25 恢复：分析收尾段构成时需要该区间，此前一度删除）。
+    # NVTX: the encoder finalize (bucket-reduce wait) keeps its own range, separate from the
+    # backbone's - different parameter sets over different groups (restored 2026-09-25 for
+    # finalize-region trace analysis).
+    nvtx_range_push("colocated-encoder-grad-finalize")
+    encoder_chunk.finish_grad_sync()
+    nvtx_range_pop("colocated-encoder-grad-finalize")
+
+    nvtx_range_push("colocated-backbone-grad-finalize")
+    backbone_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
+
+    # backbone 的按参数集归约（与 :func:`finalize_model_grads` 的段落顺序一致）。
+    # Backbone-scoped per-parameter-set reductions (same section order as
+    # finalize_model_grads).
+    _allreduce_conditional_embedding_grads(
+        backbone_chunk_list, backbone_config, backbone_pg_collection.pp
+    )
+    _allreduce_non_tensor_model_parallel_grads(
+        backbone_chunk_list, backbone_config, backbone_pg_collection.tp
+    )
+    _allreduce_word_embedding_grads(
+        backbone_chunk_list,
+        backbone_config,
+        backbone_pg_collection.embd,
+        backbone_pg_collection.pp,
+    )
+    _allreduce_position_embedding_grads(
+        backbone_chunk_list,
+        backbone_config,
+        backbone_pg_collection.pos_embd,
+        backbone_pg_collection.pp,
+    )
+    reset_model_temporary_tensors(backbone_config, backbone_chunk_list)
+    nvtx_range_pop("colocated-backbone-grad-finalize")
+
+    if num_tokens is not None:
+        # 缩放单独立一块（2026-09-25 用户定）：per-token 归一化 = backbone 原生
+        # broadcast(pp) + all_reduce(D_outer) + 双 chunk 缩放，与 finish_grad_sync/
+        # 按参数集归约分开打区间，trace 上"通信等待"与"缩放同步"可分开归因。
+        # Scaling gets its own range (2026-09-25, user call): the per-token
+        # normalization = the backbone's native broadcast(pp) + all_reduce(D_outer) +
+        # two-chunk scaling, range-separated from finish_grad_sync / per-parameter-set
+        # reductions so comm waits and the scaling sync are attributable separately.
+        nvtx_range_push("colocated-per-token-scaling")
+        last_rank = get_pp_last_rank(backbone_pg_collection.pp)
+        torch.distributed.broadcast(
+            num_tokens, src=last_rank, group=backbone_pg_collection.pp
+        )
+        torch.distributed.all_reduce(num_tokens, group=backbone_pg_collection.dp_cp)
+        if num_tokens > 0:
+            scaling = 1.0 / num_tokens
+            backbone_chunk.scale_gradients(scaling)
+            encoder_chunk.scale_gradients(scaling)
+        nvtx_range_pop("colocated-per-token-scaling")

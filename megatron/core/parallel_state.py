@@ -2250,22 +2250,23 @@ def build_colocated_encoder_process_groups():
 
 
 def validate_colocated_num_microbatches(num_microbatches):
-    """Validate num_microbatches for round-robin colocated encoder scheduling.
+    """Validate num_microbatches for colocated encoder scheduling.
 
-    Under the round-robin schedule, the microbatches are distributed across the
-    pipeline stages (microbatch s is computed by stage s), so num_microbatches
-    must be a multiple of the pipeline model parallel size.
+    划分策略（owner 表，见 colocated_microbatch_partition.py）按 mb 逐个分配，任何覆盖
+    全部 mb 恰好一次的划分——轮盘、逆序分块、非均匀头尾——都由策略函数自身保证；调度内
+    的供给/预取/grad 界全部逐 mb 驱动，与划分形状无关。此处仅校验正数性。
 
-    校验轮盘式共置 encoder 调度对 num_microbatches 的要求：轮盘调度把
-    microbatch 按 pipeline stage 分发（microbatch s 由 stage s 计算），因此
-    num_microbatches 必须是 pipeline model parallel size 的整数倍，且为正数。
+    历史注记：轮盘时代曾要求 num_microbatches 是 pipeline model parallel size 的整数倍
+    （均匀分配的不变量），2026-09-25 随非均匀切分引入而移除。
+
+    Validate that num_microbatches is positive. Partition shapes (round-robin, reversed
+    blocks, non-uniform head/tail) are owned by the strategy functions; the schedule's
+    supply/prefetch/grad bounds are per-microbatch and partition-agnostic. Historical note:
+    the round-robin era required num_microbatches to be a multiple of the pipeline model
+    parallel size; that divisibility requirement was removed with non-uniform partitioning
+    (2026-09-25).
     """
-    pp_size = get_pipeline_model_parallel_world_size()
     assert num_microbatches > 0, f"num_microbatches must be positive, got {num_microbatches}"
-    assert num_microbatches % pp_size == 0, (
-        f"num_microbatches ({num_microbatches}) must be a multiple of the pipeline "
-        f"model parallel size ({pp_size}) for round-robin colocated encoder scheduling"
-    )
 
 
 def get_microbatches_for_producer(producer_id, num_microbatches, num_producers):

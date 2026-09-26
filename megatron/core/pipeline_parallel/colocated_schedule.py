@@ -93,6 +93,28 @@ def _cpu_probe(message: str) -> None:
     )
 
 
+# 2026-09-25 实验开关（"producer 发送迟了"假设）：steady 供给在紧界 i+x 之上额外多发的 mb 数。
+# 默认 0 = 死锁修复后的紧界。**=1 下无论分配器冷热均死锁（两轮实测）**：11:22 run slack=1 从
+# iteration 1 的 steady 生效 → 冷 cudaMalloc 窗口挂死（四卡 100% 自旋、5 分钟无输出）；
+# 11:29 run 延迟到 iteration 21（分配器已暖）→ 同样挂死（7 分钟无输出）。与 2026-09-23 波前
+# 分析一致：=1 单硬件队列下 steady +1 的同波 isend/irecv 竞速闭环成执行序死锁，与分配器冷热
+# 无关——本开关仅在多硬件队列（=2）下可用，=1 恒置 0。
+# 2026-09-25 experiment knob (the "late send" hypothesis): extra mbs supplied beyond the
+# steady tight bound i+x. Default 0 = the deadlock-fix tight bound. **Under =1 it deadlocks
+# regardless of allocator warmth (two measured runs)**: the 11:22 run enabled slack=1 from
+# iteration 1's steady phase and hung in the cold-cudaMalloc window (four GPUs at 100% spin,
+# 5 min without output); the 11:29 run deferred activation to iteration 21 (allocator warm)
+# and hung the same way (7 min without output). This matches the 2026-09-23 wave-front
+# analysis: under a single hardware queue the same-wave send/recv race of a steady +1 closes
+# into an execution-order deadlock, independent of allocator state - the knob is only usable
+# with multiple queues (=2); keep 0 under =1.
+_STEADY_SUPPLY_EXTRA_SLACK = int(os.environ.get("COLOCATED_STEADY_SUPPLY_SLACK", "0"))
+_STEADY_SUPPLY_SLACK_START_ITER = int(
+    os.environ.get("COLOCATED_STEADY_SUPPLY_SLACK_START_ITER", "20")
+)
+_COLOCATED_SCHEDULE_CALL_COUNT = 0
+
+
 @dataclass
 class IntraPacket:
     """Handoff carrier between the schedule and the injected forward step (Task 4.3j).
@@ -181,6 +203,12 @@ def forward_backward_colocated(
     # Split by each chunk's own colocated_module_name rather than by position, reusing the
     # same helper the training entry uses to build the model list and chain the optimizers.
     # Exactly one chunk per component is the current minimal implementation's premise.
+    # 实验：调度调用计数——slack 只在分配器转暖（超过 START_ITER）后生效，见
+    # _STEADY_SUPPLY_EXTRA_SLACK 注释。
+    # Experiment: schedule-call counter - the slack activates only once the allocator is warm
+    # (past START_ITER), see the _STEADY_SUPPLY_EXTRA_SLACK comment.
+    global _COLOCATED_SCHEDULE_CALL_COUNT
+    _COLOCATED_SCHEDULE_CALL_COUNT += 1
     chunks_per_module = group_colocated_model_chunks(model)
     encoder_chunks = chunks_per_module["encoder"]
     backbone_chunks = chunks_per_module["language_model"]
@@ -246,7 +274,7 @@ def forward_backward_colocated(
     # (P=1: producer is always 0, is_consumer=True, all-local take, P2P no-ops), so no
     # separate pp-size dispatch is needed. It is a decoupled sub-phase returning the loss
     # store plus this rank's boundary grads.
-    forward_data_store, producer_grad_buffers, num_tokens_for_encoder = (
+    forward_data_store, producer_grad_buffers, total_num_tokens = (
         colocated_backbone_forward_backward_pipelining_without_interleaving(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -258,29 +286,41 @@ def forward_backward_colocated(
             forward_only=forward_only,
             collect_non_loss_data=collect_non_loss_data,
             adjust_tensor_shapes_fn=kwargs.get("adjust_tensor_shapes_fn"),
-            force_all_reduce=kwargs.get("force_all_reduce", False),
             comm=comm,
             encoder_buffers=encoder_buffers,
         )
     )
 
-    # Phase ④：合并 encoder 反传 + encoder 自己的梯度收尾（4.6e；优化 spec Task 1 合并
-    # 反传）——与 phase ① 对称的**独立一段**，由本函数（全流程编排者）调用，不塞进
-    # phase ② 里面。forward_only（eval）没有梯度，跳过。per-token 模式才传 token 数
-    # （与 finalize_model_grads 的调用约定一致）。合并张量由 phase ① 交回、本处转交。
-    # Phase ④: the merged encoder backward plus the encoder's own grad finalize (4.6e;
-    # optimization spec Task 1 merged backward) — a separate phase, symmetric with
-    # phase ①, driven by this function rather than nested inside phase ②. The merged
-    # tensor comes back from phase ① and is forwarded here.
+    # Phase ④：合并 encoder 反传（4.6e；优化 spec Task 1 合并反传）——与 phase ① 对称的
+    # **独立一段**，由本函数（全流程编排者）调用，不塞进 phase ② 里面。forward_only（eval）
+    # 没有梯度，跳过。合并张量由 phase ① 交回、本处转交。
+    # Phase ④: the merged encoder backward (4.6e; optimization spec Task 1 merged backward)
+    # — a separate phase, symmetric with phase ①, driven by this function rather than nested
+    # inside phase ②. The merged tensor comes back from phase ① and is forwarded here.
+    # 2026-09-25 colocated-unified-grad-finalize：encoder/backbone 的梯度收尾统一挪到反传
+    # 之后，由 finalize_colocated_model_grads 一次完成（原两处 stock finalize 调用点已删）。
+    # The grad finalize for both chunks now runs once, after the encoder backward, via
+    # finalize_colocated_model_grads (the two stock finalize call sites are gone).
     if not forward_only:
         _colocated_encoder_backward(
             encoder_chunk,
             merged_image_embeddings,
             producer_grad_buffers,
-            num_tokens=(
-                num_tokens_for_encoder if config.calculate_per_token_loss else None
-            ),
         )
+        if config.finalize_model_grads_func is not None:
+            # 2026-09-25 colocated-unified-grad-finalize：收尾走 config hook——training.py
+            # 按 colocated 开关把它设为 finalize_colocated_model_grads（签名与 stock 一致），
+            # 本编排器在 phase ④ 之后调用一次；pg_collection 不传，由 hook 回落到 backbone
+            # chunk 自带的属性。
+            # The grad finalize goes through the config hook - training.py sets it to
+            # finalize_colocated_model_grads when colocated is enabled (same signature as
+            # stock); called once here after phase ④, with pg_collection left to the
+            # hook's chunk-attribute fallback.
+            config.finalize_model_grads_func(
+                model,
+                total_num_tokens if config.calculate_per_token_loss else None,
+                force_all_reduce=kwargs.get("force_all_reduce", False),
+            )
 
     return forward_data_store
 
@@ -389,18 +429,22 @@ def _colocated_encoder_backward(
     encoder_chunk,
     merged_image_embeddings: torch.Tensor,
     producer_grad_buffers: Dict[int, torch.Tensor],
-    num_tokens: Optional[torch.Tensor] = None,
 ) -> None:
-    """Phase ④: MERGED encoder backward + the encoder's own grad finalize (4.6e; Task 1).
+    """Phase ④: MERGED encoder backward (4.6e; Task 1).
+
+    2026-09-25 colocated-unified-grad-finalize 更正：encoder 自己的梯度收尾已移入
+    ``finalize_colocated_model_grads``（编排器在本函数之后调用一次），本函数只做合并反传。
+    The encoder's own grad finalize moved into ``finalize_colocated_model_grads`` (called
+    once by the orchestrator right after this function); this function now only runs the
+    merged backward.
 
     每个 rank 在**backbone 流水全部前传与反传结束后**统一做自己的 encoder 反传。优化
     spec Task 1 起反传也合并：把 ``num_microbatches / P`` 份边界梯度沿 dim=1 ``cat`` 回
     ``[img_seq_len, merged_batch, h_lang]``，对 phase ① 交回的**合并张量**调**一次**
     ``torch.autograd.backward``——每层 wgrad 只吃一次 batch 维合并的梯度，图只遍历一遍，
-    替代原先 16 次"逐 view backward、每次遍历整图"的 launch-bound 反传。最后做 encoder
-    自己的梯度收尾（复用 ``finalize_model_grads``，传 encoder 自己的 ``pg_collection``：
-    DDP 在 colocated dp 组上的一次 SUM 同时完成"跨副本"与"副本内轮盘"两个数据并行维的
-    求和，随后按全局 token 数归一化）。
+    替代原先 16 次"逐 view backward、每次遍历整图"的 launch-bound 反传。
+    （2026-09-25 更正：下文原先"最后做 encoder 自己的梯度收尾（复用 finalize_model_grads
+    ……随后按全局 token 数归一化）"一段已随统一收尾重构移入 finalize_colocated_model_grads。）
 
     梯度来源对每个 rank 完全同构（consumer 用 4.6c 本地留存的梯度、producer 用 4.6d
     收到的梯度，两者都在自己的 ``producer_grad_buffers`` 里，每份形状
@@ -421,8 +465,6 @@ def _colocated_encoder_backward(
 
     Args:
         merged_image_embeddings: phase ① 交回的合并输出张量（图输出对象，保留 grad_fn）。
-        num_tokens: per-token 模式（``calculate_per_token_loss=True``）下 phase ② 交回的
-            **未规约**本 rank token 数；其余模式传 None。
     """
     microbatches = sorted(producer_grad_buffers)
     # cat 顺序 = phase ① 的切片顺序（轮盘序列同为升序）；总量对齐合并张量的 batch 维。
@@ -448,44 +490,6 @@ def _colocated_encoder_backward(
     torch.autograd.backward(merged_image_embeddings, grad_tensors=full_boundary_grad)
     del boundary_grads, full_boundary_grad
 
-    # encoder 的梯度收尾走 ``config.finalize_model_grads_func``（与 backbone 相位同一个入口，
-    # 不再函数内延迟 import）：Task 5 起 encoder 带着自己的 ``pg_collection``（每次 get_model
-    # 调用只有一种拓扑），``finalize_model_grads`` 的每一段都按 encoder 自己的组判断——DDP
-    # 归约走 colocated dp 组（全 W，一次 SUM 同时覆盖"跨副本"与"副本内轮盘"两个数据并行维，
-    # finalize_model_grads.py:446-447，doc §2.9）；conditional embedding 与非 TP 参数两段被
-    # pp/tp 单成员的门挡掉（:104、:333，后者在 encoder 支持 TP 后自动生效）；word/position
-    # embedding 两段因 ``embd``/``pos_embd`` 为 None 而跳过
-    # （parallel_state.build_colocated_encoder_process_groups）。
-    # The encoder's grad finalize goes through config.finalize_model_grads_func, the same
-    # entry point the backbone phase uses. The config comes from the encoder chunk's OWN
-    # wrapper chain (the no_sync block that used to fetch it earlier is gone with the
-    # merged single-backward discipline).
-    config = get_model_config(encoder_chunk)
-    if config.finalize_model_grads_func is not None and hasattr(
-        encoder_chunk, "finish_grad_sync"
-    ):
-        # per-token 的分母：encoder 的 pipeline 组只有一个成员，finalize_model_grads.py:494
-        # 的 broadcast 因此是空操作，全局 token 数完全由 :497 在 colocated dp 组（全 W）上的
-        # 一次 SUM 得到——每个副本内只有 backbone 末 stage 的 rank 持有非零值，求和即全局
-        # 总数。这依赖上游"中间 stage 不算 loss、num_tokens 恒为 0"（schedules.py:262-269），
-        # 由 Task 5.8 的数值用例守（分母错 P 倍会直接反映在梯度上），不在训练主循环里加
-        # 断言——那需要 .item() 同步，且属于为当前不可能发生的状态加防御。
-        # The per-token divisor: the encoder's pipeline group is single-member, so that
-        # broadcast is a no-op and the global token count comes solely from the SUM over the
-        # colocated data-parallel group - only the backbone last stage of each replica holds a
-        # non-zero value. That upstream assumption is guarded by the Task 5.8 numerical test,
-        # not by a runtime assert (which would need a .item() sync every iteration).
-        # NVTX：encoder 的梯度收尾（DP 归约 + per-token 归一化）是通信爆发段，单独打区间。
-        # NVTX: the encoder grad finalize (DP reduce + per-token normalization) is a
-        # communication burst - give it its own range.
-        nvtx_range_push("colocated-encoder-grad-finalize")
-        config.finalize_model_grads_func(
-            [encoder_chunk],
-            num_tokens,
-            pg_collection=get_attr_wrapped_model(encoder_chunk, "pg_collection"),
-        )
-        nvtx_range_pop("colocated-encoder-grad-finalize")
-
 
 def colocated_backbone_forward_backward_pipelining_without_interleaving(
     *,
@@ -502,7 +506,6 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
     adjust_tensor_shapes_fn: Optional[Callable] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
-    force_all_reduce: Optional[bool] = False,
     # --- colocated 特有参数（4.3b）---
     comm: Optional[EncoderBackboneBoundaryCommunicator] = None,
     encoder_buffers: Optional[Dict[int, ForwardPacket]] = None,
@@ -968,7 +971,19 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         if is_warmup:
             supply_limit = forward_microbatch + producer_id + 1
         else:
-            supply_limit = forward_microbatch + producer_id
+            # 2026-09-25 实验：COLOCATED_STEADY_SUPPLY_SLACK 允许 steady 在紧界上再多发 N 个
+            # mb。=1 下无论冷热均死锁（iter1 冷挂 + iter21 暖挂两轮实测），故此开关只在
+            # 多硬件队列（=2）下可用；=1 恒为 0。
+            # 2026-09-25 experiment: COLOCATED_STEADY_SUPPLY_SLACK supplies N extra mbs past
+            # the steady tight bound. Under =1 it deadlocks warm or cold (two measured runs:
+            # hung at iter 1 cold and at iter 21 warm), so the knob is only usable with
+            # multiple queues (=2); keep 0 under =1.
+            steady_supply_slack = (
+                _STEADY_SUPPLY_EXTRA_SLACK
+                if _COLOCATED_SCHEDULE_CALL_COUNT > _STEADY_SUPPLY_SLACK_START_ITER
+                else 0
+            )
+            supply_limit = forward_microbatch + producer_id + steady_supply_slack
         _cpu_probe(
             f"supply ENTER fwd_mb={forward_microbatch} limit={supply_limit} warmup={is_warmup}"
         )
@@ -1327,24 +1342,12 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         # recv buffers internally (cudaMalloc) and its device-wide sync must not be blocked by
         # queued boundary kernels. Prefetch of k+1 still precedes next step's take of k+1; the
         # i+x+1 supply bound only depends on current_microbatch, so it is unchanged.
-        # dual-channel-p2p（2026-09-23 定案：波前分析 + 实测 iter12+）：steady 供给 = 紧界 i+x
-        # （PP 依赖链保证 isend(i+x) 先于 take(i+x) 发射，反传尾巴再给一拍缓冲，无同波竞速）；
-        # warmup / pre-warmup 才用 i+x+1（纯 F 尾巴吸收不了 relay 延迟，需提前一拍）。=1 下 steady
-        # 带 +1 的同波竞速会闭环成执行序死锁（GBS>=32 实测），故这里必须 is_warmup=False。
-        # dual-channel-p2p (2026-09-23 settled: wave-front analysis + runs): steady supplies at
-        # the tight bound i+x — the PP chain guarantees the isend issues before the take and the
-        # backward tail adds a full step of slack (no same-wave race); warmup/pre-warmup use
-        # i+x+1 (the forward-only tail cannot absorb the relay latency). Under =1 a steady +1
-        # deadlocks via the same-wave race (GBS>=32 observed), hence is_warmup=False here.
+        # dual-channel-p2p 实验（2026-09-25 变量拆分）：producer 的 supply 放回 F 之前（原位），
+        # consumer 的 prefetch 留在 F 之后——区分 rr 死锁到底由哪个 boundary 入口贡献。
+        # dual-channel-p2p experiment (2026-09-25, variable split): the producer's supply moves
+        # back before the forward (original spot) while the consumer's prefetch stays after it,
+        # to isolate which boundary entry contributed to the rr deadlock.
         _supply_owned_activations(current_microbatch, is_warmup=False)
-        if is_consumer:
-            next_microbatch = current_microbatch + 1
-            if next_microbatch < num_microbatches:
-                next_owner = parallel_state.get_colocated_microbatch_owner(next_microbatch)
-                if next_owner != 0:
-                    prefetched[next_microbatch] = comm.colocated_recv_forward(
-                        next_owner, expected_microbatch_id=next_microbatch, wait=False
-                    )
         _cpu_probe(f"STEADY mb={current_microbatch} forward_step BEGIN")
         output_tensor, num_tokens = forward_step(
             forward_step_func,
@@ -1365,6 +1368,20 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
         )
         _cpu_probe(f"STEADY mb={current_microbatch} forward_step END")
         total_num_tokens += num_tokens
+        # dual-channel-p2p 实验（2026-09-25 变量拆分）：只把 consumer 的 prefetch 留在 forward
+        # 之后（producer 的 supply 已回到 F 之前原位）——forward 执行期间 consumer 侧不再入队
+        # 新 boundary kernel。
+        # dual-channel-p2p experiment (2026-09-25, variable split): only the consumer's prefetch
+        # stays after the forward (the producer's supply is back at its original pre-forward
+        # spot) — the consumer enqueues no new boundary kernel during the forward itself.
+        if is_consumer:
+            next_microbatch = current_microbatch + 1
+            if next_microbatch < num_microbatches:
+                next_owner = parallel_state.get_colocated_microbatch_owner(next_microbatch)
+                if next_owner != 0:
+                    prefetched[next_microbatch] = comm.colocated_recv_forward(
+                        next_owner, expected_microbatch_id=next_microbatch, wait=False
+                    )
 
         if forward_only:
             p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
@@ -1527,39 +1544,25 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
 
-    # 4.6e：交回给 phase ④ 的 token 数——**必须在 backbone 的 finalize 之前克隆**：
-    # finalize_model_grads 在 per-token 模式下会就地把这个张量规约成全局值
-    # （broadcast + all_reduce，finalize_model_grads.py:494-497），而 encoder 需要的是
-    # 未规约的原始值（它自己带 encoder 的 pg_collection 再走一遍 finalize_model_grads，
-    # 在 colocated dp 组上求和得到同一个全局 token 数）。
-    # 4.6e: clone the token count for phase ④ *before* the backbone finalize, which reduces
-    # the tensor in place; the encoder needs the raw per-rank value.
-    num_tokens_for_encoder = total_num_tokens.clone()
-
+    # 2026-09-25 colocated-unified-grad-finalize：backbone 的梯度收尾（finish_grad_sync /
+    # 按参数集归约 / per-token 归一化）移出 phase ②，与 encoder 收尾统一进
+    # finalize_colocated_model_grads（编排器在 phase ④ 之后调用一次）。原 clone
+    # （num_tokens_for_encoder）随之删除——total_num_tokens 不再被就地规约，可原样交回。
+    # The backbone grad finalize (finish_grad_sync / per-parameter-set reductions /
+    # per-token normalization) moved out of phase ② into finalize_colocated_model_grads,
+    # called once by the orchestrator after phase ④; the old clone is gone since
+    # total_num_tokens is no longer reduced in place.
     if config.finalize_model_grads_func is not None and not forward_only:
-        # NVTX：backbone 的梯度收尾（DP 归约 / layernorm / embedding 归约）与 encoder 的
-        # 收尾分开打区间，两者是不同参数集上的两段通信。
-        # NVTX: the backbone grad finalize, kept as a separate range from the encoder's -
-        # they are two communication bursts over two different parameter sets.
-        nvtx_range_push("colocated-backbone-grad-finalize")
+        # NVTX：defer_embedding_wgrad_compute 的 wgrad 补算段（2026-09-25 恢复）。
+        # NVTX: the deferred-wgrad section (restored 2026-09-25).
+        nvtx_range_push("colocated-backbone-wgrad-compute")
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
         # 若开启 defer_embedding_wgrad_compute，这里补齐 LM Head 的 wgrad 计算。
         finish_embedding_wgrad_compute(
             config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
         )
-
-        # Finalize model grads (perform full grad all-reduce / reduce-scatter for
-        # data parallelism, layernorm all-reduce for sequence parallelism, and
-        # embedding all-reduce for pipeline parallelism).
-        # 梯度收尾：数据并行的全归约 / reduce-scatter、序列并行的 layernorm 归约、PP 的 embedding 归约。
-        config.finalize_model_grads_func(
-            [model],
-            total_num_tokens if config.calculate_per_token_loss else None,
-            pg_collection=pg_collection,
-            force_all_reduce=force_all_reduce,
-        )
-        nvtx_range_pop("colocated-backbone-grad-finalize")
+        nvtx_range_pop("colocated-backbone-wgrad-compute")
 
     if getattr(config, 'fine_grained_activation_offloading', False):
         off_interface.reset()
@@ -1579,4 +1582,4 @@ def colocated_backbone_forward_backward_pipelining_without_interleaving(
     # 函数（phase ②）里面。
     # 4.6e: hand the boundary grads and the token count back to forward_backward_colocated
     # (the whole-flow orchestrator); phase ④ is a separate step, symmetric with phase ①.
-    return forward_data_store, producer_grad_buffers, num_tokens_for_encoder
+    return forward_data_store, producer_grad_buffers, total_num_tokens

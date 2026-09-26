@@ -178,7 +178,7 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
-from megatron.core.distributed import finalize_model_grads
+from megatron.core.distributed import finalize_colocated_model_grads, finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import (
     get_megatron_optimizer,
@@ -3403,7 +3403,16 @@ def train(
             ]
             if len(config_model_chunks) == 1:
                 chunk_config.param_sync_func = chunk_config.param_sync_func[0]
-        chunk_config.finalize_model_grads_func = finalize_model_grads #设置梯度收尾函数
+        chunk_config.finalize_model_grads_func = (
+            # 共置训练用统一收尾（encoder+backbone 两个 chunk 一次处理，签名与 stock 一致，
+            # 由共置编排器 forward_backward_colocated 在 phase ④ 之后调用）；非共置走 stock。
+            # Colocated training uses the unified finalize (both chunks in one pass, same
+            # signature as stock, invoked by the colocated orchestrator after phase ④);
+            # non-colocated keeps the stock one.
+            finalize_colocated_model_grads
+            if mpu.is_colocated_encoder_enabled()
+            else finalize_model_grads
+        )
 
     if args.log_energy:
         energy_monitor.setup()

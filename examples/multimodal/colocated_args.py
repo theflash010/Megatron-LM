@@ -35,27 +35,6 @@ def default_round_robin_partition(num_microbatches: int, num_producers: int) -> 
     ]
 
 
-def reverse_block_partition(num_microbatches: int, num_producers: int) -> list[list[int]]:
-    """Stress-test partition: contiguous microbatch blocks in REVERSE producer order.
-
-    连续 microbatch 分块、按 producer 逆序分配（16 mb / 4 producer：mb0-3→producer3、
-    mb4-7→producer2、mb8-11→producer1、mb12-15→producer0）。专压两点：(1) 最前一整块 mb 集中在
-    单个远端 producer；(2) 每 producer owned 数可 > D（如 16/4=4），检验"每 producer 多个 mb"的
-    正确性（轮盘下 owned 分散会掩盖这条）。不整除时靠前的块多分一个，每个内层列表升序。
-    """
-    base_length, remainder = divmod(num_microbatches, num_producers)
-    owned_by_producer: list[list[int]] = [[] for _ in range(num_producers)]
-    microbatch_start = 0
-    for chunk_index in range(num_producers):
-        chunk_length = base_length + (1 if chunk_index < remainder else 0)
-        producer_id = num_producers - 1 - chunk_index
-        owned_by_producer[producer_id] = list(
-            range(microbatch_start, microbatch_start + chunk_length)
-        )
-        microbatch_start += chunk_length
-    return owned_by_producer
-
-
 def add_colocated_extra_args(parser):
     """Add the colocated encoder arguments on top of the multimodal ones."""
     parser = add_multimodal_extra_args(parser)

@@ -1775,48 +1775,32 @@ def validate_args(args, defaults={}):
             "evaluation runs through the text-generation inference path, which does not know "
             "about the encoder / backbone split"
         )
-        # The roulette schedule gives microbatch s to pipeline stage s, so the number of
-        # microbatches must be a multiple of the pipeline size. That invariant is checked by
-        # validate_colocated_num_microbatches, but only from inside the schedule
-        # (colocated_schedule.py), i.e. after the model is built, the checkpoint is loaded and
-        # the first batch is fetched. Deriving the same number here turns a first-step failure
-        # into a startup failure. One divisibility covers both steps: global_batch_size must be
-        # divisible by micro_batch_size * data_parallel_size (that quotient IS the microbatch
-        # count) and the quotient must then be divisible by the pipeline size.
-        # 轮盘调度把 microbatch s 交给 stage s，因此 microbatch 数必须是 pipeline size 的整数
-        # 倍。这条不变量由 validate_colocated_num_microbatches 保证，但它只在 schedule 内部被
-        # 调用（colocated_schedule.py）——那已经是建完模型、加载完 checkpoint、取到第一个 batch
-        # 之后了。在这里把同一个数推一遍，就把"第一步才炸"变成"启动就炸"。一次整除覆盖两步：
-        # global_batch_size 必须能被 micro_batch_size * data_parallel_size 整除（这个商就是
-        # microbatch 数），且该商还要能被 pipeline size 整除。
-        microbatches_divisor = (
-            args.micro_batch_size * args.data_parallel_size * args.pipeline_model_parallel_size
-        )
-        assert args.global_batch_size % microbatches_divisor == 0, (
-            f"Colocated encoder training requires the number of microbatches to be a multiple "
-            f"of the pipeline model parallel size ({args.pipeline_model_parallel_size}), because "
-            f"the round-robin schedule assigns microbatch s to pipeline stage s. With "
-            f"--global-batch-size {args.global_batch_size}, --micro-batch-size "
-            f"{args.micro_batch_size} and data_parallel_size {args.data_parallel_size} the "
-            f"number of microbatches is "
-            f"{args.global_batch_size / (args.micro_batch_size * args.data_parallel_size)}; "
-            f"pick a global batch size that is a multiple of {microbatches_divisor}"
-        )
-        # A batch size that changes over time would have to satisfy the divisibility above at
-        # EVERY point of the schedule, and a value that does not would only surface mid-run.
-        # 随时间变化的批量必须在**每一个**取值上都满足上面的整除，不满足的那个取值要跑到中途
-        # 才暴露，因此直接拒绝。
+        # The only remaining requirement here is that num_microbatches (= global_batch_size /
+        # (micro_batch_size * data_parallel_size)) is a positive integer, which core Megatron
+        # enforces when the number of microbatches is derived. The former colocated-specific
+        # requirement that num_microbatches also be a multiple of the pipeline size belonged to
+        # the uniform round-robin partition and was removed with non-uniform partitioning
+        # (2026-09-25, see colocated_microbatch_partition.py): partition strategies are
+        # owner-table driven and cover every microbatch exactly once regardless of divisibility.
+        # 这里仅剩的要求是 microbatch 数为正整数（core Megatron 在推导 num_microbatches 时
+        # 保证）。旧的共置专属要求——num_microbatches 还须是 pipeline size 的整数倍——属于
+        # 均匀轮盘划分，已随非均匀切分（2026-09-25，见 colocated_microbatch_partition.py）
+        # 移除：划分策略由 owner 表驱动，任何形状都恰好覆盖全部 mb 一次。
+        # A batch size that changes over time would have to keep the per-rank owned counts
+        # consistent with the dataloader batch size fixed at build time, and a value that does
+        # not would only surface mid-run.
+        # 随时间变化的批量必须让各 rank 的 owned 数与建表期固定的 dataloader batch_size 保持
+        # 一致，不一致的取值要跑到中途才暴露，因此直接拒绝。
         assert args.step_batch_size_schedule is None and args.rampup_batch_size is None, (
             "Colocated encoder training does not support a changing batch size "
-            "(--step-batch-size-schedule / --rampup-batch-size): every value of the schedule "
-            "would have to keep the number of microbatches a multiple of the pipeline size, and "
-            "a value that does not would only fail in the middle of training"
+            "(--step-batch-size-schedule / --rampup-batch-size): the dataloader batch size "
+            "(the per-rank owned count) is fixed at build time and cannot follow a changing "
+            "num_microbatches"
         )
         assert not args.decrease_batch_size_if_needed, (
             "Colocated encoder training does not support --decrease-batch-size-if-needed: it "
-            "silently changes the global batch size, which can break the "
-            "num_microbatches % pipeline_model_parallel_size == 0 requirement of the "
-            "round-robin schedule"
+            "silently changes the global batch size, which would change the per-rank owned "
+            "counts away from the dataloader batch size fixed at build time"
         )
 
     # Print arguments.
